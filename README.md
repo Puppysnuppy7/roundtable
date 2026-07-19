@@ -90,8 +90,12 @@ you already know the CLIs are reachable.
 
 The fullscreen view provides evenly spaced live Codex, Claude, and Antigravity panes, independent
 working/waiting states, per-agent usage sparklines (response time, output size, activity), and a
-live elapsed-time readout while an agent is working. A wrapped multiline task composer, a combined
-answer, a live code monitor showing files changed during the session, and a console panel round out
+live work feed inside each active agent's own pane. The feed keeps reported file reads, searches,
+edits, commands, tests, and other CLI progress attributed to the agent that emitted them; once the
+agent finishes, its pane returns to the completed response. Read/execute/write counters provide an
+at-a-glance summary; because CLI output formats differ, they are progress indicators rather than
+audit totals. A live elapsed-time readout, a wrapped multiline task composer, a combined answer, a
+live code monitor showing files changed during the session, and a console panel round out
 the diagnostics. After an answer, a follow-up text box lets you keep the same roundtable conversation
 going. Complete transcripts are written to `.roundtable/`.
 
@@ -101,7 +105,9 @@ cycle it through **all activity** (adds raw per-line ticks), **prompts** (just w
 agent), and **errors only**; each line is tagged with a small glyph (`▶` phase, `✓` turn, `✗` error,
 `➤` prompt, `·` tick) that also carries color, so kind is legible even without color. A running count
 by kind sits under the console title. Press `0` or click the console to expand it full-screen for the
-complete filtered history, same as the agent and answer panels.
+complete filtered history, same as the agent and answer panels. Mouse wheel or two-finger scroll works
+on the console the same as any other panel, whether it's expanded or still in the compact dashboard
+view, and the title shows `↑N` while scrolled back from the latest entry.
 
 In a parallel phase, agents finish independently but the transcript only advances once every agent
 in the round is done — so a lone slow agent can leave the screen looking stuck. The console and log
@@ -125,6 +131,13 @@ result lands as its own turn (`proposal · extra`) alongside the normal one. At 
 per agent per phase, and it's cut short if it's still running once the round would otherwise be over,
 so it can add value without ever making the phase wait longer than its slowest primary agent.
 
+A CLI failure on a real, load-bearing turn (proposal, review, or the final synthesis relay) is
+retried once after a short pause before it's treated as fatal — real-world failures on a long run are
+often a transient rate limit or network timeout partway through a long chain of tool calls, not a
+broken prompt, and a short retry recovers most of them. A deliberate stop (Ctrl+C, or
+`--task-status-check` cutting an agent off) is never retried, since that agent wasn't trying to finish
+in the first place.
+
 Any panel — Codex, Claude, Antigravity, the shared answer, or the console — can be expanded to
 full-screen for its complete, un-truncated content: press `1`/`2`/`3`/`f`/`0`, or click/tap the panel.
 The same key, a click on the expanded panel, or `Esc`/`q` collapses it back to the dashboard. Keyboard
@@ -146,6 +159,10 @@ Arrow keys Move the cursor
 Esc        Exit or finish the session
 Ctrl+C     Cancel active work
 ```
+
+Ctrl+C cancels cleanly at any point in the process, not just once agents are working — including the
+startup options screen, the objective prompt, and the preflight connectivity check — printing
+`Cancelled.` and exiting instead of a raw traceback.
 
 ## Touchscreen and convertible use
 

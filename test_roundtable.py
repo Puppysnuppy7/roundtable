@@ -65,7 +65,12 @@ def make_test_display(h=48, w=160, turns=None):
     display.turn_times = {name: [] for name in display.usage_names}
     display.turn_outputs = {name: [] for name in display.usage_names}
     display.activity_pulses = {name: roundtable.deque(maxlen=200) for name in display.usage_names}
+    display.work_activity = {name: roundtable.deque(maxlen=200) for name in display.usage_names}
+    display.work_reads = {name: 0 for name in display.usage_names}
+    display.work_execs = {name: 0 for name in display.usage_names}
+    display.work_writes = {name: 0 for name in display.usage_names}
     display.turn_start = {}
+    display._known_turn_count = len(display.session.turns)
     display.console = roundtable.deque(maxlen=300)
     display.run_log = roundtable.RunLog(None)
     display.expanded = None
@@ -74,6 +79,40 @@ def make_test_display(h=48, w=160, turns=None):
 
 
 class RoundtableTests(unittest.TestCase):
+    def test_work_event_strips_terminal_codes_and_labels_common_operations(self):
+        self.assertEqual(roundtable.work_event("\x1b[32mReading app.py\x1b[0m"),
+                         "⌕ Reading app.py")
+        self.assertEqual(roundtable.work_event("executing python3 -m unittest"),
+                         "▶ executing python3 -m unittest")
+        self.assertEqual(roundtable.work_event("Applying patch"), "✎ Applying patch")
+
+    def test_active_agent_boxes_show_their_own_work_feeds(self):
+        display = make_test_display()
+        display.busy = True
+        display.active = {"Codex", "Claude"}
+        display.work_activity["Codex"].extend([
+            "⌕ Reading roundtable.py", "▶ python3 -m unittest test_roundtable"])
+        display.work_activity["Claude"].append("✎ Editing README.md")
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False):
+            display.draw()
+        rendered = display.s.text()
+        self.assertEqual(rendered.count("LIVE WORK"), 2)
+        self.assertIn("Reading roundtable.py", rendered)
+        self.assertIn("python3 -m unittest", rendered)
+        self.assertIn("Editing README.md", rendered)
+
+    def test_tick_keeps_work_history_separate_and_deduplicated(self):
+        display = make_test_display()
+        display.draw = lambda: None
+        display.poll_input = lambda: None
+        display.monitor.refresh = lambda: None
+        display.tick("Codex", "Reading one.py")
+        display.tick("Codex", "Reading one.py")
+        display.tick("Claude", "Executing tests")
+        self.assertEqual(list(display.work_activity["Codex"]), ["⌕ Reading one.py"])
+        self.assertEqual(list(display.work_activity["Claude"]), ["▶ Executing tests"])
+
     def test_line_editor(self):
         editor = roundtable.LineEditor()
         self.assertIsNone(editor.handle_key("é"))
@@ -1595,12 +1634,124 @@ class RoundtableTests(unittest.TestCase):
             self.assertTrue(session.final)
             self.assertEqual([t.phase for t in session.turns], ["proposal", "consensus"])
 
+    def test_run_with_retry_recovers_from_a_transient_failure(self):
+        class FlakyAgent(roundtable.Agent):
+            attempts = 0
+
+            def run(self, prompt, on_tick, cancel_event=None):
+                type(self).attempts += 1
+                if type(self).attempts == 1:
+                    raise RuntimeError(f"{self.name} exited with status 1\ntimeout waiting for response")
+                return "recovered on retry"
+
+        agent = FlakyAgent("Codex", Path("/tmp"))
+        ticks = []
+        with mock.patch.object(roundtable.time, "sleep") as sleep_mock:
+            result = roundtable._run_with_retry(agent, "prompt", ticks.append)
+        self.assertEqual(result, "recovered on retry")
+        self.assertEqual(FlakyAgent.attempts, 2)
+        sleep_mock.assert_called_once_with(roundtable.RETRY_BACKOFF_SECONDS)
+        self.assertTrue(any("retrying once" in t for t in ticks))
+
+    def test_run_with_retry_raises_if_the_retry_also_fails(self):
+        class AlwaysFailsAgent(roundtable.Agent):
+            attempts = 0
+
+            def run(self, prompt, on_tick, cancel_event=None):
+                type(self).attempts += 1
+                raise RuntimeError(f"{self.name} exited with status 1\nstill broken")
+
+        agent = AlwaysFailsAgent("Codex", Path("/tmp"))
+        with mock.patch.object(roundtable.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "still broken"):
+                roundtable._run_with_retry(agent, "prompt", lambda _: None)
+        self.assertEqual(AlwaysFailsAgent.attempts, 2)
+
+    def test_run_with_retry_never_retries_a_deliberate_cancellation(self):
+        class CancelledAgent(roundtable.Agent):
+            attempts = 0
+
+            def run(self, prompt, on_tick, cancel_event=None):
+                type(self).attempts += 1
+                raise RuntimeError(f"{self.name} cancelled")
+
+        agent = CancelledAgent("Codex", Path("/tmp"))
+        with mock.patch.object(roundtable.time, "sleep") as sleep_mock:
+            with self.assertRaisesRegex(RuntimeError, "Codex cancelled"):
+                roundtable._run_with_retry(agent, "prompt", lambda _: None)
+        self.assertEqual(CancelledAgent.attempts, 1)  # no retry for an intentional stop
+        sleep_mock.assert_not_called()
+
+    def test_run_parallel_phase_recovers_a_primary_agent_that_fails_once(self):
+        class FlakyAgent(roundtable.Agent):
+            attempts = 0
+
+            def run(self, prompt, on_tick, cancel_event=None):
+                if self.name != "Antigravity":
+                    return f"{self.name} content"
+                type(self).attempts += 1
+                if type(self).attempts == 1:
+                    raise RuntimeError("Antigravity exited with status 1\ntimeout waiting for response")
+                return "Antigravity content after retry"
+
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            session = roundtable.Session("Goal", td, 0, "now", [])
+            agents = [(name, FlakyAgent(name, workspace)) for name in ("Codex", "Claude", "Antigravity")]
+            with mock.patch.object(roundtable.time, "sleep"):
+                roundtable._run_parallel_phase(session, agents, "proposal", lambda *_: None,
+                                               lambda *_: None, "Working")
+            self.assertEqual({t.speaker: t.content for t in session.turns}["Antigravity"],
+                             "Antigravity content after retry")
+
     def test_save_stems_include_microseconds(self):
         with tempfile.TemporaryDirectory() as td:
             one = roundtable.Session("Goal", td, 0, "2026-01-01T00:00:00.000001+00:00", [])
             two = roundtable.Session("Goal", td, 0, "2026-01-01T00:00:00.000002+00:00", [])
             self.assertNotEqual(roundtable.save_session(one, Path(td))[0],
                                 roundtable.save_session(two, Path(td))[0])
+
+    def test_parse_work_activity_increments_counters(self):
+        display = make_test_display()
+        display.draw = lambda: None
+        display.poll_input = lambda: None
+        display.monitor.refresh = lambda: None
+        display.draw = lambda: None
+        display.poll_input = lambda: None
+        display.monitor.refresh = lambda: None
+
+        # Test reads
+        display.tick("Codex", "view_file('roundtable.py')")
+        display.tick("Codex", "read file contents")
+        # should not double-count a result/returned line
+        display.tick("Codex", "view_file returned success")
+        self.assertEqual(display.work_reads["Codex"], 2)
+
+        # Test writes
+        display.tick("Claude", "replace_file_content at line 5")
+        display.tick("Claude", "wrote file: README.md")
+        display.tick("Claude", "edit_file returned success")
+        self.assertEqual(display.work_writes["Claude"], 2)
+
+        # Test execs
+        display.tick("Antigravity", "run_command: python3 -m unittest")
+        display.tick("Antigravity", "bash command execution")
+        display.tick("Antigravity", "run_command exited with code 0")
+        self.assertEqual(display.work_execs["Antigravity"], 2)
+
+    def test_draw_renders_work_monitoring_counters(self):
+        display = make_test_display(h=30, w=120)
+        display.work_reads["Codex"] = 12
+        display.work_execs["Codex"] = 8
+        display.work_writes["Codex"] = 4
+
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False):
+            display.draw()
+            rendered = display.s.text()
+            self.assertIn("Reads: 12", rendered)
+            self.assertIn("Execs: 8", rendered)
+            self.assertIn("Writes: 4", rendered)
 
 
 if __name__ == "__main__":

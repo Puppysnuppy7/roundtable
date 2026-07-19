@@ -697,6 +697,23 @@ CONSOLE_KIND_GLYPH: dict[str, str] = {
     "phase": "▶", "turn": "✓", "tick": "·", "prompt": "➤", "error": "✗", "info": "·",
 }
 
+_ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+
+
+def work_event(line: str) -> str:
+    """Make a compact, terminal-safe entry from a CLI progress line."""
+    cleaned = " ".join(_ANSI_ESCAPE.sub("", line).split())
+    lowered = cleaned.lower()
+    if re.search(r"\b(exec|execute|executing|command|shell|bash|test|running)\b", lowered):
+        glyph = "▶"
+    elif re.search(r"\b(read|reading|open|inspect|search|find|list)\b", lowered):
+        glyph = "⌕"
+    elif re.search(r"\b(write|writing|edit|editing|patch|create|delete)\b", lowered):
+        glyph = "✎"
+    else:
+        glyph = "·"
+    return f"{glyph} {cleaned}" if cleaned else ""
+
 
 class Display:
     def __init__(self, stdscr: curses.window, session: Session, touch_mode: bool = False,
@@ -723,6 +740,11 @@ class Display:
         self.turn_outputs: dict[str, list[int]] = {name: [] for name in self.usage_names}
         self.activity_pulses: dict[str, deque[float]] = {
             name: deque(maxlen=200) for name in self.usage_names}
+        self.work_activity: dict[str, deque[str]] = {
+            name: deque(maxlen=200) for name in self.usage_names}
+        self.work_reads = {name: 0 for name in self.usage_names}
+        self.work_execs = {name: 0 for name in self.usage_names}
+        self.work_writes = {name: 0 for name in self.usage_names}
         self.turn_start: dict[str, float] = {}
         for turn in session.turns:
             if turn.speaker in self.turn_outputs:
@@ -765,6 +787,10 @@ class Display:
         next_active = set(active)
         for name in next_active - self.active:
             self.turn_start[name] = time.monotonic()
+            if name in getattr(self, "scroll", {}):
+                self.scroll[name] = 0
+            if name in getattr(self, "work_activity", {}):
+                self.work_activity[name].clear()
         if message != self.status:
             self.log(message, kind="phase")
         if next_active < self.active:
@@ -780,8 +806,13 @@ class Display:
         self.frame += 1
         if line:
             self.activity[name] = line[-180:]
+            entry = work_event(line)
+            feed = getattr(self, "work_activity", {}).get(name)
+            if entry and feed is not None and (not feed or feed[-1] != entry):
+                feed.append(entry)
             if name:
                 self.log(f"[{name}] {line}", kind="tick")
+                self.parse_work_activity(name, line)
         if name in self.activity_pulses:
             self.activity_pulses[name].append(time.monotonic())
         if len(self.session.turns) > self._known_turn_count:
@@ -799,6 +830,34 @@ class Display:
         self.monitor.refresh()
         self.draw()
         self.poll_input()
+
+    def parse_work_activity(self, name: str, line: str) -> None:
+        if not hasattr(self, "usage_names") or name not in self.usage_names:
+            return
+        line_lower = line.lower()
+        if any(term in line_lower for term in ("returned", "output", "result", "exited")):
+            return
+
+        read_patterns = (
+            "view_file", "read_file", "grep_search", "search_grep", "list_dir",
+            "glob_files", "read file", "reading file", "viewed file", "viewing file"
+        )
+        write_patterns = (
+            "replace_file_content", "write_to_file", "edit_file", "write_file",
+            "write file", "writing file", "edited file", "editing file", "wrote file"
+        )
+        exec_patterns = (
+            "run_command", "execute_command", "execute_bash", "bash",
+            "run command", "running command", "executed command", "ran command",
+            "executed code", "executing code"
+        )
+
+        if any(pat in line_lower for pat in read_patterns) and hasattr(self, "work_reads"):
+            self.work_reads[name] += 1
+        if any(pat in line_lower for pat in write_patterns) and hasattr(self, "work_writes"):
+            self.work_writes[name] += 1
+        if any(pat in line_lower for pat in exec_patterns) and hasattr(self, "work_execs"):
+            self.work_execs[name] += 1
 
     @staticmethod
     def _inside(box: tuple[int, int, int, int], y: int, x: int) -> bool:
@@ -955,9 +1014,22 @@ class Display:
             content_top = y + 4
             available = max(1, height - 6)
 
+            if height >= 10:
+                reads = getattr(self, "work_reads", {}).get(name, 0)
+                writes = getattr(self, "work_writes", {}).get(name, 0)
+                execs = getattr(self, "work_execs", {}).get(name, 0)
+                work_line = f"Reads: {reads}  Execs: {execs}  Writes: {writes}"
+                self._put(y + 4, x + 2, work_line[:usage_width], color | curses.A_DIM)
+                content_top = y + 5
+                available = max(1, height - 7)
+
         items = [t for t in self.session.turns if t.speaker == name]
-        content = items[-1].content if items else (
-            "Waiting for the shared task…" if not is_active else "Starting a new session…")
+        feed = list(getattr(self, "work_activity", {}).get(name, ()))
+        if is_active:
+            content = (f"LIVE WORK · {len(feed)} events\n" + "\n".join(feed) if feed else
+                       "LIVE WORK\n· Waiting for the agent's first progress event…")
+        else:
+            content = items[-1].content if items else "Waiting for the shared task…"
         lines = self._wrapped(content, width - 4)
         offset = min(self.scroll[name], max(0, len(lines) - available))
         end = len(lines) - offset if offset else len(lines)
@@ -1378,6 +1450,30 @@ def scope_hint(name: str, agent_speed: dict[str, list[float]]) -> str:
     )
 
 
+RETRY_BACKOFF_SECONDS = 3.0
+
+
+def _run_with_retry(agent: Agent, prompt: str, on_tick: Callable[[str], None],
+                    cancel_event: threading.Event | None = None) -> str:
+    """Run one agent turn, retrying once after a short backoff if the underlying CLI fails.
+
+    Real CLI failures seen in practice during a long run (a nonzero exit, an empty response) are
+    often transient -- a rate limit or network timeout partway through a long chain of tool calls --
+    rather than a fundamentally broken prompt, so one retry recovers most of them without masking a
+    genuinely broken agent, which will just fail the same way twice. A deliberate cancellation (e.g.
+    task_status_check stopping this agent, or Ctrl+C) is never retried: it was stopped on purpose,
+    not because it failed, and retrying it would redo work that was intentionally cut short.
+    """
+    try:
+        return agent.run(prompt, on_tick, cancel_event)
+    except RuntimeError as exc:
+        if str(exc) == f"{agent.name} cancelled":
+            raise
+        on_tick(f"failed ({exc}) — retrying once after a short pause")
+        time.sleep(RETRY_BACKOFF_SECONDS)
+        return agent.run(prompt, on_tick, threading.Event())
+
+
 def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase: str,
                         tick: Callable[[str, str], None],
                         status: Callable[[Iterable[str], str], None], message: str,
@@ -1423,7 +1519,7 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(agents),
                                                thread_name_prefix="roundtable") as pool:
         futures = {
-            name: pool.submit(agent.run, prompts[name],
+            name: pool.submit(_run_with_retry, agent, prompts[name],
                               lambda line, speaker=name: events.put((speaker, line)))
             for name, agent in agents
         }
@@ -1532,7 +1628,7 @@ def _run_sequential_phase(session: Session, agents: list[tuple[str, Agent]], pha
         status([name], message)
         prompt = prompt_for(session.objective, session.turns, phase, name, sequential=True)
         log_prompt(name, prompt)
-        content = agent.run(prompt, lambda line, speaker=name: tick(speaker, line))
+        content = _run_with_retry(agent, prompt, lambda line, speaker=name: tick(speaker, line))
         session.turns.append(Turn(name, phase, content))
         tick(name, "")
     status([], message)
@@ -1594,7 +1690,8 @@ def synthesize(session: Session, order: list[tuple[str, Agent]],
         # Pass a fresh Event explicitly rather than relying on agent.cancel_event: a prior phase's
         # task_status_check cancellation could otherwise leave that attribute already set, which
         # would abort this agent's turn before it starts.
-        draft = agent.run(prompt, lambda line, speaker=name: tick(speaker, line), threading.Event())
+        draft = _run_with_retry(agent, prompt, lambda line, speaker=name: tick(speaker, line),
+                                threading.Event())
     status([], "Final answer complete")
     return draft
 
