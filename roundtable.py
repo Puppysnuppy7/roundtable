@@ -8,6 +8,7 @@ import curses
 import concurrent.futures
 import hashlib
 import json
+import math
 import os
 import queue
 import re
@@ -247,6 +248,23 @@ def battery_summary() -> str:
     return f"{icon} {capacity}%"
 
 
+def suppress_focus_reporting() -> None:
+    """Turn off the terminal's focus-in/out reporting (DECSET mode 1004) for this session.
+
+    If it's on, the terminal sends `ESC [ I` / `ESC [ O` on every focus change (e.g. alt-tab away
+    and back). Curses has no special handling for that sequence, so it's read as a bare Escape
+    keypress followed by stray characters — and every text box here treats Escape as cancel, which
+    silently ends the whole session. curses.wrapper's endwin() can also reassert a terminal's default
+    modes between screens, so this needs to run at the start of every fresh curses session, not just
+    once for the whole process.
+    """
+    try:
+        sys.stdout.write("\x1b[?1004l")
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        pass
+
+
 _SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
 
 
@@ -355,7 +373,7 @@ class Agent:
             cmd = self.command(prompt, output_file)
             proc = subprocess.Popen(
                 cmd, cwd=self.workspace, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1,
+                text=True, bufsize=1, encoding="utf-8", errors="replace",
             )
             captured: list[str] = []
             events: queue.SimpleQueue[str] = queue.SimpleQueue()
@@ -402,7 +420,7 @@ class Agent:
                     break
             raw = "".join(captured).strip()
             if output_file and output_file.exists():
-                answer = output_file.read_text(errors="replace").strip()
+                answer = output_file.read_text(encoding="utf-8", errors="replace").strip()
             else:
                 answer = raw
             if code != 0:
@@ -424,7 +442,7 @@ class MockAgent(Agent):
                 "agent's useful points, and proposed a concrete next step with explicit tradeoffs.")
 
 
-TASK_STATUS_COMPLETE = re.compile(r"task status:\s*complete", re.IGNORECASE)
+TASK_STATUS_COMPLETE = re.compile(r"task status:[ \t]*complete", re.IGNORECASE)
 TASK_STATUS_HINT = (
     "\n\nEnd your response with a final line reading exactly `TASK STATUS: complete` if the "
     "objective is now fully done and verified (files written, checked, working), or `TASK STATUS: "
@@ -435,7 +453,8 @@ TASK_STATUS_HINT = (
 
 def signals_task_complete(text: str) -> bool:
     """Whether an agent's response ends with a TASK STATUS: complete marker."""
-    return bool(TASK_STATUS_COMPLETE.search(text[-300:]))
+    lines = text.rstrip().splitlines()
+    return bool(lines and TASK_STATUS_COMPLETE.fullmatch(lines[-1].strip()))
 
 
 DIBS_PATTERN = re.compile(r"^\s*dibs:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
@@ -534,6 +553,27 @@ and keep its overall shape. Do not mention the roundtable process, the transcrip
 instructions, or that this is a draft or someone else's work. Return only the polished answer."""
 
 
+def reassignment_prompt(objective: str, turns: list[Turn], phase: str, speaker: str,
+                        remaining: Iterable[str]) -> str:
+    """Prompt for an agent that finished its turn while others in the same phase are still working:
+    pick up different unclaimed work, or help a specific agent still in progress, instead of idling
+    until the round closes."""
+    history = transcript(turns) or "(No contributions yet.)"
+    still_working = ", ".join(sorted(remaining))
+    dibs_claims = extract_dibs(turns)
+    claimed_note = ("; ".join(f"{name} has dibs on {claim}" for name, claim in dibs_claims.items())
+                    if dibs_claims else "nothing yet claimed by name")
+    return (f"{SYSTEM_BRIEF}\n\nUSER OBJECTIVE:\n{objective}\n\nSHARED TRANSCRIPT:\n{history}\n\n"
+           f"YOUR TURN ({speaker}, {phase} · extra):\n"
+           f"You already finished your part of this round while {still_working} are still working "
+           f"({claimed_note}). Rather than sit idle, do one of two things: (1) pick up a different, "
+           f"useful part of the objective nobody has claimed yet — open with a DIBS: line as usual — "
+           f"or (2) prepare something that will genuinely help {still_working}: a check, a test, "
+           f"missing context, or an alternative worth them considering. Say up front which you're "
+           f"doing and, for (2), who it's for. Choose whichever is more valuable; be concrete either "
+           f"way. If there is truly nothing useful left to add, say so briefly instead of padding.")
+
+
 def atomic_write_text(path: Path, content: str) -> None:
     """Replace a text file atomically without risking the previous saved version."""
     temporary: Path | None = None
@@ -586,7 +626,7 @@ def save_session(session: Session, output_dir: Path) -> tuple[Path, Path]:
 def load_session(path: Path) -> Session:
     """Load a saved JSON session, rejecting malformed or incomplete transcripts."""
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"could not read session {path}: {exc}") from exc
     if not isinstance(data, dict):
@@ -831,8 +871,11 @@ class Display:
 
     def handle_mouse(self, x: int, y: int, state: int) -> str | None:
         """Translate terminal mouse events, including touchscreen taps and swipes."""
-        tapped = state & (curses.BUTTON1_CLICKED | curses.BUTTON1_RELEASED |
-                          curses.BUTTON1_PRESSED)
+        # BUTTON1_PRESSED is deliberately excluded: with mouse-position reporting on (needed for
+        # swipe/scroll), most terminals send a press event AND a separate release event for one
+        # physical click. Treating both as a "tap" fired every toggle twice — expand then instantly
+        # collapse again — which looked like clicking only worked while held down.
+        tapped = state & (curses.BUTTON1_CLICKED | curses.BUTTON1_RELEASED)
         if tapped and "stop" in self.hitboxes and self._inside(self.hitboxes["stop"], y, x):
             return "stop"
         if tapped:
@@ -1140,6 +1183,8 @@ OPTION_TOGGLES: tuple[tuple[str, str], ...] = (
     ("balance_load", "Balance load — scope down an agent running much slower than the others"),
     ("task_status_check", "Task status check — stop redundant work once one agent finishes"),
     ("self", "Self-edit — point the workspace at roundtable's own source to improve itself"),
+    ("skip_preflight", "Skip preflight — bypass the preliminary system check (saves time)"),
+    ("reassign_idle", "Reassign idle — a finished agent picks up other work instead of waiting"),
 )
 
 
@@ -1159,6 +1204,7 @@ def read_options_ui(stdscr: curses.window, defaults: dict[str, bool]) -> dict[st
     """A quick numbered-toggle screen for opt-in flags, shown right after startup so they can be
     switched on or off without remembering CLI flag names. CLI flags still set the starting values
     shown here, and Enter/Esc/q all just continue with whatever is currently checked."""
+    suppress_focus_reporting()
     try:
         curses.curs_set(0)
     except curses.error:
@@ -1190,6 +1236,7 @@ def read_options_ui(stdscr: curses.window, defaults: dict[str, bool]) -> dict[st
 
 def read_objective_ui(stdscr: curses.window, workspace: Path, touch_mode: bool = False) -> str:
     """Collect the task inside the same visual language as the main application."""
+    suppress_focus_reporting()
     try:
         curses.curs_set(1)
     except curses.error:
@@ -1254,8 +1301,9 @@ def read_objective_ui(stdscr: curses.window, workspace: Path, touch_mode: bool =
                 _, x, y, _, state = curses.getmouse()
             except curses.error:
                 continue
-            tapped = state & (curses.BUTTON1_CLICKED | curses.BUTTON1_RELEASED |
-                              curses.BUTTON1_PRESSED)
+            # See Display.handle_mouse: excluding BUTTON1_PRESSED avoids double-firing a tap once
+            # for the press and again for the release of the same physical touch/click.
+            tapped = state & (curses.BUTTON1_CLICKED | curses.BUTTON1_RELEASED)
             action = next((name for name, box in buttons.items()
                            if tapped and Display._inside(box, y, x)), None)
             if action == "start" and editor.text.strip():
@@ -1335,7 +1383,7 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
                         status: Callable[[Iterable[str], str], None], message: str,
                         log_prompt: Callable[[str, str], None] = lambda *_: None,
                         agent_speed: dict[str, list[float]] | None = None,
-                        task_status_check: bool = False) -> None:
+                        task_status_check: bool = False, reassign_idle: bool = False) -> None:
     """Run one collaboration phase concurrently and record results deterministically.
 
     When agent_speed is provided, an agent running notably slower than the others (based on
@@ -1346,8 +1394,15 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
     the objective is fully done. The first agent to do so stops the other still-running agents in
     this phase rather than letting them duplicate finished work — they get a turn again in the next
     phase (typically a review round) to check and refine it instead.
+
+    When reassign_idle is set, an agent that finishes its turn while others are still working (and
+    nobody has declared the whole task complete) gets one extra prompt asking it to pick up different
+    unclaimed work or help a still-running agent, instead of sitting idle for the rest of the round.
+    At most one extra attempt per agent per phase; it's cancelled if it's still going once the round
+    would otherwise be over, so it can't drag a phase out past its slowest primary agent.
     """
     names = [name for name, _ in agents]
+    by_name = dict(agents)
     status(names, message)
     prompts = {
         name: prompt_for(session.objective, session.turns, phase, name, sequential=False,
@@ -1364,6 +1419,7 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
     phase_start = time.monotonic()
     completed_by: str | None = None
     skipped: set[str] = set()
+    bonus_futures: dict[str, concurrent.futures.Future] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(agents),
                                                thread_name_prefix="roundtable") as pool:
         futures = {
@@ -1391,16 +1447,27 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
                             agent_speed.setdefault(name, []).append(elapsed)
                         tick(name, f"finished this phase ({elapsed:.1f}s) — waiting on "
                                     f"{', '.join(sorted(remaining)) or 'nothing else'}")
+                        declared_complete = False
                         if task_status_check and completed_by is None and remaining:
                             try:
-                                done = signals_task_complete(futures[name].result())
+                                declared_complete = signals_task_complete(futures[name].result())
                             except Exception:
-                                done = False
-                            if done:
+                                declared_complete = False
+                            if declared_complete:
                                 completed_by, skipped = name, set(remaining)
                                 cancel_event.set()
                                 tick(name, f"marked the task complete — skipping "
                                             f"{', '.join(sorted(skipped))} this phase")
+                        if (reassign_idle and not declared_complete and completed_by is None
+                                and remaining and name not in bonus_futures):
+                            bonus_prompt = reassignment_prompt(session.objective, session.turns,
+                                                               phase, name, remaining)
+                            log_prompt(name, bonus_prompt)
+                            tick(name, f"picking up extra work while "
+                                        f"{', '.join(sorted(remaining))} finish")
+                            bonus_futures[name] = pool.submit(
+                                by_name[name].run, bonus_prompt,
+                                lambda line, speaker=name: events.put((speaker, line)))
                     pending = remaining
                     status([name for name in names if name in pending], message)
         except BaseException:
@@ -1424,8 +1491,29 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
                 tick(*events.get_nowait())
             except queue.Empty:
                 break
+        bonus_results: dict[str, str] = {}
+        if bonus_futures:
+            # The round is otherwise over: let any bonus attempt still running wind down rather than
+            # dragging the phase out, then take whichever ones made it in time. Resolved here, while
+            # the pool is still open, so this stays bounded instead of blocking on shutdown below.
+            cancel_event.set()
+            for name, future in bonus_futures.items():
+                try:
+                    bonus_results[name] = future.result(timeout=4.0)
+                except Exception:
+                    continue
         results = {name: futures[name].result() for name in names if name not in skipped}
+    # A task_status_check completion sets cancel_event on every agent (line ~1404 above) so the
+    # other agents in THIS phase stop — but that Event object stays attached to the Agent instances
+    # after this function returns. Left alone, it silently poisons the next call that runs any of
+    # these agents without passing its own cancel_event (e.g. synthesize()), which would see an
+    # already-cancelled event and abort instantly. Clear it here so only an active phase can cancel.
+    for _, agent in agents:
+        agent.cancel_event = None
     session.turns.extend(Turn(name, phase, results[name]) for name in names if name in results)
+    for name, content in bonus_results.items():
+        tick(name, f"extra contribution ({len(content)} chars)")
+        session.turns.append(Turn(name, f"{phase} · extra", content))
     for name in names:
         tick(name, "")
 
@@ -1503,7 +1591,10 @@ def synthesize(session: Session, order: list[tuple[str, Agent]],
         prompt = (final_prompt(session.objective, session.turns, followup) if index == 0 else
                  refine_prompt(session.objective, session.turns, draft, followup))
         log_prompt(name, prompt)
-        draft = agent.run(prompt, lambda line, speaker=name: tick(speaker, line))
+        # Pass a fresh Event explicitly rather than relying on agent.cancel_event: a prior phase's
+        # task_status_check cancellation could otherwise leave that attribute already set, which
+        # would abort this agent's turn before it starts.
+        draft = agent.run(prompt, lambda line, speaker=name: tick(speaker, line), threading.Event())
     status([], "Final answer complete")
     return draft
 
@@ -1583,11 +1674,12 @@ def _run_phase(runner: Callable[..., None], session: Session, agents: list[tuple
               status: Callable[[Iterable[str], str], None], message: str,
               log_prompt: Callable[[str, str], None],
               agent_speed: dict[str, list[float]] | None,
-              task_status_check: bool = False) -> None:
-    """Dispatch to a phase runner, passing agent_speed/task_status_check only to the parallel runner."""
+              task_status_check: bool = False, reassign_idle: bool = False) -> None:
+    """Dispatch to a phase runner, passing agent_speed/task_status_check/reassign_idle only to the
+    parallel runner that uses them."""
     if runner is _run_parallel_phase:
         runner(session, agents, phase, tick, status, message, log_prompt, agent_speed,
-              task_status_check)
+              task_status_check, reassign_idle)
     else:
         runner(session, agents, phase, tick, status, message, log_prompt)
 
@@ -1597,7 +1689,8 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent,
             status: Callable[[Iterable[str], str], None],
             followup: bool = False, collab: str = "parallel", synthesizer: str = "rotate",
             log_prompt: Callable[[str, str], None] = lambda *_: None,
-            balance_load: bool = False, task_status_check: bool = False) -> None:
+            balance_load: bool = False, task_status_check: bool = False,
+            reassign_idle: bool = False) -> None:
     agents = [("Codex", codex), ("Claude", claude), ("Antigravity", antigravity)]
     agent_speed: dict[str, list[float]] | None = {} if balance_load else None
     phase = "followup-proposal" if followup else "proposal"
@@ -1606,7 +1699,7 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent,
     message = (f"Agents are addressing the follow-up {style}" if followup else
                f"Agents are developing solutions {style}")
     _run_phase(proposal_runner, session, agents, phase, tick, status, message, log_prompt,
-              agent_speed, task_status_check)
+              agent_speed, task_status_check, reassign_idle)
     for round_no in range(1, session.rounds + 1):
         phase = f"followup-review {round_no}" if followup else f"review {round_no}"
         runner = _phase_runner(collab, round_no)
@@ -1614,7 +1707,7 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent,
         _run_phase(
             runner, session, agents, phase, tick, status,
             f"Agents are reviewing {round_style} · round {round_no}/{session.rounds}",
-            log_prompt, agent_speed, task_status_check,
+            log_prompt, agent_speed, task_status_check, reassign_idle,
         )
     order = synthesis_order(synthesizer, session, codex, claude, antigravity)
     session.final = synthesize(session, order, tick, status, log_prompt, followup)
@@ -1624,6 +1717,7 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent,
 def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
             codex: Agent, claude: Agent, antigravity: Agent,
             resumed: bool = False) -> int:
+    suppress_focus_reporting()
     run_log = RunLog(log_path_for(session, Path(args.output_dir)))
     ui = Display(stdscr, session, args.touch_mode, run_log)
     def status(active: Iterable[str], message: str) -> None:
@@ -1632,8 +1726,9 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
     try:
         ui.busy = True
         stdscr.nodelay(True)
-        run_preflight([("Codex", codex), ("Claude", claude), ("Antigravity", antigravity)],
-                      ui.tick, status)
+        if not args.skip_preflight:
+            run_preflight([("Codex", codex), ("Claude", claude), ("Antigravity", antigravity)],
+                          ui.tick, status, timeout=args.preflight_timeout)
         ui.busy = False
         ui.status = "Ready"
         followup = resumed
@@ -1649,7 +1744,8 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
             stdscr.nodelay(True)
             conduct(session, codex, claude, antigravity, ui.tick, status, followup,
                    collab=args.collab, synthesizer=args.synthesizer, log_prompt=ui.log_prompt,
-                   balance_load=args.balance_load, task_status_check=args.task_status_check)
+                   balance_load=args.balance_load, task_status_check=args.task_status_check,
+                   reassign_idle=args.reassign_idle)
             ui.busy = False
             paths = save_session(session, Path(args.output_dir))
             ui.status = "Complete"
@@ -1696,7 +1792,15 @@ def verify_clis(mock: bool) -> None:
         raise SystemExit(f"Missing required CLI(s): {', '.join(missing)}")
 
 
-def main() -> int:
+def positive_finite_float(value: str) -> float:
+    """Argparse type for positive, finite timeout values."""
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive finite number")
+    return number
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="roundtable",
                                      description="A shared terminal roundtable for Codex, Claude, and Antigravity")
     parser.add_argument("objective", nargs="?", help="the problem the agents should solve")
@@ -1727,6 +1831,10 @@ def main() -> int:
                              "complete once the objective is fully done; the first agent to do so "
                              "stops the others from redoing the same finished work, leaving them "
                              "to review and refine it in the next phase instead")
+    parser.add_argument("--reassign-idle", action="store_true",
+                        help="in parallel phases, an agent that finishes while others are still "
+                             "working gets one extra prompt to pick up different unclaimed work or "
+                             "help a still-running agent, instead of sitting idle for the round")
     parser.add_argument("--elevated", choices=["codex", "claude", "antigravity", "all"],
                         action="append", default=[], metavar="AGENT",
                         help="run the named agent (repeatable, or 'all') with its CLI's own "
@@ -1742,7 +1850,17 @@ def main() -> int:
     parser.add_argument("--plain", action="store_true", help="disable fullscreen UI")
     parser.add_argument("--touch", action=argparse.BooleanOptionalAction, default=None,
                         help="enable or disable touchscreen controls (auto-detected by default)")
+    parser.add_argument("--preflight-timeout", type=positive_finite_float, default=25.0,
+                        help="timeout in seconds for each agent's preflight connectivity check "
+                             "(default: 25.0)")
+    parser.add_argument("--skip-preflight", action="store_true",
+                        help="skip the preliminary system check entirely")
     parser.add_argument("--mock", action="store_true", help=argparse.SUPPRESS)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
     args = parser.parse_args()
     args.touch_mode = has_touchscreen() if args.touch is None else args.touch
     if not args.plain and sys.stdin.isatty() and sys.stdout.isatty():
@@ -1752,6 +1870,8 @@ def main() -> int:
             "balance_load": args.balance_load,
             "task_status_check": args.task_status_check,
             "self": args.self,
+            "skip_preflight": args.skip_preflight,
+            "reassign_idle": args.reassign_idle,
         })
         if toggled["elevated"] != started_elevated:
             # Only overwrite a specific --elevated CODEX/CLAUDE/... choice if the toggle actually
@@ -1760,6 +1880,8 @@ def main() -> int:
         args.balance_load = toggled["balance_load"]
         args.task_status_check = toggled["task_status_check"]
         args.self = toggled["self"]
+        args.skip_preflight = toggled["skip_preflight"]
+        args.reassign_idle = toggled["reassign_idle"]
     verify_clis(args.mock)
     self_dir = Path(__file__).resolve().parent
     resumed = args.resume is not None
@@ -1829,11 +1951,13 @@ def main() -> int:
         def log_prompt(name: str, prompt: str) -> None:
             run_log.write("prompt", f"[{name}] PROMPT:\n{prompt}")
         try:
-            run_preflight([("Codex", codex), ("Claude", claude), ("Antigravity", antigravity)],
-                          tick, status)
+            if not args.skip_preflight:
+                run_preflight([("Codex", codex), ("Claude", claude), ("Antigravity", antigravity)],
+                              tick, status, timeout=args.preflight_timeout)
             conduct(session, codex, claude, antigravity, tick, status, followup=resumed,
                    collab=args.collab, synthesizer=args.synthesizer, log_prompt=log_prompt,
-                   balance_load=args.balance_load, task_status_check=args.task_status_check)
+                   balance_load=args.balance_load, task_status_check=args.task_status_check,
+                   reassign_idle=args.reassign_idle)
         except KeyboardInterrupt:
             run_log.write("error", "Cancelled by user")
             if session.turns:

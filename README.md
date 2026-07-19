@@ -31,11 +31,10 @@ roundtable
 ```
 
 In a real terminal (not `--plain` or piped), startup shows a quick numbered toggle screen for the
-opt-in options below before anything else — press `1`/`2`/`3`/`4` to flip elevated permissions, load
-balancing, the task-status check, or self-edit mode, then Enter (or Esc/`q`) to continue. Any matching
-CLI flag you already passed sets that toggle's starting state; leaving a toggle untouched keeps
-whatever the flag specified (so a specific `--elevated codex` survives even if you don't touch that
-option).
+opt-in options below before anything else — press the number shown next to an option to flip it,
+then Enter (or Esc/`q`) to continue. Any matching CLI flag you already passed sets that toggle's
+starting state; leaving a toggle untouched keeps whatever the flag specified (so a specific
+`--elevated codex` survives even if you don't touch that option).
 
 Useful options:
 
@@ -58,6 +57,12 @@ Useful options:
                        prompt in later parallel phases, instead of the same full task
 --task-status-check    In parallel phases, stop agents still working once one marks the objective
                        fully done, instead of letting them redo the same finished work
+--reassign-idle        In parallel phases, an agent that finishes while others are still working
+                       gets one extra prompt to pick up different unclaimed work or help a
+                       still-running agent, instead of sitting idle for the round
+--preflight-timeout S  Set the positive timeout in seconds for each startup connectivity check
+                       (default: 25)
+--skip-preflight       Skip startup connectivity checks
 --elevated AGENT       Run codex, claude, antigravity, or all with that CLI's own permission-bypass
                        flag instead of the sandboxed default (repeatable). Dangerous — see Safety model.
 --plain                Stream a non-fullscreen version (also used in pipes)
@@ -77,9 +82,11 @@ roundtable --resume .roundtable/roundtable-20260718-120000-000000.json \
 Without follow-up text, fullscreen mode opens the follow-up editor. Plain or piped mode requires the
 follow-up as an argument or on standard input.
 
-Before the real task starts, all three CLIs get a quick "reply OK" preflight check (25s timeout each,
-run in parallel). This exists so a hung or unauthenticated CLI fails fast with a named reason instead
-of leaving every panel stuck on "waiting for task" with no explanation.
+Before the real task starts, all three CLIs get a quick "reply OK" preflight check (25s timeout each
+by default, run in parallel). This exists so a hung or unauthenticated CLI fails fast with a named
+reason instead of leaving every panel stuck on "waiting for task" with no explanation. Override the
+per-agent timeout with `--preflight-timeout`, or skip the check entirely with `--skip-preflight` if
+you already know the CLIs are reachable.
 
 The fullscreen view provides evenly spaced live Codex, Claude, and Antigravity panes, independent
 working/waiting states, per-agent usage sparklines (response time, output size, activity), and a
@@ -109,6 +116,14 @@ to say so stops the other agents still running that phase — `[Claude] stopped 
 completed the task; will review it next phase instead` — rather than letting them duplicate finished
 work. They still get a full turn in the next phase (typically the following review round) to check
 and refine what was done, so nothing is lost, just not redone from scratch.
+
+`--reassign-idle` covers the ordinary case, without anyone declaring the whole thing done: an agent
+that just finishes faster than the other two. Rather than sit idle for the rest of the round, it gets
+one extra prompt — informed by what's already been claimed via `DIBS:` — to either pick up a different
+useful part of the objective or prepare something that helps whichever agents are still working. The
+result lands as its own turn (`proposal · extra`) alongside the normal one. At most one extra attempt
+per agent per phase, and it's cut short if it's still running once the round would otherwise be over,
+so it can add value without ever making the phase wait longer than its slowest primary agent.
 
 Any panel — Codex, Claude, Antigravity, the shared answer, or the console — can be expanded to
 full-screen for its complete, un-truncated content: press `1`/`2`/`3`/`f`/`0`, or click/tap the panel.

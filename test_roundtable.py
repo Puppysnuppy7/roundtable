@@ -1,4 +1,5 @@
 import contextlib
+import inspect
 import io
 import json
 import os
@@ -14,7 +15,7 @@ import roundtable
 
 
 class FailingAgent(roundtable.Agent):
-    def run(self, prompt, on_tick):
+    def run(self, prompt, on_tick, cancel_event=None):
         raise RuntimeError("boom: simulated failure")
 
 
@@ -128,6 +129,44 @@ class RoundtableTests(unittest.TestCase):
         display.handle_mouse(5, 5, roundtable.curses.BUTTON1_CLICKED)
         self.assertIsNone(display.expanded)
         self.assertEqual(draws, ["Codex", None])
+
+    def test_press_and_release_of_one_click_only_toggles_expanded_once(self):
+        """Regression: with mouse-position reporting on, terminals commonly send a PRESSED event and
+        a separate RELEASED event for one physical click. Treating both as a tap toggled expand on
+        (press) then immediately back off (release) — looked like clicking only worked while held."""
+        display = roundtable.Display.__new__(roundtable.Display)
+        display.hitboxes = {"codex": (2, 2, 8, 30)}
+        display.scroll = {"Codex": 0, "Claude": 0, "Antigravity": 0, "Final": 0}
+        display.expanded = None
+        display.draw = lambda: None
+
+        display.handle_mouse(5, 5, roundtable.curses.BUTTON1_PRESSED)
+        self.assertIsNone(display.expanded)  # press alone must not toggle
+        display.handle_mouse(5, 5, roundtable.curses.BUTTON1_RELEASED)
+        self.assertEqual(display.expanded, "Codex")  # release completes exactly one toggle
+
+    def test_suppress_focus_reporting_writes_the_disable_sequence(self):
+        buffer = io.StringIO()
+        with mock.patch.object(sys, "stdout", buffer):
+            roundtable.suppress_focus_reporting()
+        self.assertEqual(buffer.getvalue(), "\x1b[?1004l")
+
+    def test_suppress_focus_reporting_swallows_a_broken_stdout(self):
+        class BrokenStdout:
+            def write(self, _):
+                raise OSError("broken pipe")
+
+        with mock.patch.object(sys, "stdout", BrokenStdout()):
+            roundtable.suppress_focus_reporting()  # must not raise
+
+    def test_curses_entry_points_suppress_focus_reporting_before_reading_input(self):
+        """Regression: terminals that report focus-in/out send ESC [ I / ESC [ O on every alt-tab.
+        Every text box here treats a bare Escape as cancel, so without disabling that reporting mode,
+        switching focus away and back could look like the user hit Escape and silently end the run."""
+        for name in ("read_options_ui", "read_objective_ui", "run_tui"):
+            with self.subTest(entry_point=name):
+                source = inspect.getsource(getattr(roundtable, name))
+                self.assertIn("suppress_focus_reporting()", source)
 
     def test_expand_keys_toggle_and_collapse_key_clears(self):
         display = roundtable.Display.__new__(roundtable.Display)
@@ -322,7 +361,7 @@ class RoundtableTests(unittest.TestCase):
             stopped = 0
             lock = threading.Lock()
 
-            def run(self, prompt, on_tick):
+            def run(self, prompt, on_tick, cancel_event=None):
                 on_tick("started")
                 while not self.cancel_event.is_set():
                     time.sleep(0.01)
@@ -365,7 +404,7 @@ class RoundtableTests(unittest.TestCase):
 
     def test_run_preflight_reports_timeout_without_hanging(self):
         class HangingAgent(roundtable.Agent):
-            def run(self, prompt, on_tick):
+            def run(self, prompt, on_tick, cancel_event=None):
                 while not self.cancel_event.is_set():
                     time.sleep(0.01)
                 raise RuntimeError(f"{self.name} cancelled")
@@ -635,6 +674,22 @@ class RoundtableTests(unittest.TestCase):
                 roundtable.main()
             self.assertTrue(captured.get("task_status_check"))
 
+    def test_reassign_idle_flag_reaches_conduct(self):
+        with tempfile.TemporaryDirectory() as td:
+            argv = ["roundtable", "Solve it", "--plain", "-r", "0", "--mock",
+                    "-C", td, "--output-dir", str(Path(td) / "out"), "--reassign-idle"]
+            captured = {}
+            real_conduct = roundtable.conduct
+
+            def recording_conduct(*args, **kwargs):
+                captured.update(kwargs)
+                return real_conduct(*args, **kwargs)
+
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(roundtable, "conduct", recording_conduct):
+                roundtable.main()
+            self.assertTrue(captured.get("reassign_idle"))
+
     def test_self_flag_points_workspace_at_roundtables_own_source(self):
         with tempfile.TemporaryDirectory() as td:
             argv = ["roundtable", "Improve the console panel", "--plain", "-r", "0", "--mock",
@@ -667,6 +722,36 @@ class RoundtableTests(unittest.TestCase):
             session = roundtable.load_session(saved)
             self.assertEqual(Path(session.workspace), Path(td).resolve())
 
+    def test_skip_preflight_flag_bypasses_check(self):
+        with tempfile.TemporaryDirectory() as td:
+            argv = ["roundtable", "Solve it", "--plain", "-r", "0", "--mock",
+                    "-C", td, "--output-dir", str(Path(td) / "out"), "--skip-preflight"]
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(roundtable, "run_preflight") as mock_preflight, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(roundtable.main(), 0)
+                mock_preflight.assert_not_called()
+
+    def test_preflight_timeout_flag_propagates_to_run_preflight(self):
+        with tempfile.TemporaryDirectory() as td:
+            argv = ["roundtable", "Solve it", "--plain", "-r", "0", "--mock",
+                    "-C", td, "--output-dir", str(Path(td) / "out"), "--preflight-timeout", "15.5"]
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(roundtable, "run_preflight") as mock_preflight, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(roundtable.main(), 0)
+                mock_preflight.assert_called_once()
+                self.assertEqual(mock_preflight.call_args[1].get("timeout"), 15.5)
+
+    def test_preflight_timeout_rejects_nonpositive_and_nonfinite_values(self):
+        for value in ("0", "-1", "nan", "inf"):
+            with self.subTest(value=value), mock.patch.object(
+                    sys, "argv", ["roundtable", "Solve it", "--preflight-timeout", value]), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    roundtable.main()
+                self.assertEqual(raised.exception.code, 2)
+
     def test_apply_option_key_toggles_by_number_and_enter_confirms(self):
         values = {"elevated": False, "balance_load": False, "task_status_check": False}
         values, done = roundtable.apply_option_key(values, "1")
@@ -680,6 +765,12 @@ class RoundtableTests(unittest.TestCase):
                                   "task_status_check": False})
         values, done = roundtable.apply_option_key(values, "\n")
         self.assertTrue(done)
+
+    def test_apply_option_key_toggles_skip_preflight(self):
+        values = {"elevated": False, "balance_load": False, "task_status_check": False, "self": False, "skip_preflight": False}
+        values, done = roundtable.apply_option_key(values, "5")
+        self.assertFalse(done)
+        self.assertTrue(values["skip_preflight"])
 
     def test_apply_option_key_escape_and_q_confirm_without_toggling(self):
         values = {"elevated": True, "balance_load": False, "task_status_check": False}
@@ -714,8 +805,13 @@ class RoundtableTests(unittest.TestCase):
                  mock.patch.object(sys.stdout, "isatty", return_value=True), \
                  mock.patch.object(roundtable.curses, "wrapper", side_effect=fake_wrapper):
                 self.assertEqual(roundtable.main(), 0)
-            self.assertEqual(captured["defaults"], {"elevated": True, "balance_load": False,
-                                                     "task_status_check": False, "self": False})
+            # Check by key rather than the whole dict, so this doesn't need editing every time a new
+            # toggle is added — test_every_store_true_opt_in_flag_has_a_matching_options_screen_toggle
+            # already guards that every toggle is present at all.
+            self.assertEqual(captured["defaults"]["elevated"], True)
+            self.assertFalse(captured["defaults"]["balance_load"])
+            self.assertFalse(captured["defaults"]["task_status_check"])
+            self.assertFalse(captured["defaults"]["self"])
             result_args = captured["args"]
             self.assertEqual(result_args.elevated, ["codex"])  # left untouched, so preserved as-is
             self.assertTrue(result_args.balance_load)  # toggled on in the fake screen
@@ -723,11 +819,18 @@ class RoundtableTests(unittest.TestCase):
             self.assertFalse(result_args.task_status_check)
 
     def test_every_store_true_opt_in_flag_has_a_matching_options_screen_toggle(self):
-        """Guards against the exact gap --self shipped with: a new opt-in flag added to the parser
-        without a matching entry in OPTION_TOGGLES, so the interactive menu silently falls behind."""
-        parser_flags = {"balance_load", "task_status_check", "self"}  # store_true, user-facing
+        """Guards against parser flags added to the parser without a matching entry in OPTION_TOGGLES,
+        so the interactive menu silently falls behind."""
+        parser = roundtable.build_parser()
+        parser_flags = {
+            action.dest
+            for action in parser._actions
+            if isinstance(action, roundtable.argparse._StoreTrueAction)
+            and action.help != roundtable.argparse.SUPPRESS
+            and action.dest != "plain"
+        }
         toggle_names = {name for name, _ in roundtable.OPTION_TOGGLES}
-        self.assertTrue(parser_flags <= toggle_names)
+        self.assertTrue(parser_flags <= toggle_names, f"Missing toggles for: {parser_flags - toggle_names}")
 
     def test_self_toggle_flips_workspace_to_roundtables_own_source(self):
         # cwd must differ from roundtable's own source dir, or a broken --self would still resolve
@@ -924,7 +1027,7 @@ class RoundtableTests(unittest.TestCase):
             active = 0
             maximum = 0
 
-            def run(self, prompt, on_tick):
+            def run(self, prompt, on_tick, cancel_event=None):
                 with self.lock:
                     type(self).active += 1
                     type(self).maximum = max(type(self).maximum, type(self).active)
@@ -956,7 +1059,7 @@ class RoundtableTests(unittest.TestCase):
         seen_prompts: dict[str, str] = {}
 
         class StaggeredAgent(roundtable.Agent):
-            def run(self, prompt, on_tick):
+            def run(self, prompt, on_tick, cancel_event=None):
                 time.sleep(delays[self.name])
                 seen_prompts[self.name] = prompt
                 return f"{self.name} done"
@@ -985,7 +1088,7 @@ class RoundtableTests(unittest.TestCase):
         seen_prompts: dict[str, str] = {}
 
         class SlowAgent(roundtable.Agent):
-            def run(self, prompt, on_tick):
+            def run(self, prompt, on_tick, cancel_event=None):
                 time.sleep(0.05 if self.name == "Antigravity" else 0.01)
                 seen_prompts[self.name] = prompt
                 return f"{self.name} done"
@@ -1006,7 +1109,7 @@ class RoundtableTests(unittest.TestCase):
         seen_prompts: list[tuple[str, str]] = []
 
         class StaggeredAgent(roundtable.Agent):
-            def run(self, prompt, on_tick):
+            def run(self, prompt, on_tick, cancel_event=None):
                 time.sleep(delays[self.name])
                 return f"{self.name} done"
 
@@ -1028,7 +1131,7 @@ class RoundtableTests(unittest.TestCase):
         seen_prompts = {}
 
         class RelayAgent(roundtable.Agent):
-            def run(self, prompt, on_tick):
+            def run(self, prompt, on_tick, cancel_event=None):
                 seen_prompts[self.name] = prompt
                 return f"{self.name} says hi"
 
@@ -1051,7 +1154,7 @@ class RoundtableTests(unittest.TestCase):
             active = 0
             maximum = 0
 
-            def run(self, prompt, on_tick):
+            def run(self, prompt, on_tick, cancel_event=None):
                 with self.lock:
                     type(self).active += 1
                     type(self).maximum = max(type(self).maximum, type(self).active)
@@ -1075,7 +1178,7 @@ class RoundtableTests(unittest.TestCase):
             active = 0
             maxima = []
 
-            def run(self, prompt, on_tick):
+            def run(self, prompt, on_tick, cancel_event=None):
                 with self.lock:
                     type(self).active += 1
                 time.sleep(0.03)
@@ -1137,7 +1240,7 @@ class RoundtableTests(unittest.TestCase):
         seen_prompts: list[tuple[str, str]] = []
 
         class RecordingAgent(roundtable.Agent):
-            def run(self, prompt, on_tick):
+            def run(self, prompt, on_tick, cancel_event=None):
                 seen_prompts.append((self.name, prompt))
                 return f"{self.name}'s version"
 
@@ -1204,6 +1307,15 @@ class RoundtableTests(unittest.TestCase):
         self.assertNotIn("Already claimed", prompt)
         self.assertIn("DIBS: <short claim>", prompt)
 
+    def test_reassignment_prompt_names_who_is_still_working_and_what_they_claimed(self):
+        turns = [roundtable.Turn("Claude", "proposal", "DIBS: the frontend\nWorking on it.")]
+        prompt = roundtable.reassignment_prompt("Goal", turns, "proposal", "Codex",
+                                                {"Claude", "Antigravity"})
+        self.assertIn("Antigravity, Claude", prompt)
+        self.assertIn("Claude has dibs on the frontend", prompt)
+        self.assertIn("pick up a different", prompt)
+        self.assertIn("help", prompt)
+
     def test_spinner_frame_differs_by_agent_and_cycles(self):
         codex_frames = {roundtable.spinner_frame("Codex", i) for i in range(12)}
         claude_frames = {roundtable.spinner_frame("Claude", i) for i in range(12)}
@@ -1220,7 +1332,7 @@ class RoundtableTests(unittest.TestCase):
         delays = {"Codex": 0.02, "Claude": 0.12, "Antigravity": 0.22}
 
         class StaggeredAgent(roundtable.Agent):
-            def run(self, prompt, on_tick):
+            def run(self, prompt, on_tick, cancel_event=None):
                 time.sleep(delays[self.name])
                 return self.name
 
@@ -1243,7 +1355,7 @@ class RoundtableTests(unittest.TestCase):
         delays = {"Codex": 0.02, "Claude": 0.12, "Antigravity": 0.22}
 
         class StaggeredAgent(roundtable.Agent):
-            def run(self, prompt, on_tick):
+            def run(self, prompt, on_tick, cancel_event=None):
                 time.sleep(delays[self.name])
                 return self.name
 
@@ -1266,10 +1378,20 @@ class RoundtableTests(unittest.TestCase):
     def test_signals_task_complete_matches_marker_near_end_of_text(self):
         self.assertTrue(roundtable.signals_task_complete("All done.\nTASK STATUS: complete"))
         self.assertTrue(roundtable.signals_task_complete("All done.\ntask status: COMPLETE  "))
+        self.assertTrue(roundtable.signals_task_complete("All done.\nTASK STATUS: complete\n\n"))
         self.assertFalse(roundtable.signals_task_complete("All done.\nTASK STATUS: in-progress"))
         self.assertFalse(roundtable.signals_task_complete("Still working on it."))
         buried = "TASK STATUS: complete" + ("x" * 400)
         self.assertFalse(roundtable.signals_task_complete(buried))
+
+    def test_signals_task_complete_only_accepts_the_final_marker(self):
+        self.assertFalse(roundtable.signals_task_complete(
+            "I considered TASK STATUS: complete, but verification remains.\n"
+            "TASK STATUS: in-progress"
+        ))
+        self.assertFalse(roundtable.signals_task_complete(
+            "TASK STATUS: complete\nVerification still pending."
+        ))
 
     def test_prompt_for_includes_task_status_hint_only_when_requested(self):
         plain = roundtable.prompt_for("Goal", [], "proposal", "Codex")
@@ -1279,13 +1401,13 @@ class RoundtableTests(unittest.TestCase):
 
     def test_run_parallel_phase_stops_other_agents_once_one_signals_task_complete(self):
         class WaitingAgent(roundtable.Agent):
-            def run(self, prompt, on_tick):
+            def run(self, prompt, on_tick, cancel_event=None):
                 while not self.cancel_event.is_set():
                     time.sleep(0.01)
                 raise RuntimeError(f"{self.name} cancelled")
 
         class DoneAgent(roundtable.Agent):
-            def run(self, prompt, on_tick):
+            def run(self, prompt, on_tick, cancel_event=None):
                 return "Wrote the file and verified it.\nTASK STATUS: complete"
 
         with tempfile.TemporaryDirectory() as td:
@@ -1307,7 +1429,7 @@ class RoundtableTests(unittest.TestCase):
 
     def test_run_parallel_phase_without_task_status_check_ignores_the_marker(self):
         class DoneAgent(roundtable.Agent):
-            def run(self, prompt, on_tick):
+            def run(self, prompt, on_tick, cancel_event=None):
                 time.sleep(0.02)
                 return "Done.\nTASK STATUS: complete"
 
@@ -1319,9 +1441,109 @@ class RoundtableTests(unittest.TestCase):
                                            lambda *_: None, "Working")
             self.assertEqual({turn.speaker for turn in session.turns}, {"Codex", "Claude", "Antigravity"})
 
+    def test_reassign_idle_gives_a_finished_agent_extra_work_while_others_run(self):
+        calls = {"Codex": 0}
+
+        class MixedAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None):
+                if self.name == "Codex":
+                    calls["Codex"] += 1
+                    return "Codex extra content" if calls["Codex"] > 1 else "Codex proposal content"
+                time.sleep(0.2)
+                return f"{self.name} proposal content"
+
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            session = roundtable.Session("Goal", td, 0, "now", [])
+            agents = [(name, MixedAgent(name, workspace)) for name in ("Codex", "Claude", "Antigravity")]
+            ticks = []
+            roundtable._run_parallel_phase(
+                session, agents, "proposal",
+                lambda speaker, line: ticks.append((speaker, line)),
+                lambda *_: None, "Working", reassign_idle=True,
+            )
+            phases = [(t.speaker, t.phase) for t in session.turns]
+            self.assertIn(("Codex", "proposal · extra"), phases)
+            self.assertEqual({t.phase for t in session.turns if t.speaker != "Codex"}, {"proposal"})
+            self.assertEqual(calls["Codex"], 2)
+            self.assertTrue(any("picking up extra work" in line for _, line in ticks))
+
+    def test_reassign_idle_off_by_default_leaves_a_finished_agent_idle(self):
+        calls = {"Codex": 0}
+
+        class MixedAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None):
+                if self.name == "Codex":
+                    calls["Codex"] += 1
+                    return "Codex proposal content"
+                time.sleep(0.1)
+                return f"{self.name} proposal content"
+
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            session = roundtable.Session("Goal", td, 0, "now", [])
+            agents = [(name, MixedAgent(name, workspace)) for name in ("Codex", "Claude", "Antigravity")]
+            roundtable._run_parallel_phase(session, agents, "proposal", lambda *_: None,
+                                           lambda *_: None, "Working")
+            self.assertEqual(calls["Codex"], 1)
+            self.assertEqual({t.phase for t in session.turns}, {"proposal"})
+
+    def test_reassign_idle_does_not_apply_to_the_agent_that_declared_task_complete(self):
+        class WaitingAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None):
+                while not self.cancel_event.is_set():
+                    time.sleep(0.01)
+                raise RuntimeError(f"{self.name} cancelled")
+
+        class DoneAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None):
+                return "Wrote the file and verified it.\nTASK STATUS: complete"
+
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            session = roundtable.Session("Goal", td, 0, "now", [])
+            agents = [("Codex", DoneAgent("Codex", workspace)),
+                     ("Claude", WaitingAgent("Claude", workspace)),
+                     ("Antigravity", WaitingAgent("Antigravity", workspace))]
+            roundtable._run_parallel_phase(
+                session, agents, "proposal", lambda *_: None, lambda *_: None, "Working",
+                task_status_check=True, reassign_idle=True,
+            )
+            self.assertEqual([t.phase for t in session.turns], ["proposal"])  # no "· extra" turn
+
+    def test_reassign_idle_discards_a_bonus_attempt_that_does_not_finish_in_time(self):
+        class HangingBonusAgent(roundtable.Agent):
+            calls = 0
+
+            def run(self, prompt, on_tick, cancel_event=None):
+                type(self).calls += 1
+                if type(self).calls == 1:
+                    return "Codex proposal content"
+                while not self.cancel_event.is_set():
+                    time.sleep(0.01)
+                raise RuntimeError("Codex cancelled")
+
+        class SlowAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None):
+                time.sleep(0.2)
+                return f"{self.name} proposal content"
+
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            session = roundtable.Session("Goal", td, 0, "now", [])
+            agents = [("Codex", HangingBonusAgent("Codex", workspace)),
+                     ("Claude", SlowAgent("Claude", workspace)),
+                     ("Antigravity", SlowAgent("Antigravity", workspace))]
+            roundtable._run_parallel_phase(session, agents, "proposal", lambda *_: None,
+                                           lambda *_: None, "Working", reassign_idle=True)
+            # The bonus attempt got cancelled once the round closed, so no "· extra" turn lands —
+            # but the phase still completes normally instead of hanging on it.
+            self.assertEqual({t.phase for t in session.turns}, {"proposal"})
+            self.assertEqual({t.speaker for t in session.turns}, {"Codex", "Claude", "Antigravity"})
+
     def test_conduct_lets_agents_skipped_by_task_status_check_review_next_round(self):
         class DoneOnceAgent(roundtable.Agent):
-            def run(self, prompt, on_tick):
+            def run(self, prompt, on_tick, cancel_event=None):
                 if f"YOUR TURN ({self.name}, proposal)" in prompt:
                     if self.name == "Codex":
                         return "Wrote the file and verified it.\nTASK STATUS: complete"
@@ -1342,6 +1564,36 @@ class RoundtableTests(unittest.TestCase):
             review_speakers = [t.speaker for t in session.turns if t.phase == "review 1"]
             self.assertEqual(proposal_speakers, ["Codex"])
             self.assertEqual(set(review_speakers), {"Codex", "Claude", "Antigravity"})
+
+    def test_conduct_synthesis_survives_a_task_status_check_cancellation_earlier_in_the_run(self):
+        """Regression: a task_status_check completion sets a shared cancel_event on every agent to
+        stop the round. Real Agent.run() falls back to self.cancel_event when no override is passed
+        (agent.run(prompt, on_tick) with no third arg) — if that Event is never cleared, the next
+        such call (synthesize(), which used to call agent.run this way) saw an already-cancelled
+        Event and aborted the whole run before producing anything."""
+        class RealisticAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None):
+                cancel_event = cancel_event or self.cancel_event
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RuntimeError(f"{self.name} cancelled")
+                if f"YOUR TURN ({self.name}, proposal)" in prompt:
+                    if self.name == "Codex":
+                        return "Done and verified.\nTASK STATUS: complete"
+                    while not self.cancel_event.is_set():
+                        time.sleep(0.01)
+                    raise RuntimeError(f"{self.name} cancelled")
+                return f"{self.name} says: final text"
+
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            session = roundtable.Session("Physics demo", td, 0, "now", [])
+            codex = RealisticAgent("Codex", workspace)
+            claude = RealisticAgent("Claude", workspace)
+            antigravity = RealisticAgent("Antigravity", workspace)
+            roundtable.conduct(session, codex, claude, antigravity, lambda *_: None, lambda *_: None,
+                               synthesizer="codex", task_status_check=True)
+            self.assertTrue(session.final)
+            self.assertEqual([t.phase for t in session.turns], ["proposal", "consensus"])
 
     def test_save_stems_include_microseconds(self):
         with tempfile.TemporaryDirectory() as td:
