@@ -1886,7 +1886,28 @@ class RoundtableTests(unittest.TestCase):
             roundtable._wait_for_agent_availability(
                 agent, ticks.append, threading.Event(), "rate limit exceeded, no reset given")
         wait_mock.assert_called_once_with(roundtable.AVAILABILITY_CHECK_SECONDS)
-        self.assertTrue(any("waiting 30s" in tick for tick in ticks))
+        self.assertTrue(any("polling every 30s" in tick for tick in ticks))
+
+    def test_wait_for_agent_availability_only_announces_method_once_across_polls(self):
+        class FlakyThenReadyAgent(roundtable.Agent):
+            probes = 0
+
+            def run(self, prompt, on_tick, cancel_event=None):
+                type(self).probes += 1
+                if type(self).probes < 3:
+                    raise roundtable.UsageLimitError("still rate limited, no reset given")
+                return "OK"
+
+        agent = FlakyThenReadyAgent("Claude", Path("/tmp"))
+        ticks = []
+        with mock.patch.object(threading.Event, "wait", return_value=False):
+            roundtable._wait_for_agent_availability(
+                agent, ticks.append, threading.Event(), "rate limit exceeded, no reset given")
+        self.assertEqual(FlakyThenReadyAgent.probes, 3)
+        announce_count = sum(1 for tick in ticks if "polling every" in tick)
+        self.assertEqual(announce_count, 1)
+        self.assertNotIn(True, ["checking whether" in tick for tick in ticks])
+        self.assertNotIn(True, ["still unavailable" in tick for tick in ticks])
 
     def test_run_parallel_phase_recovers_a_primary_agent_that_fails_once(self):
         class FlakyAgent(roundtable.Agent):

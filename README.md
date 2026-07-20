@@ -153,6 +153,8 @@ agent's turn pending and, when the provider's own message names a reset time (e.
 (America/Chicago)"), sleeps until just past that moment instead of polling — there's no point checking
 early when the limit is known not to have cleared yet. Without a recognizable reset time it falls back
 to checking availability every 30 seconds with the lightweight preflight prompt. Either way, the
+console only shows which method is being used, announced once, and a final line once the agent
+responds — the repeated 30-second rechecks stay silent instead of flooding the console, and the
 original task is resent once the agent responds. The wait continues only while Roundtable is running
 and remains cancellable with Ctrl+C (or by `--task-status-check`).
 

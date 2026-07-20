@@ -1628,27 +1628,34 @@ def _wait_for_agent_availability(agent: Agent, on_tick: Callable[[str], None],
     checking earlier is pointless, since the limit is known not to have cleared yet. Falls back to
     periodic polling when no reset time is present or parseable, or once the reported time has come
     and gone but the agent still isn't back (a slow or inaccurate reset).
+
+    Only two ticks are emitted for a normal wait: which method is being used, announced once up
+    front, and confirmation once the agent answers again. A poll fallback can run for a long time
+    at a short interval, and announcing every recheck (or every "still unavailable") would flood
+    the console with nothing new to say -- silence between those two ticks means it's still waiting.
     """
+    announced = False
     while True:
         now = clock()
         reset_at = parse_reset_time(detail, now) if detail else None
         if reset_at is not None:
             wait_seconds = max(0.0, (reset_at - now).total_seconds()) + RESET_TIME_BUFFER_SECONDS
-            on_tick(f"usage limit reached — waiting until {reset_at.strftime('%-I:%M%p')} "
-                    "before checking availability")
+            if not announced:
+                on_tick(f"usage limit reached — waiting until {reset_at.strftime('%-I:%M%p')} "
+                        "before checking availability")
         else:
             wait_seconds = AVAILABILITY_CHECK_SECONDS
-            on_tick(f"usage limit reached — waiting {wait_seconds:g}s before checking availability")
+            if not announced:
+                on_tick(f"usage limit reached — polling every {wait_seconds:g}s until available")
+        announced = True
         if cancel_event.wait(wait_seconds):
             raise RuntimeError(f"{agent.name} cancelled")
-        on_tick("checking whether the agent is available again")
         try:
             agent.run(PREFLIGHT_PROMPT, on_tick, cancel_event)
         except RuntimeError as exc:
             if str(exc) == f"{agent.name} cancelled" or cancel_event.is_set():
                 raise RuntimeError(f"{agent.name} cancelled") from exc
             detail = usage_limit_detail(str(exc))
-            on_tick(f"still unavailable ({detail or str(exc).splitlines()[0]})")
             continue
         on_tick("agent available again — retrying the original task")
         return
