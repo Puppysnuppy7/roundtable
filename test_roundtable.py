@@ -292,6 +292,90 @@ class RoundtableTests(unittest.TestCase):
         # A far wider wrap than the normal ~1/3-width column fits many more "word"s per line.
         self.assertIn("word " * 15, rendered)
 
+    def test_latest_agent_turns_keeps_each_agents_latest_contribution_in_panel_order(self):
+        turns = [
+            roundtable.Turn("Claude", "proposal", "old Claude answer"),
+            roundtable.Turn("User", "follow-up", "more detail"),
+            roundtable.Turn("Codex", "review", "Codex conclusion and ask"),
+            roundtable.Turn("Claude", "review", "new Claude conclusion"),
+            roundtable.Turn("Final", "consensus", "combined"),
+        ]
+
+        latest = roundtable.latest_agent_turns(turns)
+
+        self.assertEqual([(turn.speaker, turn.content) for turn in latest], [
+            ("Codex", "Codex conclusion and ask"),
+            ("Claude", "new Claude conclusion"),
+        ])
+
+    def test_answer_box_previews_individual_conclusions_and_asks(self):
+        turns = [
+            roundtable.Turn("Codex", "proposal", "obsolete Codex proposal"),
+            roundtable.Turn("Codex", "review 1", "Codex conclusion; ask about migrations"),
+            roundtable.Turn("Claude", "review 1", "Claude conclusion"),
+            roundtable.Turn("Antigravity", "review 1", "Antigravity conclusion"),
+        ]
+        display = make_test_display(turns=turns)
+        display.session.final = "The shared conclusion"
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False):
+            display.draw()
+        rendered = display.s.text()
+
+        self.assertIn("SHARED ANSWER", rendered)
+        self.assertIn("The shared conclusion", rendered)
+        self.assertIn("INDIVIDUAL CONCLUSIONS / ASKS", rendered)
+        self.assertIn("Codex · review 1: Codex conclusion; ask about migrations", rendered)
+        self.assertNotIn("obsolete Codex proposal", rendered)
+
+    def test_expanded_answer_includes_full_latest_individual_answers(self):
+        turns = [
+            roundtable.Turn("Codex", "review 1", "Codex full conclusion\nCodex open ask"),
+            roundtable.Turn("Claude", "review 1", "Claude full conclusion"),
+        ]
+        display = make_test_display(turns=turns)
+        display.session.final = "Shared conclusion"
+        display.expanded = "Final"
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False):
+            display.draw()
+        rendered = display.s.text()
+
+        self.assertIn("Shared conclusion", rendered)
+        self.assertIn("INDIVIDUAL CONCLUSIONS / ASKS", rendered)
+        self.assertIn("Codex full conclusion", rendered)
+        self.assertIn("Codex open ask", rendered)
+        self.assertIn("Claude full conclusion", rendered)
+
+    def test_answer_box_truncates_individual_section_at_minimum_terminal_size(self):
+        # At the smallest supported size (content_height == 20), the shared answer box
+        # shrinks to consensus_height == 6, leaving room for only one individual line.
+        # The section must still render cleanly rather than crashing or dropping the
+        # shared answer entirely to make room.
+        turns = [
+            roundtable.Turn("Codex", "review 1", "Codex conclusion text"),
+            roundtable.Turn("Claude", "review 1", "Claude conclusion text"),
+            roundtable.Turn("Antigravity", "review 1", "Antigravity conclusion text"),
+        ]
+        display = make_test_display(h=20, w=72, turns=turns)
+        display.session.final = "Shared answer line"
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False):
+            display.draw()
+        rendered = display.s.text()
+
+        self.assertIn("SHARED ANSWER", rendered)
+        self.assertIn("Shared answer line", rendered)
+        self.assertIn("INDIVIDUAL CONCLUSIONS / ASKS", rendered)
+        # Only the most recent agent (last in panel order) fits in the one available row.
+        self.assertIn("Antigravity · review 1", rendered)
+        y, x, y2, x2 = display.hitboxes["final"]
+        self.assertEqual(display.s.grid[y][x], "╭")
+        self.assertEqual(display.s.grid[y2][x2], "╯")
+        for row in range(y + 1, y2):
+            self.assertEqual(display.s.grid[row][x], "│")
+            self.assertEqual(display.s.grid[row][x2], "│")
+
     def test_cycle_console_filter_wraps_through_all_filters(self):
         display = roundtable.Display.__new__(roundtable.Display)
         display.console_filter = 0
@@ -456,6 +540,20 @@ class RoundtableTests(unittest.TestCase):
             elapsed = time.monotonic() - start
             self.assertLess(elapsed, 2.0)
             self.assertIn("timed out", str(raised.exception))
+
+    def test_run_preflight_allows_usage_limited_agent_to_wait_during_task(self):
+        class LimitedAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None):
+                raise RuntimeError(
+                    "Claude exited with status 1\n"
+                    "You've hit your session limit · resets 5:30pm (America/Chicago)")
+
+        with tempfile.TemporaryDirectory() as td:
+            ticks = []
+            roundtable.run_preflight(
+                [("Claude", LimitedAgent("Claude", Path(td)))],
+                lambda name, line: ticks.append((name, line)), lambda *_: None)
+        self.assertTrue(any("usage-limited; will wait" in line for _, line in ticks))
 
     def test_agents_exchange_and_synthesize(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1366,6 +1464,13 @@ class RoundtableTests(unittest.TestCase):
         self.assertTrue(codex_frames.isdisjoint(antigravity_frames))
         self.assertEqual(roundtable.spinner_frame("Codex", 0),
                          roundtable.spinner_frame("Codex", len(roundtable.AGENT_SPINNERS["Codex"][0])))
+        # Verify speed divisor advances frame correctly (Claude divisor is 3, Codex divisor is 1)
+        self.assertEqual(roundtable.spinner_frame("Claude", 0), "·")
+        self.assertEqual(roundtable.spinner_frame("Claude", 1), "·")
+        self.assertEqual(roundtable.spinner_frame("Claude", 2), "·")
+        self.assertEqual(roundtable.spinner_frame("Claude", 3), "✢")
+        self.assertEqual(roundtable.spinner_frame("Codex", 0), "◌")
+        self.assertEqual(roundtable.spinner_frame("Codex", 1), "○")
 
     def test_parallel_phase_reports_agents_completing_independently(self):
         delays = {"Codex": 0.02, "Claude": 0.12, "Antigravity": 0.22}
@@ -1562,6 +1667,8 @@ class RoundtableTests(unittest.TestCase):
                     time.sleep(0.01)
                 raise RuntimeError("Codex cancelled")
 
+        HangingBonusAgent.calls = 0
+
         class SlowAgent(roundtable.Agent):
             def run(self, prompt, on_tick, cancel_event=None):
                 time.sleep(0.2)
@@ -1682,6 +1789,51 @@ class RoundtableTests(unittest.TestCase):
         self.assertEqual(CancelledAgent.attempts, 1)  # no retry for an intentional stop
         sleep_mock.assert_not_called()
 
+    def test_run_with_retry_waits_for_usage_limit_then_reasks_original_task(self):
+        class LimitedThenReadyAgent(roundtable.Agent):
+            task_attempts = 0
+            probes = 0
+
+            def run(self, prompt, on_tick, cancel_event=None):
+                if prompt == roundtable.PREFLIGHT_PROMPT:
+                    type(self).probes += 1
+                    if type(self).probes == 1:
+                        raise roundtable.UsageLimitError(
+                            "Claude unavailable: You've hit your session limit · resets 5:30pm")
+                    return "OK"
+                type(self).task_attempts += 1
+                if type(self).task_attempts == 1:
+                    raise roundtable.UsageLimitError(
+                        "Claude unavailable: You've hit your session limit · resets 5:30pm")
+                return "completed original task"
+
+        agent = LimitedThenReadyAgent("Claude", Path("/tmp"))
+        ticks = []
+        with mock.patch.object(threading.Event, "wait", return_value=False) as wait_mock:
+            result = roundtable._run_with_retry(agent, "original task", ticks.append)
+        self.assertEqual(result, "completed original task")
+        self.assertEqual(LimitedThenReadyAgent.task_attempts, 2)
+        self.assertEqual(LimitedThenReadyAgent.probes, 2)
+        self.assertEqual(wait_mock.call_count, 2)
+        self.assertTrue(any("agent available again" in tick for tick in ticks))
+
+    def test_usage_limit_wait_stops_when_round_is_cancelled(self):
+        class LimitedAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None):
+                raise roundtable.UsageLimitError("Codex unavailable: rate limit exceeded")
+
+        agent = LimitedAgent("Codex", Path("/tmp"))
+        cancel_event = threading.Event()
+        cancel_event.set()
+        with self.assertRaisesRegex(RuntimeError, "Codex cancelled"):
+            roundtable._run_with_retry(agent, "original task", lambda _: None, cancel_event)
+
+    def test_usage_limit_detector_matches_provider_message_without_generic_limit_word(self):
+        self.assertIn("session limit", roundtable.usage_limit_detail(
+            "You've hit your session limit · resets 5:30pm (America/Chicago)"))
+        self.assertIsNone(roundtable.usage_limit_detail(
+            "Please limit this implementation to the requested scope."))
+
     def test_run_parallel_phase_recovers_a_primary_agent_that_fails_once(self):
         class FlakyAgent(roundtable.Agent):
             attempts = 0
@@ -1753,6 +1905,261 @@ class RoundtableTests(unittest.TestCase):
             self.assertIn("Execs: 8", rendered)
             self.assertIn("Writes: 4", rendered)
 
+    def test_draw_renders_active_tickers_next_to_agent_names(self):
+        display = make_test_display(h=30, w=120)
+        display.busy = True
+        display.active = {"Codex", "Claude", "Antigravity"}
+        display.frame = 0
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False):
+            display.draw()
+            rendered = display.s.text()
+            # For Codex (frame=0 is ◌)
+            self.assertIn("CODEX ◌", rendered)
+            # For Claude (frame=0 is ·)
+            self.assertIn("CLAUDE ·", rendered)
+            # For Antigravity (frame=0 is ⠁)
+            self.assertIn("ANTIGRAVITY ⠁", rendered)
+
+    def test_draw_does_not_render_tickers_when_inactive(self):
+        display = make_test_display(h=30, w=120)
+        display.busy = False
+        display.active = {"Codex", "Claude", "Antigravity"}
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False):
+            display.draw()
+            rendered = display.s.text()
+            self.assertNotIn("CODEX ◌", rendered)
+            self.assertNotIn("CLAUDE ·", rendered)
+            self.assertNotIn("ANTIGRAVITY ⠁", rendered)
+            self.assertIn("CODEX", rendered)
+            self.assertIn("CLAUDE", rendered)
+            self.assertIn("ANTIGRAVITY", rendered)
+
+    def test_draw_renders_ticker_only_for_active_agent(self):
+        display = make_test_display(h=30, w=120)
+        display.busy = True
+        display.active = {"Claude"}
+        display.frame = 3
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False):
+            display.draw()
+            rendered = display.s.text()
+            self.assertIn("CLAUDE ✢", rendered)
+            self.assertNotIn("CODEX ●", rendered)
+            self.assertNotIn("ANTIGRAVITY ⡀", rendered)
+
+    def test_draw_animates_active_tickers_over_frames(self):
+        display = make_test_display(h=30, w=120)
+        display.busy = True
+        display.active = {"Codex", "Claude", "Antigravity"}
+
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False):
+            # Test frame 1: Codex should advance (frame 1 -> ○), Claude remains (divisor 3 -> ·), Antigravity advances (frame 1 -> ⠂)
+            display.frame = 1
+            display.draw()
+            rendered = display.s.text()
+            self.assertIn("CODEX ○", rendered)
+            self.assertIn("CLAUDE ·", rendered)
+            self.assertIn("ANTIGRAVITY ⠂", rendered)
+
+            # Test frame 3: Codex advances (3 % 6 = 3 -> ●), Claude advances (3 // 3 = 1 -> ✢), Antigravity advances (3 % 8 = 3 -> ⡀)
+            display.frame = 3
+            display.draw()
+            rendered = display.s.text()
+            self.assertIn("CODEX ●", rendered)
+            self.assertIn("CLAUDE ✢", rendered)
+            self.assertIn("ANTIGRAVITY ⡀", rendered)
+
+    def test_spinner_frame_fallback_for_unknown_agent(self):
+        # Unknown agent should fall back to default spinner frames and speed divisor 1
+        default_frames = roundtable.DEFAULT_SPINNER_FRAMES
+        for i in range(len(default_frames) * 2):
+            expected = default_frames[i % len(default_frames)]
+            self.assertEqual(roundtable.spinner_frame("UnknownAgent", i), expected)
+
+    def test_ticker_never_overruns_panel_border_at_minimum_width(self):
+        # 72 columns is the smallest width draw() renders full panels at (below it,
+        # a "Terminal too small" message shows instead). At that width Antigravity's
+        # "NAME + ticker" header exactly fills its column with zero slack, so any
+        # future longer name/spinner frame would silently bleed into the next panel's
+        # border if the header text weren't clipped to the panel's own width.
+        display = make_test_display(h=25, w=72)
+        display.busy = True
+        display.active = {"Codex", "Claude", "Antigravity"}
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False):
+            for frame in range(max(len(f) for f, _ in roundtable.AGENT_SPINNERS.values())):
+                display.frame = frame
+                display.draw()
+                header_row = display.s.grid[5]
+                # Every box-drawing corner char from _box must survive untouched; if a
+                # header overran its column it would clobber one of these.
+                border_cols = [i for i, ch in enumerate(header_row) if ch in "╭╮"]
+                self.assertEqual(len(border_cols), 6, display.s.text())
+
+    def test_agent_header_is_clipped_to_panel_width(self):
+        display = make_test_display()
+        display.busy = True
+        display.active = {"Antigravity"}
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False), \
+             mock.patch.object(roundtable, "spinner_frame", return_value="X" * 50):
+            display.draw()
+        y, x, _, x2 = display.hitboxes["antigravity"]
+        panel_row = display.s.grid[y]
+        # The header write must stop before the panel's own right border column,
+        # regardless of how long the name/ticker combination turns out to be.
+        self.assertEqual(panel_row[x2], "╮")
+
+    def test_session_queued_prompts_default_and_load(self):
+        session = roundtable.Session("test obj", "/tmp", 1, "now", [])
+        self.assertEqual(session.queued_prompts, [])
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            jpath, _ = roundtable.save_session(session, tmp_path)
+            loaded = roundtable.load_session(jpath)
+            self.assertEqual(loaded.queued_prompts, [])
+
+    def test_interrupt_queues_prompt_and_acknowledges_on_rotate_line(self):
+        display = make_test_display()
+        display.busy = True
+        display.active = {"Codex"}
+        with mock.patch("roundtable.read_followup_ui", return_value="Add error handling"), \
+             mock.patch.object(display, "draw"):
+            display.trigger_interrupt()
+        self.assertEqual(display.session.queued_prompts, ["Add error handling"])
+        self.assertIn("[Codex] Acknowledged queued task: Add error handling", display.status)
+        self.assertEqual(display.activity["Codex"], "Acknowledged queued task: Add error handling")
+
+    def test_trigger_interrupt_restores_hidden_cursor_on_close(self):
+        """read_followup_ui turns the terminal cursor on (curs_set(1)) so the user can see where
+        they're typing; trigger_interrupt must hide it again on the way out, or the blinking cursor
+        leaks into the plain dashboard view for the rest of the session."""
+        display = make_test_display()
+        display.busy = True
+        display.active = {"Codex"}
+        with mock.patch("roundtable.read_followup_ui", return_value=""), \
+             mock.patch.object(display, "draw"), \
+             mock.patch.object(roundtable.curses, "curs_set") as mock_curs_set:
+            display.trigger_interrupt()
+        mock_curs_set.assert_called_once_with(0)
+
+    def test_queued_prompt_acknowledgement_rotates_active_agents(self):
+        display = make_test_display()
+        display.active = {"Antigravity", "Codex", "Claude"}
+        with mock.patch.object(display, "draw"):
+            display.acknowledge_queued_prompt("first")
+            first = display.status
+            display.acknowledge_queued_prompt("second")
+            second = display.status
+            display.acknowledge_queued_prompt("third")
+            third = display.status
+        self.assertIn("[Codex]", first)
+        self.assertIn("[Claude]", second)
+        self.assertIn("[Antigravity]", third)
+
+    def test_busy_dashboard_exposes_clickable_add_prompt_control(self):
+        display = make_test_display()
+        display.busy = True
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False):
+            display.draw()
+        self.assertIn("ADD PROMPT [i]", display.s.text())
+        y, x, y2, x2 = display.hitboxes["interrupt"]
+        self.assertEqual(display.handle_mouse(
+            x, y, roundtable.curses.BUTTON1_CLICKED), "interrupt")
+        self.assertEqual(y, y2)
+        self.assertGreater(x2, x)
+
+    def test_poll_input_i_key_triggers_interrupt(self):
+        display = make_test_display()
+        display.s.getch = mock.MagicMock(side_effect=[ord("i"), -1])
+        with mock.patch.object(display, "trigger_interrupt") as mock_interrupt:
+            display.poll_input()
+            mock_interrupt.assert_called_once()
+
+    def test_drain_queued_prompts_appends_turns(self):
+        session = roundtable.Session("test obj", "/tmp", 1, "now", [])
+        session.queued_prompts.append("Refactor authentication module")
+        drained = roundtable.drain_queued_prompts(session)
+        self.assertTrue(drained)
+        self.assertEqual(len(session.turns), 1)
+        self.assertEqual(session.turns[0].speaker, "User")
+        self.assertEqual(session.turns[0].phase, "follow-up")
+        self.assertEqual(session.turns[0].content, "Refactor authentication module")
+        self.assertEqual(session.queued_prompts, [])
+
+    def test_run_phase_drains_queued_prompt_before_dispatch(self):
+        """A prompt queued mid-round (via trigger_interrupt) must reach the very next phase, not
+        just the next full round -- that's what makes the interrupt actually interrupt."""
+        session = roundtable.Session("Task", "/tmp", 1, "now", [])
+        session.queued_prompts.append("Also handle logging")
+        captured = {}
+
+        def stub_runner(session, agents, phase, tick, status, message, log_prompt):
+            captured["phase"] = phase
+            captured["turns"] = list(session.turns)
+
+        roundtable._run_phase(stub_runner, session, [], "review 1", lambda *_: None,
+                              lambda *_: None, "Working", lambda *_: None, None)
+        self.assertEqual(captured["phase"], "followup-review 1")
+        self.assertEqual(captured["turns"][-1].content, "Also handle logging")
+        self.assertEqual(session.queued_prompts, [])
+
+    def test_run_phase_leaves_phase_name_alone_when_nothing_queued(self):
+        session = roundtable.Session("Task", "/tmp", 1, "now", [])
+        captured = {}
+
+        def stub_runner(session, agents, phase, tick, status, message, log_prompt):
+            captured["phase"] = phase
+
+        roundtable._run_phase(stub_runner, session, [], "review 1", lambda *_: None,
+                              lambda *_: None, "Working", lambda *_: None, None)
+        self.assertEqual(captured["phase"], "review 1")
+
+    def test_run_phase_does_not_double_prefix_an_already_followup_phase(self):
+        session = roundtable.Session("Task", "/tmp", 1, "now", [])
+        session.queued_prompts.append("More context")
+        captured = {}
+
+        def stub_runner(session, agents, phase, tick, status, message, log_prompt):
+            captured["phase"] = phase
+
+        roundtable._run_phase(stub_runner, session, [], "followup-proposal", lambda *_: None,
+                              lambda *_: None, "Working", lambda *_: None, None)
+        self.assertEqual(captured["phase"], "followup-proposal")
+
+    def test_run_tui_drains_queued_prompts_at_round_end(self):
+        session = roundtable.Session("Task", "/tmp", 1, "now", [])
+        args = roundtable.argparse.Namespace(
+            output_dir="/tmp", skip_preflight=True, preflight_timeout=5,
+            touch_mode=False, collab="parallel", synthesizer="rotate",
+            balance_load=False, task_status_check=False, reassign_idle=False)
+        prompts_at_dispatch = []
+
+        def stub_conduct(active_session, *_args, **_kwargs):
+            prompts_at_dispatch.append([
+                turn.content for turn in active_session.turns if turn.speaker == "User"])
+            active_session.turns.append(roundtable.Turn("Final", "consensus", "done"))
+            if len(prompts_at_dispatch) == 1:
+                # Model an interrupt arriving after conduct()'s pre-synthesis drain point.
+                active_session.queued_prompts.append("Post-synthesis request")
+
+        test_display = make_test_display()
+        test_display.session = session
+        stdscr = mock.MagicMock()
+        with mock.patch("roundtable.Display", return_value=test_display), \
+             mock.patch("roundtable.conduct", side_effect=stub_conduct), \
+             mock.patch("roundtable.read_followup_ui", return_value=""), \
+             mock.patch("roundtable.save_session", return_value=("/tmp/s.json", "/tmp/s.md")), \
+             mock.patch("roundtable.suppress_focus_reporting"):
+            ret = roundtable.run_tui(stdscr, args, session, None, None, None, resumed=False)
+
+        self.assertEqual(ret, 0)
+        self.assertEqual(prompts_at_dispatch, [[], ["Post-synthesis request"]])
+        self.assertEqual(session.queued_prompts, [])
 
 if __name__ == "__main__":
     unittest.main()

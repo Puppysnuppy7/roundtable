@@ -20,7 +20,7 @@ import textwrap
 import threading
 import time
 from collections import Counter, deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, TextIO
@@ -84,6 +84,7 @@ class Session:
     started_at: str
     turns: list[Turn]
     final: str = ""
+    queued_prompts: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -309,7 +310,7 @@ DEFAULT_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"
 # who is active without reading the header. 'speed' slows the frame advance for a calmer pulse.
 AGENT_SPINNERS: dict[str, tuple[tuple[str, ...], int]] = {
     "Claude": (("·", "✢", "✳", "∗", "✻", "✽", "✻", "∗", "✳", "✢"), 3),
-    "Codex": (("◜", "◠", "◝", "◞", "◡", "◟"), 1),
+    "Codex": (("◌", "○", "◉", "●", "◉", "○"), 1),
     "Antigravity": (("⠁", "⠂", "⠄", "⡀", "⢀", "⠠", "⠐", "⠈"), 1),
 }
 
@@ -424,6 +425,9 @@ class Agent:
             else:
                 answer = raw
             if code != 0:
+                limit_detail = usage_limit_detail(raw)
+                if limit_detail:
+                    raise UsageLimitError(f"{self.name} unavailable: {limit_detail}")
                 raise RuntimeError(f"{self.name} exited with status {code}\n{raw[-2000:]}")
             if not answer:
                 raise RuntimeError(f"{self.name} returned an empty response")
@@ -477,6 +481,19 @@ def extract_dibs(turns: list[Turn]) -> dict[str, str]:
         if match:
             claims[turn.speaker] = match.group(1).strip()
     return claims
+
+
+def latest_agent_turns(turns: Iterable[Turn]) -> list[Turn]:
+    """Return each agent's latest contribution in stable panel order.
+
+    These are the individual conclusions and asks that fed the shared answer. User and Final turns
+    are deliberately excluded, and a later review replaces that agent's older proposal.
+    """
+    latest: dict[str, Turn] = {}
+    for turn in turns:
+        if turn.speaker in AGENT_NAMES:
+            latest[turn.speaker] = turn
+    return [latest[name] for name in AGENT_NAMES if name in latest]
 
 
 def prompt_for(objective: str, turns: list[Turn], phase: str, speaker: str,
@@ -648,8 +665,11 @@ def load_session(path: Path) -> Session:
     final = data.get("final", "")
     if not isinstance(final, str):
         raise ValueError("session field 'final' must be str")
+    queued_prompts = data.get("queued_prompts", [])
+    if not isinstance(queued_prompts, list) or any(not isinstance(p, str) for p in queued_prompts):
+        queued_prompts = []
     return Session(data["objective"], data["workspace"], data["rounds"],
-                   data["started_at"], turns, final)
+                   data["started_at"], turns, final, queued_prompts=queued_prompts)
 
 
 class RunLog:
@@ -728,6 +748,7 @@ class Display:
         self.busy = False
         self.error = ""
         self.frame = 0
+        self.ack_index = 0
         self.monitor = WorkspaceMonitor(Path(session.workspace))
         self.started = time.monotonic()
         self.touch_mode = touch_mode
@@ -868,6 +889,7 @@ class Display:
                   ord("f"): "Final", ord("F"): "Final", ord("0"): "Console"}
     COLLAPSE_KEYS = (27, ord("q"), ord("Q"))  # Esc, q
     CONSOLE_FILTER_KEYS = (ord("c"), ord("C"))
+    INTERRUPT_KEYS = (ord("i"), ord("I"))
     PANEL_NAMES = ("Codex", "Claude", "Antigravity", "Final", "Console")
     AGENTS = (
         ("Codex", "◇", "OpenAI coding agent", 1),
@@ -900,14 +922,52 @@ class Display:
             "prompt": curses.color_pair(5),
         }.get(kind, curses.A_DIM)
 
+    def acknowledge_queued_prompt(self, prompt: str) -> None:
+        """Acknowledge a newly queued user prompt via an active agent on the rotate line."""
+        active_list = [name for name in AGENT_NAMES if name in getattr(self, "active", ())]
+        candidates = active_list or AGENT_NAMES
+        ack_index = getattr(self, "ack_index", 0)
+        ack_speaker = candidates[ack_index % len(candidates)]
+        self.ack_index = ack_index + 1
+        short_prompt = textwrap.shorten(prompt, width=40, placeholder="…")
+        msg = f"[{ack_speaker}] Acknowledged queued task: {short_prompt}"
+        self.status = msg
+        self.activity[ack_speaker] = f"Acknowledged queued task: {short_prompt}"
+        self.log(msg, kind="phase")
+        self.draw()
+
+    def trigger_interrupt(self) -> None:
+        """Interrupt active execution to open the follow-up box and queue a prompt."""
+        was_busy = self.busy
+        self.busy = False
+        try:
+            request = read_followup_ui(self.s, self)
+            if request:
+                self.session.queued_prompts.append(request)
+                self.acknowledge_queued_prompt(request)
+        finally:
+            self.busy = was_busy
+            if hasattr(self.s, "nodelay"):
+                try:
+                    self.s.nodelay(True)
+                except curses.error:
+                    pass
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
+
     def poll_input(self) -> None:
-        """Handle touch, keyboard cancellation, and panel-expand shortcuts while agents work."""
+        """Handle touch, keyboard cancellation, panel-expand shortcuts, and interrupts while agents work."""
         while True:
             key = self.s.getch()
             if key == -1:
                 return
             if key == 3:
                 raise KeyboardInterrupt
+            if key in self.INTERRUPT_KEYS:
+                self.trigger_interrupt()
+                continue
             if key in self.EXPAND_KEYS:
                 self.toggle_expanded(self.EXPAND_KEYS[key])
                 continue
@@ -927,6 +987,8 @@ class Display:
             action = self.handle_mouse(x, y, state)
             if action == "stop":
                 raise KeyboardInterrupt
+            if action == "interrupt":
+                self.trigger_interrupt()
 
     def handle_mouse(self, x: int, y: int, state: int) -> str | None:
         """Translate terminal mouse events, including touchscreen taps and swipes."""
@@ -937,6 +999,8 @@ class Display:
         tapped = state & (curses.BUTTON1_CLICKED | curses.BUTTON1_RELEASED)
         if tapped and "stop" in self.hitboxes and self._inside(self.hitboxes["stop"], y, x):
             return "stop"
+        if tapped and "interrupt" in self.hitboxes and self._inside(self.hitboxes["interrupt"], y, x):
+            return "interrupt"
         if tapped:
             for action in ("send", "newline", "finish", "clear"):
                 box = self.hitboxes.get(action)
@@ -994,7 +1058,9 @@ class Display:
             t.speaker == name for t in self.session.turns)
         state = "● working" if is_active else ("✓ responded" if has_responded else "○ waiting")
         state_attr = color | (curses.A_BOLD if is_active else curses.A_DIM)
-        self._put(y, x + 2, f" {icon}  {name.upper()} ", color | curses.A_BOLD)
+        ticker = f" {spinner_frame(name, self.frame)}" if is_active else ""
+        header = f" {icon}  {name.upper()}{ticker} "
+        self._put(y, x + 2, header[:max(0, width - 4)], color | curses.A_BOLD)
         state_x = max(x + 2, x + width - len(state) - 2)
         subtitle_width = max(0, state_x - (x + 2) - 1)
         self._put(y + 1, x + 2, subtitle[:subtitle_width], curses.A_DIM)
@@ -1079,7 +1145,17 @@ class Display:
         self._put(2, 2, "›", curses.color_pair(3) | curses.A_BOLD)
         obj = textwrap.shorten(self.session.objective, width=max(20, w - 8), placeholder="…")
         self._put(2, 4, obj, curses.A_BOLD)
-        self._put(3, 4, f"{self.status}  ·  {self.session.workspace}", curses.A_DIM)
+        status_line = f"{self.status}  ·  {self.session.workspace}"
+        if self.busy:
+            interrupt_label = " ＋ ADD PROMPT [i] "
+            interrupt_x = w - len(interrupt_label) - 3
+            status_line = textwrap.shorten(
+                status_line, width=max(10, interrupt_x - 5), placeholder="…")
+            self._put(3, interrupt_x, interrupt_label,
+                      curses.color_pair(5) | curses.A_BOLD)
+            self.hitboxes["interrupt"] = (
+                3, interrupt_x, 3, interrupt_x + len(interrupt_label) - 1)
+        self._put(3, 4, status_line, curses.A_DIM)
 
         if self.expanded:
             self._draw_expanded(content_height, w)
@@ -1101,15 +1177,31 @@ class Display:
         monitor_width = max(25, min(38, w // 3))
         answer_width = w - monitor_width - 4
         self._box(cy, 1, consensus_height, answer_width, curses.color_pair(3))
-        self._put(cy, 3, " ◆  SHARED ANSWER ", curses.color_pair(3) | curses.A_BOLD)
+
+        self._put(cy, 3, " ◆  SHARED ANSWER "[:max(0, answer_width - 4)],
+                  curses.color_pair(3) | curses.A_BOLD)
         final_text = self.session.final or "The combined answer will appear here after all agents review the task."
         all_final_lines = self._wrapped(final_text, answer_width - 4)
         available_final = consensus_height - 3
-        final_offset = min(self.scroll["Final"], max(0, len(all_final_lines) - available_final))
+        individual = latest_agent_turns(self.session.turns)
+        individual_rows = min(len(individual), max(0, available_final - 2))
+        final_rows = available_final - individual_rows - (1 if individual_rows else 0)
+        final_offset = min(self.scroll["Final"], max(0, len(all_final_lines) - final_rows))
         final_end = len(all_final_lines) - final_offset if final_offset else len(all_final_lines)
-        final_lines = all_final_lines[max(0, final_end - available_final):final_end]
+        final_lines = all_final_lines[max(0, final_end - final_rows):final_end]
         for row, line in enumerate(final_lines):
             self._put(cy + 2 + row, 4, line)
+        if individual_rows:
+            section_y = cy + 2 + final_rows
+            self._put(section_y, 3, " ─ INDIVIDUAL CONCLUSIONS / ASKS ",
+                      curses.color_pair(3) | curses.A_BOLD)
+            for row, turn in enumerate(individual[-individual_rows:]):
+                prefix = f"{turn.speaker} · {turn.phase}: "
+                summary = " ".join(turn.content.split())
+                shown = textwrap.shorten(prefix + summary, width=max(5, answer_width - 6),
+                                         placeholder="…")
+                self._put(section_y + 1 + row, 4, shown, curses.A_DIM)
+
         self.hitboxes["final"] = (cy, 1, cy + consensus_height - 1, answer_width)
 
         mx = answer_width + 2
@@ -1195,6 +1287,12 @@ class Display:
             self._box(top, 1, height, w - 2, color)
             self._put(top, 3, " ◆  SHARED ANSWER (expanded) ", color | curses.A_BOLD)
             content = self.session.final or "The combined answer will appear here after all agents review the task."
+            individual = latest_agent_turns(self.session.turns)
+            if individual:
+                sections = [content, "INDIVIDUAL CONCLUSIONS / ASKS"]
+                sections.extend(f"{turn.speaker} · {turn.phase}\n{turn.content}"
+                                for turn in individual)
+                content = "\n\n".join(sections)
             lines = self._wrapped(content, w - 6)
             available = max(1, height - 3)
             offset = min(self.scroll["Final"], max(0, len(lines) - available))
@@ -1451,11 +1549,57 @@ def scope_hint(name: str, agent_speed: dict[str, list[float]]) -> str:
 
 
 RETRY_BACKOFF_SECONDS = 3.0
+AVAILABILITY_CHECK_SECONDS = 30.0
+
+
+class UsageLimitError(RuntimeError):
+    """An agent is temporarily unavailable because its provider usage allowance is exhausted."""
+
+
+USAGE_LIMIT_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
+    r"you(?:'|’)?ve hit your (?:session|usage) limit",
+    r"(?:session|usage) limit (?:has been )?(?:reached|exceeded|exhausted)",
+    r"(?:quota|credits?) (?:has been )?(?:reached|exceeded|exhausted)",
+    r"resource[_ -]?exhausted",
+    r"too many requests",
+    r"(?:rate limit(?:ed)?|rate_limit_exceeded)",
+    r"(?:http(?: status)? )?429\b",
+))
+
+
+def usage_limit_detail(text: str) -> str | None:
+    """Return the provider diagnostic line when text indicates a temporary usage limit."""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped and any(pattern.search(stripped) for pattern in USAGE_LIMIT_PATTERNS):
+            return stripped
+    return None
+
+
+def _wait_for_agent_availability(agent: Agent, on_tick: Callable[[str], None],
+                                 cancel_event: threading.Event) -> None:
+    """Poll a usage-limited agent until a lightweight request succeeds or the run is cancelled."""
+    while True:
+        on_tick(f"usage limit reached — waiting {AVAILABILITY_CHECK_SECONDS:g}s before checking "
+                "availability")
+        if cancel_event.wait(AVAILABILITY_CHECK_SECONDS):
+            raise RuntimeError(f"{agent.name} cancelled")
+        on_tick("checking whether the agent is available again")
+        try:
+            agent.run(PREFLIGHT_PROMPT, on_tick, cancel_event)
+        except RuntimeError as exc:
+            if str(exc) == f"{agent.name} cancelled" or cancel_event.is_set():
+                raise RuntimeError(f"{agent.name} cancelled") from exc
+            detail = usage_limit_detail(str(exc))
+            on_tick(f"still unavailable ({detail or str(exc).splitlines()[0]})")
+            continue
+        on_tick("agent available again — retrying the original task")
+        return
 
 
 def _run_with_retry(agent: Agent, prompt: str, on_tick: Callable[[str], None],
                     cancel_event: threading.Event | None = None) -> str:
-    """Run one agent turn, retrying once after a short backoff if the underlying CLI fails.
+    """Run one agent turn, recovering from transient failures and provider usage limits.
 
     Real CLI failures seen in practice during a long run (a nonzero exit, an empty response) are
     often transient -- a rate limit or network timeout partway through a long chain of tool calls --
@@ -1463,15 +1607,29 @@ def _run_with_retry(agent: Agent, prompt: str, on_tick: Callable[[str], None],
     genuinely broken agent, which will just fail the same way twice. A deliberate cancellation (e.g.
     task_status_check stopping this agent, or Ctrl+C) is never retried: it was stopped on purpose,
     not because it failed, and retrying it would redo work that was intentionally cut short.
+
+    A provider usage/session limit is different: while Roundtable is still running, periodically
+    send the lightweight preflight prompt. Once the agent answers again, resend its original task so
+    the round can finish without discarding the other agents' work.
     """
-    try:
-        return agent.run(prompt, on_tick, cancel_event)
-    except RuntimeError as exc:
-        if str(exc) == f"{agent.name} cancelled":
-            raise
-        on_tick(f"failed ({exc}) — retrying once after a short pause")
-        time.sleep(RETRY_BACKOFF_SECONDS)
-        return agent.run(prompt, on_tick, threading.Event())
+    active_cancel = cancel_event or agent.cancel_event or threading.Event()
+    transient_failures = 0
+    while True:
+        try:
+            return agent.run(prompt, on_tick, active_cancel)
+        except RuntimeError as exc:
+            if str(exc) == f"{agent.name} cancelled" or active_cancel.is_set():
+                raise RuntimeError(f"{agent.name} cancelled") from exc
+            detail = usage_limit_detail(str(exc))
+            if detail:
+                on_tick(f"temporarily unavailable: {detail}")
+                _wait_for_agent_availability(agent, on_tick, active_cancel)
+                continue
+            if transient_failures:
+                raise
+            transient_failures += 1
+            on_tick(f"failed ({exc}) — retrying once after a short pause")
+            time.sleep(RETRY_BACKOFF_SECONDS)
 
 
 def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase: str,
@@ -1713,6 +1871,9 @@ def preflight_check(name: str, agent: Agent, tick: Callable[[str, str], None],
     except Exception as exc:
         if cancel_event.is_set():
             return False, f"timed out after {timeout:.0f}s"
+        limit_detail = usage_limit_detail(str(exc))
+        if limit_detail:
+            return True, f"usage-limited; will wait during the task ({limit_detail})"
         message = str(exc).strip().splitlines()[0] if str(exc).strip() else "no response"
         return False, message
     finally:
@@ -1760,10 +1921,21 @@ def run_preflight(agents: list[tuple[str, Agent]], tick: Callable[[str, str], No
         results = {name: futures[name].result() for name in names}
     status([], "System check complete")
     for name, (ok, detail) in results.items():
-        tick(name, "check passed" if ok else f"check failed: {detail}")
+        tick(name, ("check passed" if detail == "ready" else detail) if ok
+             else f"check failed: {detail}")
     failed = [f"{name} ({detail})" for name, (ok, detail) in results.items() if not ok]
     if failed:
         raise RuntimeError("Preliminary system check failed — " + "; ".join(failed))
+
+
+def drain_queued_prompts(session: Session) -> bool:
+    """Pop queued prompts added during active interrupts into transcript user follow-up turns."""
+    drained = False
+    while getattr(session, "queued_prompts", None):
+        prompt = session.queued_prompts.pop(0)
+        session.turns.append(Turn("User", "follow-up", prompt))
+        drained = True
+    return drained
 
 
 def _run_phase(runner: Callable[..., None], session: Session, agents: list[tuple[str, Agent]],
@@ -1774,6 +1946,9 @@ def _run_phase(runner: Callable[..., None], session: Session, agents: list[tuple
               task_status_check: bool = False, reassign_idle: bool = False) -> None:
     """Dispatch to a phase runner, passing agent_speed/task_status_check/reassign_idle only to the
     parallel runner that uses them."""
+    drained = drain_queued_prompts(session)
+    if drained and not phase.startswith("followup-"):
+        phase = f"followup-{phase}"
     if runner is _run_parallel_phase:
         runner(session, agents, phase, tick, status, message, log_prompt, agent_speed,
               task_status_check, reassign_idle)
@@ -1806,6 +1981,7 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent,
             f"Agents are reviewing {round_style} · round {round_no}/{session.rounds}",
             log_prompt, agent_speed, task_status_check, reassign_idle,
         )
+    drain_queued_prompts(session)
     order = synthesis_order(synthesizer, session, codex, claude, antigravity)
     session.final = synthesize(session, order, tick, status, log_prompt, followup)
     session.turns.append(Turn("Final", "consensus", session.final))
@@ -1832,10 +2008,12 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
         if resumed and not session.turns[-1:]:
             raise ValueError("a resumed session has no transcript")
         if resumed and session.turns[-1].speaker != "User":
-            request = read_followup_ui(stdscr, ui)
-            if not request:
-                return 0
-            session.turns.append(Turn("User", "follow-up", request))
+            drain_queued_prompts(session)
+            if session.turns[-1].speaker != "User":
+                request = read_followup_ui(stdscr, ui)
+                if not request:
+                    return 0
+                session.turns.append(Turn("User", "follow-up", request))
         while True:
             ui.busy = True
             stdscr.nodelay(True)
@@ -1847,10 +2025,12 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
             paths = save_session(session, Path(args.output_dir))
             ui.status = "Complete"
             ui.activity = {}
+            drain_queued_prompts(session)
             request = read_followup_ui(stdscr, ui)
-            if not request:
+            if not request and session.turns[-1].speaker != "User":
                 break
-            session.turns.append(Turn("User", "follow-up", request))
+            if request:
+                session.turns.append(Turn("User", "follow-up", request))
             ui.status = "Continuing"
             followup = True
         return 0

@@ -86,18 +86,30 @@ Before the real task starts, all three CLIs get a quick "reply OK" preflight che
 by default, run in parallel). This exists so a hung or unauthenticated CLI fails fast with a named
 reason instead of leaving every panel stuck on "waiting for task" with no explanation. Override the
 per-agent timeout with `--preflight-timeout`, or skip the check entirely with `--skip-preflight` if
-you already know the CLIs are reachable.
+you already know the CLIs are reachable. A provider session/usage-limit response is treated as
+temporary rather than a failed preflight: the run starts, the other agents can work, and the limited
+agent waits until it becomes available again.
 
 The fullscreen view provides evenly spaced live Codex, Claude, and Antigravity panes, independent
-working/waiting states, per-agent usage sparklines (response time, output size, activity), and a
-live work feed inside each active agent's own pane. The feed keeps reported file reads, searches,
-edits, commands, tests, and other CLI progress attributed to the agent that emitted them; once the
-agent finishes, its pane returns to the completed response. Read/execute/write counters provide an
-at-a-glance summary; because CLI output formats differ, they are progress indicators rather than
-audit totals. A live elapsed-time readout, a wrapped multiline task composer, a combined answer, a
-live code monitor showing files changed during the session, and a console panel round out
-the diagnostics. After an answer, a follow-up text box lets you keep the same roundtable conversation
-going. Complete transcripts are written to `.roundtable/`.
+working/waiting states, and agent-specific activity tickers next to agent names (a pulsing circle
+for Codex, an asterisk pulse for Claude, and moving braille dots for Antigravity). Per-agent usage
+sparklines show response time, output size, and activity, while a live work feed inside each active
+agent's own pane keeps reported file reads, searches, edits, commands, tests, and other CLI progress
+attributed to the agent that emitted them; once the agent finishes, its pane returns to the completed
+response. Read/execute/write counters provide an at-a-glance summary; because CLI output formats
+differ, they are progress indicators rather than audit totals. A live elapsed-time readout, a wrapped
+multiline task composer, and a combined answer box with a compact section for each agent's latest
+conclusion or ask (expand it to inspect the full individual responses), plus a live code monitor
+showing files changed during the session, and a console panel round out the diagnostics.
+
+While agents are working, press `i` (or click/tap the "ADD PROMPT [i]" control next to the status
+line) to interrupt and open the same follow-up box used between rounds, without stopping the run.
+Anything you send there is queued rather than applied immediately; it lands in the transcript, and
+takes effect, at the start of the very next phase — proposal, review round, or synthesis — whichever
+comes next. An active agent acknowledges the queued prompt for you on the status line ("[Codex]
+Acknowledged queued task: …"), rotating through whichever agents are currently working so the
+acknowledgment isn't always attributed to the same one. After an answer, a follow-up text box lets
+you keep the same roundtable conversation going. Complete transcripts are written to `.roundtable/`.
 
 The console opens on **key events** — phase changes, completed turns, and errors — instead of a
 firehose of every raw line each CLI prints, so the signal-dense view is the default. Press `c` to
@@ -136,7 +148,10 @@ retried once after a short pause before it's treated as fatal — real-world fai
 often a transient rate limit or network timeout partway through a long chain of tool calls, not a
 broken prompt, and a short retry recovers most of them. A deliberate stop (Ctrl+C, or
 `--task-status-check` cutting an agent off) is never retried, since that agent wasn't trying to finish
-in the first place.
+in the first place. Provider usage/session limits have a separate recovery path: Roundtable keeps the
+agent's turn pending, checks availability every 30 seconds with the lightweight preflight prompt,
+and resends the original task once the agent responds. The wait continues only while Roundtable is
+running and remains cancellable with Ctrl+C (or by `--task-status-check`).
 
 Any panel — Codex, Claude, Antigravity, the shared answer, or the console — can be expanded to
 full-screen for its complete, un-truncated content: press `1`/`2`/`3`/`f`/`0`, or click/tap the panel.
