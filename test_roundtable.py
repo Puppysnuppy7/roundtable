@@ -8,8 +8,10 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 import roundtable
 
@@ -1833,6 +1835,58 @@ class RoundtableTests(unittest.TestCase):
             "You've hit your session limit · resets 5:30pm (America/Chicago)"))
         self.assertIsNone(roundtable.usage_limit_detail(
             "Please limit this implementation to the requested scope."))
+
+    def test_parse_reset_time_returns_todays_time_when_still_upcoming(self):
+        now = datetime(2026, 7, 20, 17, 0)
+        reset_at = roundtable.parse_reset_time("You've hit your session limit · resets 5:30pm", now)
+        self.assertEqual((reset_at.year, reset_at.month, reset_at.day), (2026, 7, 20))
+        self.assertEqual((reset_at.hour, reset_at.minute), (17, 30))
+
+    def test_parse_reset_time_rolls_over_to_tomorrow_when_time_has_passed(self):
+        now = datetime(2026, 7, 20, 18, 0)
+        reset_at = roundtable.parse_reset_time("resets 5:30pm", now)
+        self.assertEqual((reset_at.year, reset_at.month, reset_at.day), (2026, 7, 21))
+        self.assertEqual((reset_at.hour, reset_at.minute), (17, 30))
+
+    def test_parse_reset_time_honors_named_timezone(self):
+        now = datetime(2026, 7, 20, 17, 0, tzinfo=ZoneInfo("America/Chicago"))
+        reset_at = roundtable.parse_reset_time("resets 5:30pm (America/Chicago)", now)
+        self.assertEqual(reset_at.tzinfo.key, "America/Chicago")
+        self.assertEqual((reset_at.hour, reset_at.minute), (17, 30))
+
+    def test_parse_reset_time_returns_none_without_a_recognizable_time(self):
+        now = datetime(2026, 7, 20, 17, 0)
+        self.assertIsNone(roundtable.parse_reset_time("rate limit exceeded, please retry", now))
+        self.assertIsNone(roundtable.parse_reset_time("resets 25:99pm", now))
+
+    def test_wait_for_agent_availability_sleeps_until_reset_time_instead_of_polling(self):
+        class ReadyAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None):
+                return "OK"
+
+        agent = ReadyAgent("Claude", Path("/tmp"))
+        now = datetime(2026, 7, 20, 17, 0).astimezone()
+        ticks = []
+        with mock.patch.object(threading.Event, "wait", return_value=False) as wait_mock:
+            roundtable._wait_for_agent_availability(
+                agent, ticks.append, threading.Event(),
+                "You've hit your session limit · resets 5:30pm", clock=lambda: now)
+        waited = wait_mock.call_args.args[0]
+        self.assertAlmostEqual(waited, 30 * 60 + roundtable.RESET_TIME_BUFFER_SECONDS, delta=1)
+        self.assertTrue(any("waiting until" in tick for tick in ticks))
+
+    def test_wait_for_agent_availability_falls_back_to_polling_without_a_reset_time(self):
+        class ReadyAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None):
+                return "OK"
+
+        agent = ReadyAgent("Claude", Path("/tmp"))
+        ticks = []
+        with mock.patch.object(threading.Event, "wait", return_value=False) as wait_mock:
+            roundtable._wait_for_agent_availability(
+                agent, ticks.append, threading.Event(), "rate limit exceeded, no reset given")
+        wait_mock.assert_called_once_with(roundtable.AVAILABILITY_CHECK_SECONDS)
+        self.assertTrue(any("waiting 30s" in tick for tick in ticks))
 
     def test_run_parallel_phase_recovers_a_primary_agent_that_fails_once(self):
         class FlakyAgent(roundtable.Agent):

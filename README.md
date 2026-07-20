@@ -149,9 +149,12 @@ often a transient rate limit or network timeout partway through a long chain of 
 broken prompt, and a short retry recovers most of them. A deliberate stop (Ctrl+C, or
 `--task-status-check` cutting an agent off) is never retried, since that agent wasn't trying to finish
 in the first place. Provider usage/session limits have a separate recovery path: Roundtable keeps the
-agent's turn pending, checks availability every 30 seconds with the lightweight preflight prompt,
-and resends the original task once the agent responds. The wait continues only while Roundtable is
-running and remains cancellable with Ctrl+C (or by `--task-status-check`).
+agent's turn pending and, when the provider's own message names a reset time (e.g. "resets 5:30pm
+(America/Chicago)"), sleeps until just past that moment instead of polling — there's no point checking
+early when the limit is known not to have cleared yet. Without a recognizable reset time it falls back
+to checking availability every 30 seconds with the lightweight preflight prompt. Either way, the
+original task is resent once the agent responds. The wait continues only while Roundtable is running
+and remains cancellable with Ctrl+C (or by `--task-status-check`).
 
 Any panel — Codex, Claude, Antigravity, the shared answer, or the console — can be expanded to
 full-screen for its complete, un-truncated content: press `1`/`2`/`3`/`f`/`0`, or click/tap the panel.

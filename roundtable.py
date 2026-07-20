@@ -21,9 +21,10 @@ import threading
 import time
 from collections import Counter, deque
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterable, TextIO
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 SYSTEM_BRIEF = """You are one member of a multi-AI roundtable. Work toward the user's objective.
@@ -1576,13 +1577,69 @@ def usage_limit_detail(text: str) -> str | None:
     return None
 
 
+RESET_TIME_PATTERN = re.compile(
+    r"resets?\s+(\d{1,2}):(\d{2})\s*([ap]\.?m\.?)?(?:\s*\(([^)]+)\))?", re.IGNORECASE)
+RESET_TIME_BUFFER_SECONDS = 15.0
+
+
+def parse_reset_time(text: str, now: datetime) -> datetime | None:
+    """Parse a provider-reported reset time (e.g. 'resets 5:30pm (America/Chicago)') into the
+    next absolute moment it refers to, relative to `now`, or None if none is present/parseable.
+
+    Providers report this in their own clock, so a timezone name in parentheses -- when present --
+    is what the hour/minute are read against; a time already passed today means tomorrow, since
+    these limits reset daily rather than at a fixed point in the future.
+    """
+    match = RESET_TIME_PATTERN.search(text)
+    if not match:
+        return None
+    hour, minute, meridiem, tz_name = match.groups()
+    hour, minute = int(hour), int(minute)
+    if minute > 59:
+        return None
+    if meridiem:
+        if not 1 <= hour <= 12:
+            return None
+        meridiem = meridiem.lower().replace(".", "")
+        hour = hour % 12 + (12 if meridiem == "pm" else 0)
+    elif hour > 23:
+        return None
+    tz = None
+    if tz_name:
+        try:
+            tz = ZoneInfo(tz_name.strip())
+        except (ZoneInfoNotFoundError, ValueError):
+            tz = None
+    reference = now.astimezone(tz)
+    candidate = reference.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= reference:
+        candidate += timedelta(days=1)
+    return candidate
+
+
 def _wait_for_agent_availability(agent: Agent, on_tick: Callable[[str], None],
-                                 cancel_event: threading.Event) -> None:
-    """Poll a usage-limited agent until a lightweight request succeeds or the run is cancelled."""
+                                 cancel_event: threading.Event, detail: str | None = None,
+                                 clock: Callable[[], datetime] = lambda: datetime.now().astimezone()
+                                 ) -> None:
+    """Wait for a usage-limited agent to become available, then confirm with a lightweight check.
+
+    When the provider's own message names a specific reset time (e.g. 'resets 5:30pm
+    (America/Chicago)'), sleep until just past that moment instead of polling every few seconds --
+    checking earlier is pointless, since the limit is known not to have cleared yet. Falls back to
+    periodic polling when no reset time is present or parseable, or once the reported time has come
+    and gone but the agent still isn't back (a slow or inaccurate reset).
+    """
     while True:
-        on_tick(f"usage limit reached — waiting {AVAILABILITY_CHECK_SECONDS:g}s before checking "
-                "availability")
-        if cancel_event.wait(AVAILABILITY_CHECK_SECONDS):
+        now = clock()
+        reset_at = parse_reset_time(detail, now) if detail else None
+        if reset_at is not None:
+            wait_seconds = max(0.0, (reset_at - now).total_seconds()) + RESET_TIME_BUFFER_SECONDS
+            on_tick(f"usage limit reached — waiting until {reset_at.strftime('%-I:%M%p')} "
+                    "before checking availability")
+        else:
+            wait_seconds = AVAILABILITY_CHECK_SECONDS
+            on_tick(f"usage limit reached — waiting {wait_seconds:g}s before checking availability")
+        if cancel_event.wait(wait_seconds):
             raise RuntimeError(f"{agent.name} cancelled")
         on_tick("checking whether the agent is available again")
         try:
@@ -1608,9 +1665,11 @@ def _run_with_retry(agent: Agent, prompt: str, on_tick: Callable[[str], None],
     task_status_check stopping this agent, or Ctrl+C) is never retried: it was stopped on purpose,
     not because it failed, and retrying it would redo work that was intentionally cut short.
 
-    A provider usage/session limit is different: while Roundtable is still running, periodically
-    send the lightweight preflight prompt. Once the agent answers again, resend its original task so
-    the round can finish without discarding the other agents' work.
+    A provider usage/session limit is different: while Roundtable is still running, wait for the
+    agent to come back before resending the lightweight preflight prompt -- until the provider's own
+    reported reset time if it named one, or a short poll interval otherwise -- then resend its
+    original task once the agent answers again, so the round can finish without discarding the
+    other agents' work.
     """
     active_cancel = cancel_event or agent.cancel_event or threading.Event()
     transient_failures = 0
@@ -1623,7 +1682,7 @@ def _run_with_retry(agent: Agent, prompt: str, on_tick: Callable[[str], None],
             detail = usage_limit_detail(str(exc))
             if detail:
                 on_tick(f"temporarily unavailable: {detail}")
-                _wait_for_agent_availability(agent, on_tick, active_cancel)
+                _wait_for_agent_availability(agent, on_tick, active_cancel, detail)
                 continue
             if transient_failures:
                 raise
