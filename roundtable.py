@@ -1552,6 +1552,14 @@ def scope_hint(name: str, agent_speed: dict[str, list[float]]) -> str:
 RETRY_BACKOFF_SECONDS = 3.0
 AVAILABILITY_CHECK_SECONDS = 30.0
 
+RERUN_PROGRESS_NOTE = (
+    "This is a rerun of a task that didn't finish last time (a transient CLI failure, or a "
+    "provider usage limit that has now cleared). Before doing anything else, check current "
+    "progress -- `git status`/`git diff` or equivalent, and re-read anything relevant -- since "
+    "your own partial work, or another agent's in the meantime, may already cover part of this. "
+    "Continue from where things actually stand instead of redoing completed work."
+)
+
 
 class UsageLimitError(RuntimeError):
     """An agent is temporarily unavailable because its provider usage allowance is exhausted."""
@@ -1677,12 +1685,18 @@ def _run_with_retry(agent: Agent, prompt: str, on_tick: Callable[[str], None],
     reported reset time if it named one, or a short poll interval otherwise -- then resend its
     original task once the agent answers again, so the round can finish without discarding the
     other agents' work.
+
+    Either way, a resend appends RERUN_PROGRESS_NOTE telling the agent to check current progress
+    first. Time has passed since the original attempt -- a few seconds for a transient failure, up
+    to hours for a usage limit -- during which the agent's own earlier tool calls, or another
+    agent's work in a shared `--self` workspace, may already have covered part of the task.
     """
     active_cancel = cancel_event or agent.cancel_event or threading.Event()
     transient_failures = 0
+    current_prompt = prompt
     while True:
         try:
-            return agent.run(prompt, on_tick, active_cancel)
+            return agent.run(current_prompt, on_tick, active_cancel)
         except RuntimeError as exc:
             if str(exc) == f"{agent.name} cancelled" or active_cancel.is_set():
                 raise RuntimeError(f"{agent.name} cancelled") from exc
@@ -1690,12 +1704,14 @@ def _run_with_retry(agent: Agent, prompt: str, on_tick: Callable[[str], None],
             if detail:
                 on_tick(f"temporarily unavailable: {detail}")
                 _wait_for_agent_availability(agent, on_tick, active_cancel, detail)
+                current_prompt = f"{prompt}\n\n{RERUN_PROGRESS_NOTE}"
                 continue
             if transient_failures:
                 raise
             transient_failures += 1
             on_tick(f"failed ({exc}) — retrying once after a short pause")
             time.sleep(RETRY_BACKOFF_SECONDS)
+            current_prompt = f"{prompt}\n\n{RERUN_PROGRESS_NOTE}"
 
 
 def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase: str,

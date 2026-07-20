@@ -1762,6 +1762,23 @@ class RoundtableTests(unittest.TestCase):
         sleep_mock.assert_called_once_with(roundtable.RETRY_BACKOFF_SECONDS)
         self.assertTrue(any("retrying once" in t for t in ticks))
 
+    def test_run_with_retry_tells_agent_to_check_progress_before_a_transient_retry(self):
+        class FlakyAgent(roundtable.Agent):
+            prompts = []
+
+            def run(self, prompt, on_tick, cancel_event=None):
+                type(self).prompts.append(prompt)
+                if len(type(self).prompts) == 1:
+                    raise RuntimeError(f"{self.name} exited with status 1\ntimeout")
+                return "recovered"
+
+        agent = FlakyAgent("Codex", Path("/tmp"))
+        with mock.patch.object(roundtable.time, "sleep"):
+            roundtable._run_with_retry(agent, "original prompt", lambda _: None)
+        self.assertEqual(FlakyAgent.prompts[0], "original prompt")
+        self.assertIn(roundtable.RERUN_PROGRESS_NOTE, FlakyAgent.prompts[1])
+        self.assertTrue(FlakyAgent.prompts[1].startswith("original prompt"))
+
     def test_run_with_retry_raises_if_the_retry_also_fails(self):
         class AlwaysFailsAgent(roundtable.Agent):
             attempts = 0
@@ -1793,7 +1810,7 @@ class RoundtableTests(unittest.TestCase):
 
     def test_run_with_retry_waits_for_usage_limit_then_reasks_original_task(self):
         class LimitedThenReadyAgent(roundtable.Agent):
-            task_attempts = 0
+            task_prompts = []
             probes = 0
 
             def run(self, prompt, on_tick, cancel_event=None):
@@ -1803,8 +1820,8 @@ class RoundtableTests(unittest.TestCase):
                         raise roundtable.UsageLimitError(
                             "Claude unavailable: You've hit your session limit · resets 5:30pm")
                     return "OK"
-                type(self).task_attempts += 1
-                if type(self).task_attempts == 1:
+                type(self).task_prompts.append(prompt)
+                if len(type(self).task_prompts) == 1:
                     raise roundtable.UsageLimitError(
                         "Claude unavailable: You've hit your session limit · resets 5:30pm")
                 return "completed original task"
@@ -1814,10 +1831,13 @@ class RoundtableTests(unittest.TestCase):
         with mock.patch.object(threading.Event, "wait", return_value=False) as wait_mock:
             result = roundtable._run_with_retry(agent, "original task", ticks.append)
         self.assertEqual(result, "completed original task")
-        self.assertEqual(LimitedThenReadyAgent.task_attempts, 2)
+        self.assertEqual(len(LimitedThenReadyAgent.task_prompts), 2)
         self.assertEqual(LimitedThenReadyAgent.probes, 2)
         self.assertEqual(wait_mock.call_count, 2)
         self.assertTrue(any("agent available again" in tick for tick in ticks))
+        self.assertEqual(LimitedThenReadyAgent.task_prompts[0], "original task")
+        self.assertIn(roundtable.RERUN_PROGRESS_NOTE, LimitedThenReadyAgent.task_prompts[1])
+        self.assertTrue(LimitedThenReadyAgent.task_prompts[1].startswith("original task"))
 
     def test_usage_limit_wait_stops_when_round_is_cancelled(self):
         class LimitedAgent(roundtable.Agent):

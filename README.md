@@ -158,6 +158,11 @@ responds — the repeated 30-second rechecks stay silent instead of flooding the
 original task is resent once the agent responds. The wait continues only while Roundtable is running
 and remains cancellable with Ctrl+C (or by `--task-status-check`).
 
+Any resend — after a transient-failure retry or a usage-limit wait — appends a note telling the
+agent to check current progress (`git status`/`git diff`, re-reading relevant files) before doing
+anything else, since time has passed and its own earlier partial work, or another agent's in a
+shared `--self` workspace, may already cover part of the task.
+
 Any panel — Codex, Claude, Antigravity, the shared answer, or the console — can be expanded to
 full-screen for its complete, un-truncated content: press `1`/`2`/`3`/`f`/`0`, or click/tap the panel.
 The same key, a click on the expanded panel, or `Esc`/`q` collapses it back to the dashboard. Keyboard
