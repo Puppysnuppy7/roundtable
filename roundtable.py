@@ -19,6 +19,7 @@ import tempfile
 import textwrap
 import threading
 import time
+import traceback
 from collections import Counter, deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -43,9 +44,9 @@ SELF_EDIT_NOTE = (
     "run `python3 -m unittest test_roundtable` yourself before finishing — report the result."
 )
 
-AGENT_NAMES: tuple[str, ...] = ("Codex", "Claude", "Antigravity")
+AGENT_NAMES: tuple[str, ...] = ("Codex", "Claude", "Antigravity", "Aider", "Grok", "Qwen")
 
-# Nudges agents toward complementary parts of the work instead of three redundant attempts at the
+# Nudges agents toward complementary parts of the work instead of six redundant attempts at the
 # same whole task. Which agent gets which nudge rotates by objective (see role_hints_for) rather
 # than being fixed to one identity, so no agent is permanently typecast into the same lane.
 ROLE_HINTS_BY_SLOT: tuple[str, ...] = (
@@ -55,15 +56,21 @@ ROLE_HINTS_BY_SLOT: tuple[str, ...] = (
     "and edge cases, and make sure the approach is well-explained and sound.",
     "Your edge here is breadth: look for angles, edge cases, or alternate approaches the others "
     "might miss, and verify or stress-test what's being proposed.",
+    "Your edge here is fast, narrowly-scoped diffs: land one small, concrete, mergeable change and "
+    "sanity-check the others' proposals against it rather than attempting a full rewrite.",
+    "Your edge here is skepticism: verify that claims made so far actually hold, re-run tests or "
+    "checks yourself, and flag anything that looks unverified or overstated.",
+    "Your edge here is integration: reconcile the different approaches proposed so far into one "
+    "coherent plan, resolving conflicts between them explicitly rather than just picking a side.",
 )
 
 
 def role_hints_for(objective: str) -> dict[str, str]:
-    """Assign the three role hints to the three agents, rotated by objective.
+    """Assign the six role hints to the six agents, rotated by objective.
 
     Stable across follow-ups in the same session (same objective), but varies session to session so
-    each agent leads execution, reasoning, and breadth roughly equally over time instead of always
-    the same one.
+    each agent leads execution, reasoning, breadth, fast narrow diffs, verification, and integration
+    roughly equally over time instead of always the same one.
     """
     offset = int(hashlib.sha256(("roles:" + objective).encode()).hexdigest(), 16) % len(AGENT_NAMES)
     rotated = AGENT_NAMES[offset:] + AGENT_NAMES[:offset]
@@ -86,6 +93,10 @@ class Session:
     turns: list[Turn]
     final: str = ""
     queued_prompts: list[str] = field(default_factory=list)
+
+
+class SelfRestartRequired(RuntimeError):
+    """Signal that a --self run changed the loaded program at a safe checkpoint."""
 
 
 @dataclass
@@ -181,34 +192,59 @@ class WorkspaceMonitor:
     """Tracks file changes made during the roundtable without requiring Git."""
 
     SKIP_DIRS = {".git", ".roundtable", "node_modules", "__pycache__", ".venv", "venv"}
+    MIN_INTERVAL = 0.75
+    MAX_INTERVAL = 6.0
 
     def __init__(self, root: Path, max_files: int = 10_000):
         self.root = root
         self.max_files = max_files
         self.baseline = self._snapshot()
+        self.previous = self.baseline
         self.changes: list[CodeChange] = []
         self.last_scan = 0.0
+        self.interval = self.MIN_INTERVAL
         self.truncated = len(self.baseline) >= self.max_files
 
     def _snapshot(self) -> dict[str, tuple[int, int]]:
+        # Keep each DirEntry through classification and metadata collection instead of discarding
+        # it in os.walk and looking the path up again. This can avoid a redundant stat on filesystems
+        # where classification needs one, and avoids a Path allocation in this frequently-run scan.
         files: dict[str, tuple[int, int]] = {}
-        for base, dirs, names in os.walk(self.root):
-            dirs[:] = [d for d in dirs if d not in self.SKIP_DIRS]
-            for name in names:
-                path = Path(base) / name
+        stack = [self.root]
+        while stack:
+            for entry in self._scan_dir(stack.pop()):
                 try:
-                    stat = path.stat()
-                    relative = str(path.relative_to(self.root))
-                    files[relative] = (stat.st_mtime_ns, stat.st_size)
+                    is_dir = entry.is_dir()
+                    is_link = entry.is_symlink()
+                except OSError:
+                    continue
+                if is_dir:
+                    # Matches os.walk's default followlinks=False: a symlinked directory is
+                    # neither recursed into nor stat'd as a file.
+                    if entry.name not in self.SKIP_DIRS and not is_link:
+                        stack.append(Path(entry.path))
+                    continue
+                try:
+                    stat = entry.stat()
+                    relative = str(Path(entry.path).relative_to(self.root))
                 except (OSError, ValueError):
                     continue
+                files[relative] = (stat.st_mtime_ns, stat.st_size)
                 if len(files) >= self.max_files:
                     return files
         return files
 
+    @staticmethod
+    def _scan_dir(path: Path) -> list[os.DirEntry]:
+        try:
+            with os.scandir(path) as it:
+                return list(it)
+        except OSError:
+            return []
+
     def refresh(self, force: bool = False) -> list[CodeChange]:
         now = time.monotonic()
-        if not force and now - self.last_scan < 0.75:
+        if not force and now - self.last_scan < self.interval:
             return self.changes
         self.last_scan = now
         current = self._snapshot()
@@ -218,6 +254,16 @@ class WorkspaceMonitor:
                     if current[path] != self.baseline[path]]
         order = {"modified": 0, "added": 1, "deleted": 2}
         self.changes = sorted(changes, key=lambda item: (order[item.kind], item.path))
+        self.truncated = len(current) >= self.max_files
+        # Back off the scan cadence while nothing is changing since the *last scan* -- this
+        # matters most during a usage-limit wait, where the UI can sit idle ticking for hours
+        # with nothing to find. Comparing against `previous` (not `baseline`, which never moves)
+        # lets the interval keep backing off after the first edit instead of resetting forever.
+        # Any newly detected change snaps the interval back to MIN_INTERVAL so active edits still
+        # show up promptly.
+        settled = current == self.previous
+        self.interval = min(self.MAX_INTERVAL, self.interval * 2) if settled else self.MIN_INTERVAL
+        self.previous = current
         return self.changes
 
 
@@ -313,6 +359,9 @@ AGENT_SPINNERS: dict[str, tuple[tuple[str, ...], int]] = {
     "Claude": (("·", "✢", "✳", "∗", "✻", "✽", "✻", "∗", "✳", "✢"), 3),
     "Codex": (("◌", "○", "◉", "●", "◉", "○"), 1),
     "Antigravity": (("⠁", "⠂", "⠄", "⡀", "⢀", "⠠", "⠐", "⠈"), 1),
+    "Aider": (("◢", "◣", "◤", "◥"), 2),
+    "Grok": (("╌", "╍", "━", "╍"), 2),
+    "Qwen": (("◜", "◝", "◞", "◟"), 2),
 }
 
 
@@ -328,17 +377,43 @@ def clip(text: str, limit: int = 16_000) -> str:
     return "[Earlier content clipped]\n" + text[-limit:]
 
 
-def transcript(turns: list[Turn]) -> str:
-    return clip("\n\n".join(f"## {t.speaker} — {t.phase}\n{t.content}" for t in turns))
+def transcript(turns: list[Turn], limit: int = 16_000) -> str:
+    """Render only the history suffix that can reach an agent prompt.
+
+    Build from newest to oldest so a long-running session does not first allocate the complete,
+    unbounded transcript only for ``clip`` to immediately discard almost all of it.
+    """
+    parts: deque[str] = deque()
+    remaining = limit
+    clipped = False
+    for index in range(len(turns) - 1, -1, -1):
+        turn = turns[index]
+        prefix = ("\n\n" if index else "") + f"## {turn.speaker} — {turn.phase}\n"
+        chunk_length = len(prefix) + len(turn.content)
+        if chunk_length <= remaining:
+            parts.appendleft(prefix + turn.content)
+            remaining -= chunk_length
+            continue
+        clipped = True
+        if remaining:
+            if len(turn.content) >= remaining:
+                parts.appendleft(turn.content[-remaining:])
+            else:
+                prefix_length = remaining - len(turn.content)
+                parts.appendleft(prefix[-prefix_length:] + turn.content)
+        break
+    rendered = "".join(parts)
+    return "[Earlier content clipped]\n" + rendered if clipped else rendered
 
 
 class Agent:
     def __init__(self, name: str, workspace: Path, model: str | None = None,
-                elevated: bool = False):
+                 elevated: bool = False, debug: bool = False):
         self.name = name
         self.workspace = workspace
         self.model = model
         self.elevated = elevated
+        self.debug = debug
         self.cancel_event: threading.Event | None = None
 
     def command(self, prompt: str, output_file: Path | None = None) -> list[str]:
@@ -365,6 +440,43 @@ class Agent:
             if self.model:
                 cmd += ["--model", self.model]
             return cmd
+        if self.name == "Aider":
+            # --message runs one instruction non-interactively then exits; --yes-always is required
+            # for that to run unattended at all (it covers the same "auto-accept edits" ground as
+            # Claude's --permission-mode acceptEdits). --no-git keeps Aider from ever auto-creating a
+            # repo or auto-committing in a workspace that doesn't already use git -- matching the
+            # other agents and this harness, none of which commit on the user's behalf unasked.
+            cmd = ["aider", "--message", prompt, "--yes-always", "--no-pretty",
+                   "--no-check-update", "--no-analytics", "--no-git"]
+            cmd += ["--suggest-shell-commands"] if self.elevated else ["--no-suggest-shell-commands"]
+            if self.model:
+                cmd += ["--model", self.model]
+            return cmd
+        if self.name == "Grok":
+            # -p/--single runs one instruction non-interactively then exits. permission-mode and
+            # sandbox names mirror Claude's own (Grok Build accepts --dangerously-skip-permissions
+            # as a compat alias too), reflecting xAI's deliberate Claude Code flag compatibility.
+            cmd = ["grok", "-p", prompt, "--output-format", "plain"]
+            cmd += (["--permission-mode", "bypassPermissions"] if self.elevated
+                    else ["--permission-mode", "acceptEdits", "--sandbox", "workspace"])
+            if self.model:
+                cmd += ["-m", self.model]
+            return cmd
+        if self.name == "Qwen":
+            # -p runs one instruction non-interactively then exits. Deliberately never passes
+            # --sandbox here: verified against the real CLI, it tries to launch a container-backed
+            # sandbox and hangs rather than failing fast when no container runtime is reachable, so
+            # --approval-mode alone (matching Claude's acceptEdits/bypass split) is the safer default.
+            # --auth-type openai is required for OPENAI_API_KEY/OPENAI_BASE_URL env vars to be
+            # honored at all -- verified against the real CLI, without it a perfectly valid key
+            # still fails with a misleading "Invalid API-key provided" error. Qwen-oauth is not an
+            # option here: it cannot be configured headlessly (confirmed via the CLI's own removal
+            # notice for `qwen auth`), so this is the only viable non-interactive auth path.
+            cmd = ["qwen", "-p", prompt, "--output-format", "text", "--auth-type", "openai"]
+            cmd += ["--approval-mode", "yolo"] if self.elevated else ["--approval-mode", "auto-edit"]
+            if self.model:
+                cmd += ["-m", self.model]
+            return cmd
         raise ValueError(f"Unsupported agent: {self.name}")
 
     def run(self, prompt: str, on_tick: Callable[[str], None],
@@ -373,10 +485,16 @@ class Agent:
         with tempfile.TemporaryDirectory(prefix="roundtable-") as td:
             output_file = Path(td) / "last.txt" if self.name == "Codex" else None
             cmd = self.command(prompt, output_file)
+            if self.debug:
+                sys.stderr.write(f"[debug] [{self.name}] exec cmd: {' '.join(cmd)} (cwd={self.workspace})\n")
+                sys.stderr.flush()
             proc = subprocess.Popen(
                 cmd, cwd=self.workspace, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1, encoding="utf-8", errors="replace",
             )
+            if self.debug:
+                sys.stderr.write(f"[debug] [{self.name}] started PID={proc.pid}\n")
+                sys.stderr.flush()
             captured: list[str] = []
             events: queue.SimpleQueue[str] = queue.SimpleQueue()
 
@@ -415,6 +533,9 @@ class Agent:
                 raise
             code = proc.returncode
             reader.join(timeout=2)
+            if self.debug:
+                sys.stderr.write(f"[debug] [{self.name}] PID={proc.pid} exited with status {code}\n")
+                sys.stderr.flush()
             while True:
                 try:
                     on_tick(events.get_nowait())
@@ -429,6 +550,9 @@ class Agent:
                 limit_detail = usage_limit_detail(raw)
                 if limit_detail:
                     raise UsageLimitError(f"{self.name} unavailable: {limit_detail}")
+                if self.debug:
+                    sys.stderr.write(f"[debug] [{self.name}] exit code {code} output detail:\n{raw}\n")
+                    sys.stderr.flush()
                 raise RuntimeError(f"{self.name} exited with status {code}\n{raw[-2000:]}")
             if not answer:
                 raise RuntimeError(f"{self.name} returned an empty response")
@@ -475,26 +599,15 @@ def extract_dibs(turns: list[Turn]) -> dict[str, str]:
     """Each named agent's most recent DIBS claim, later turns overriding earlier ones from the same
     agent — this is what each agent currently owns, not a full claim history."""
     claims: dict[str, str] = {}
-    for turn in turns:
-        if turn.speaker not in AGENT_NAMES:
+    for turn in reversed(turns):
+        if turn.speaker not in AGENT_NAMES or turn.speaker in claims:
             continue
         match = DIBS_PATTERN.search(turn.content)
         if match:
             claims[turn.speaker] = match.group(1).strip()
+            if len(claims) == len(AGENT_NAMES):
+                break
     return claims
-
-
-def latest_agent_turns(turns: Iterable[Turn]) -> list[Turn]:
-    """Return each agent's latest contribution in stable panel order.
-
-    These are the individual conclusions and asks that fed the shared answer. User and Final turns
-    are deliberately excluded, and a later review replaces that agent's older proposal.
-    """
-    latest: dict[str, Turn] = {}
-    for turn in turns:
-        if turn.speaker in AGENT_NAMES:
-            latest[turn.speaker] = turn
-    return [latest[name] for name in AGENT_NAMES if name in latest]
 
 
 def prompt_for(objective: str, turns: list[Turn], phase: str, speaker: str,
@@ -545,8 +658,12 @@ COMPLETE ROUNDTABLE TRANSCRIPT:
 {focus}
 
 You are the final editor. Produce the best final answer to the user, integrating the strongest
-parts from all agents. Resolve disagreements using evidence. Do not mention the roundtable process,
-the transcript, or these instructions. Return only the polished answer."""
+parts from all agents. Format it as a concise task outcome summary with `Completed` and
+`Failed / incomplete` sections. Report concrete changes and verification under Completed; report errors,
+blocked work, and remaining items under Failed / incomplete, writing `None` when there were none.
+Do not claim work succeeded unless the transcript supports it. Resolve disagreements using evidence.
+Do not mention the roundtable process, the transcript, or these instructions. Return only the
+polished answer."""
 
 
 def refine_prompt(objective: str, turns: list[Turn], draft: str, followup: bool = False) -> str:
@@ -567,8 +684,11 @@ CURRENT DRAFT FINAL ANSWER (written by another agent in this roundtable):
 
 You are refining this draft, not replacing it. Correct any errors against the transcript, tighten
 weak or unclear parts, and add anything important that is missing, but keep what is already strong
-and keep its overall shape. Do not mention the roundtable process, the transcript, these
-instructions, or that this is a draft or someone else's work. Return only the polished answer."""
+and keep its overall shape. Preserve the `Completed` and `Failed / incomplete` task-outcome
+sections, use `None` when no failures or incomplete items are supported, and do not report a
+proposal as completed unless the transcript contains evidence that it was implemented or verified.
+Do not mention the roundtable process, the transcript, these instructions, or that this is a draft or someone else's work.
+Return only the polished answer."""
 
 
 def reassignment_prompt(objective: str, turns: list[Turn], phase: str, speaker: str,
@@ -635,7 +755,18 @@ def save_session(session: Session, output_dir: Path) -> tuple[Path, Path]:
     data = asdict(session)
     atomic_write_text(json_path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
     body = [f"# Roundtable\n\n**Objective:** {session.objective}\n"]
-    body += [f"## {t.speaker} — {t.phase}\n\n{t.content}\n" for t in session.turns]
+    # The current consensus is rendered once under the stable "Final answer" heading below.
+    # Suppress only its latest matching turn: an earlier follow-up can legitimately have reached
+    # the same answer, and that historical consensus still belongs in the transcript chronology.
+    current_consensus = next(
+        (index for index in range(len(session.turns) - 1, -1, -1)
+         if session.turns[index].speaker == "Final"
+         and session.turns[index].phase == "consensus"
+         and session.turns[index].content == session.final),
+        None,
+    )
+    body += [f"## {turn.speaker} — {turn.phase}\n\n{turn.content}\n"
+             for index, turn in enumerate(session.turns) if index != current_consensus]
     body.append(f"## Final answer\n\n{session.final}\n")
     atomic_write_text(md_path, "\n".join(body))
     return json_path, md_path
@@ -719,17 +850,21 @@ CONSOLE_KIND_GLYPH: dict[str, str] = {
 }
 
 _ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+_EXEC_PATTERN = re.compile(r"\b(exec|execute|executing|command|shell|bash|test|running)\b", re.IGNORECASE)
+_READ_PATTERN = re.compile(r"\b(read|reading|open|inspect|search|find|list)\b", re.IGNORECASE)
+_WRITE_PATTERN = re.compile(r"\b(write|writing|edit|editing|patch|create|delete)\b", re.IGNORECASE)
 
 
 def work_event(line: str) -> str:
     """Make a compact, terminal-safe entry from a CLI progress line."""
-    cleaned = " ".join(_ANSI_ESCAPE.sub("", line).split())
-    lowered = cleaned.lower()
-    if re.search(r"\b(exec|execute|executing|command|shell|bash|test|running)\b", lowered):
+    if "\x1b" in line:
+        line = _ANSI_ESCAPE.sub("", line)
+    cleaned = " ".join(line.split())
+    if _EXEC_PATTERN.search(cleaned):
         glyph = "▶"
-    elif re.search(r"\b(read|reading|open|inspect|search|find|list)\b", lowered):
+    elif _READ_PATTERN.search(cleaned):
         glyph = "⌕"
-    elif re.search(r"\b(write|writing|edit|editing|patch|create|delete)\b", lowered):
+    elif _WRITE_PATTERN.search(cleaned):
         glyph = "✎"
     else:
         glyph = "·"
@@ -754,10 +889,11 @@ class Display:
         self.started = time.monotonic()
         self.touch_mode = touch_mode
         self.hitboxes: dict[str, tuple[int, int, int, int]] = {}
-        self.scroll = {"Codex": 0, "Claude": 0, "Antigravity": 0, "Final": 0, "Console": 0}
+        self.scroll = {"Codex": 0, "Claude": 0, "Antigravity": 0, "Aider": 0, "Grok": 0, "Qwen": 0,
+                      "Final": 0, "Console": 0}
         self.expanded: str | None = None
         self.console_filter = 0
-        self.usage_names = ("Codex", "Claude", "Antigravity")
+        self.usage_names = ("Codex", "Claude", "Antigravity", "Aider", "Grok", "Qwen")
         self.turn_times: dict[str, list[float]] = {name: [] for name in self.usage_names}
         self.turn_outputs: dict[str, list[int]] = {name: [] for name in self.usage_names}
         self.activity_pulses: dict[str, deque[float]] = {
@@ -793,6 +929,9 @@ class Display:
             curses.init_pair(4, curses.COLOR_RED, -1)
             curses.init_pair(5, curses.COLOR_YELLOW, -1)
             curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_CYAN)
+            curses.init_pair(7, curses.COLOR_BLUE, -1)
+            curses.init_pair(8, curses.COLOR_WHITE, -1)
+            curses.init_pair(9, curses.COLOR_GREEN, -1)
 
     def log(self, text: str, kind: str = "info", file_text: str | None = None) -> None:
         elapsed = time.monotonic() - self.started
@@ -886,16 +1025,20 @@ class Display:
         top, left, bottom, right = box
         return top <= y <= bottom and left <= x <= right
 
-    EXPAND_KEYS = {ord("1"): "Codex", ord("2"): "Claude", ord("3"): "Antigravity",
+    EXPAND_KEYS = {ord("1"): "Codex", ord("2"): "Claude", ord("3"): "Antigravity", ord("4"): "Aider",
+                  ord("5"): "Grok", ord("6"): "Qwen",
                   ord("f"): "Final", ord("F"): "Final", ord("0"): "Console"}
     COLLAPSE_KEYS = (27, ord("q"), ord("Q"))  # Esc, q
     CONSOLE_FILTER_KEYS = (ord("c"), ord("C"))
     INTERRUPT_KEYS = (ord("i"), ord("I"))
-    PANEL_NAMES = ("Codex", "Claude", "Antigravity", "Final", "Console")
+    PANEL_NAMES = ("Codex", "Claude", "Antigravity", "Aider", "Grok", "Qwen", "Final", "Console")
     AGENTS = (
         ("Codex", "◇", "OpenAI coding agent", 1),
         ("Claude", "✳", "Anthropic coding agent", 5),
         ("Antigravity", "△", "Google coding agent", 2),
+        ("Aider", "✦", "Open-source coding agent", 7),
+        ("Grok", "▲", "xAI coding agent", 8),
+        ("Qwen", "◈", "Alibaba coding agent", 9),
     )
 
     def toggle_expanded(self, name: str) -> None:
@@ -1179,29 +1322,18 @@ class Display:
         answer_width = w - monitor_width - 4
         self._box(cy, 1, consensus_height, answer_width, curses.color_pair(3))
 
-        self._put(cy, 3, " ◆  SHARED ANSWER "[:max(0, answer_width - 4)],
+        self._put(cy, 3, " ◆  TASK OUTCOME · COMPLETED / FAILED "[:max(0, answer_width - 4)],
                   curses.color_pair(3) | curses.A_BOLD)
-        final_text = self.session.final or "The combined answer will appear here after all agents review the task."
+        final_text = (self.session.final or
+                      "Completed and failed work will be summarized here after the task.")
         all_final_lines = self._wrapped(final_text, answer_width - 4)
         available_final = consensus_height - 3
-        individual = latest_agent_turns(self.session.turns)
-        individual_rows = min(len(individual), max(0, available_final - 2))
-        final_rows = available_final - individual_rows - (1 if individual_rows else 0)
+        final_rows = available_final
         final_offset = min(self.scroll["Final"], max(0, len(all_final_lines) - final_rows))
         final_end = len(all_final_lines) - final_offset if final_offset else len(all_final_lines)
         final_lines = all_final_lines[max(0, final_end - final_rows):final_end]
         for row, line in enumerate(final_lines):
             self._put(cy + 2 + row, 4, line)
-        if individual_rows:
-            section_y = cy + 2 + final_rows
-            self._put(section_y, 3, " ─ INDIVIDUAL CONCLUSIONS / ASKS ",
-                      curses.color_pair(3) | curses.A_BOLD)
-            for row, turn in enumerate(individual[-individual_rows:]):
-                prefix = f"{turn.speaker} · {turn.phase}: "
-                summary = " ".join(turn.content.split())
-                shown = textwrap.shorten(prefix + summary, width=max(5, answer_width - 6),
-                                         placeholder="…")
-                self._put(section_y + 1 + row, 4, shown, curses.A_DIM)
 
         self.hitboxes["final"] = (cy, 1, cy + consensus_height - 1, answer_width)
 
@@ -1253,7 +1385,7 @@ class Display:
                                         mx + monitor_width - 1)
 
         controls = ("tap STOP to cancel   ·   tap a panel to expand" if self.touch_mode else
-                    "ctrl+c cancel   ·   1/2/3/f/0 expand   ·   c cycles console filter   ·   "
+                    "ctrl+c cancel   ·   1-6/f/0 expand   ·   c cycles console filter   ·   "
                     "click a panel to expand")
         footer = self.error or f"{controls}   ·   transcript saved automatically"
         attr = curses.color_pair(4) if self.error and curses.has_colors() else curses.A_DIM
@@ -1286,14 +1418,9 @@ class Display:
         else:  # "Final"
             color = curses.color_pair(3)
             self._box(top, 1, height, w - 2, color)
-            self._put(top, 3, " ◆  SHARED ANSWER (expanded) ", color | curses.A_BOLD)
-            content = self.session.final or "The combined answer will appear here after all agents review the task."
-            individual = latest_agent_turns(self.session.turns)
-            if individual:
-                sections = [content, "INDIVIDUAL CONCLUSIONS / ASKS"]
-                sections.extend(f"{turn.speaker} · {turn.phase}\n{turn.content}"
-                                for turn in individual)
-                content = "\n\n".join(sections)
+            self._put(top, 3, " ◆  TASK OUTCOME (expanded) ", color | curses.A_BOLD)
+            content = (self.session.final or
+                       "Completed and failed work will be summarized here after the task.")
             lines = self._wrapped(content, w - 6)
             available = max(1, height - 3)
             offset = min(self.scroll["Final"], max(0, len(lines) - available))
@@ -1302,7 +1429,7 @@ class Display:
                 self._put(top + 2 + row, 3, line)
             self.hitboxes["final"] = (top, 1, top + height - 1, w - 2)
         hint = ("tap panel to collapse" if self.touch_mode else
-               "same key or Esc/q collapses   ·   1/2/3/f/0 switch panels   ·   c cycles filter   ·   "
+               "same key or Esc/q collapses   ·   1-6/f/0 switch panels   ·   c cycles filter   ·   "
                "wheel/click scrolls")
         self._put(top + height, 2, textwrap.shorten(hint, width=max(10, w - 5), placeholder="…"),
                  curses.A_DIM)
@@ -1355,7 +1482,9 @@ OPTION_TOGGLES: tuple[tuple[str, str], ...] = (
     ("task_status_check", "Task status check — stop redundant work once one agent finishes"),
     ("self", "Self-edit — point the workspace at roundtable's own source to improve itself"),
     ("skip_preflight", "Skip preflight — bypass the preliminary system check (saves time)"),
+    ("extended_preflight", "Extended preflight — use a longer timeout for slow-starting agents"),
     ("reassign_idle", "Reassign idle — a finished agent picks up other work instead of waiting"),
+    ("debug", "Debug mode — enable verbose subprocess and diagnostic trace logging"),
 )
 
 
@@ -1551,6 +1680,14 @@ def scope_hint(name: str, agent_speed: dict[str, list[float]]) -> str:
 
 RETRY_BACKOFF_SECONDS = 3.0
 AVAILABILITY_CHECK_SECONDS = 30.0
+
+# Some agents (verified in practice: Antigravity's sandbox setup, Aider/Qwen against certain
+# providers) can take well past the default preflight timeout just to answer a trivial "reply OK"
+# check, without anything actually being wrong. --extended-preflight swaps in this much more
+# generous timeout for exactly that case, instead of a slow-but-healthy agent being misreported as
+# failed the preflight check.
+DEFAULT_PREFLIGHT_TIMEOUT_SECONDS = 25.0
+EXTENDED_PREFLIGHT_TIMEOUT_SECONDS = 90.0
 
 RERUN_PROGRESS_NOTE = (
     "This is a rerun of a task that didn't finish last time (a transient CLI failure, or a "
@@ -1883,43 +2020,47 @@ def _phase_runner(collab: str, round_no: int) -> Callable[..., None]:
     return _run_parallel_phase
 
 
-def pick_synthesizer(choice: str, session: Session, codex: Agent, claude: Agent,
-                     antigravity: Agent) -> tuple[str, Agent]:
+def pick_synthesizer(choice: str, session: Session, codex: Agent, claude: Agent, antigravity: Agent,
+                     aider: Agent, grok: Agent, qwen: Agent) -> tuple[str, Agent]:
     """Choose who writes the final answer.
 
     'rotate' spreads the role across agents by objective instead of always favoring one model,
     so the same session stays consistent across follow-ups while different sessions vary.
     """
-    options = [("Codex", codex), ("Claude", claude), ("Antigravity", antigravity)]
-    by_name = {"codex": 0, "claude": 1, "antigravity": 2}
+    options = [("Codex", codex), ("Claude", claude), ("Antigravity", antigravity), ("Aider", aider),
+              ("Grok", grok), ("Qwen", qwen)]
+    by_name = {"codex": 0, "claude": 1, "antigravity": 2, "aider": 3, "grok": 4, "qwen": 5}
     if choice in by_name:
         return options[by_name[choice]]
     index = int(hashlib.sha256(session.objective.encode()).hexdigest(), 16) % len(options)
     return options[index]
 
 
-def synthesis_order(choice: str, session: Session, codex: Agent, claude: Agent,
-                    antigravity: Agent) -> list[tuple[str, Agent]]:
+def synthesis_order(choice: str, session: Session, codex: Agent, claude: Agent, antigravity: Agent,
+                    aider: Agent, grok: Agent, qwen: Agent, passes: int = 6) -> list[tuple[str, Agent]]:
     """Full relay order for the final answer: who drafts it, then who refines it, in turn.
 
     Reuses pick_synthesizer for the drafting agent (so --synthesizer keeps its meaning), then
-    rotates the remaining two by a second objective-derived hash, so the refining order also varies
-    across sessions instead of always following the same Codex/Claude/Antigravity order.
+    rotates the rest by a second objective-derived hash, so the refining order also varies across
+    sessions instead of always following the same fixed agent order.
     """
-    options = [("Codex", codex), ("Claude", claude), ("Antigravity", antigravity)]
-    first_name, first_agent = pick_synthesizer(choice, session, codex, claude, antigravity)
+    options = [("Codex", codex), ("Claude", claude), ("Antigravity", antigravity), ("Aider", aider),
+              ("Grok", grok), ("Qwen", qwen)]
+    first_name, first_agent = pick_synthesizer(choice, session, codex, claude, antigravity, aider,
+                                               grok, qwen)
     rest = [pair for pair in options if pair[0] != first_name]
     index = int(hashlib.sha256((session.objective + first_name).encode()).hexdigest(), 16) % len(rest)
     rest = rest[index:] + rest[:index]
-    return [(first_name, first_agent)] + rest
+    passes = max(1, min(passes, len(options)))
+    return ([(first_name, first_agent)] + rest)[:passes]
 
 
 def synthesize(session: Session, order: list[tuple[str, Agent]],
                tick: Callable[[str, str], None], status: Callable[[Iterable[str], str], None],
                log_prompt: Callable[[str, str], None] = lambda *_: None,
                followup: bool = False) -> str:
-    """Produce the final answer as a relay: one agent drafts it, the other two refine it in turn,
-    so the result is a merge shaped by all three rather than the output of a single agent."""
+    """Produce the final answer as a relay: one agent drafts it, the rest refine it in turn,
+    so the result is a merge shaped by all of them rather than the output of a single agent."""
     draft = ""
     for index, (name, agent) in enumerate(order):
         verb = "drafting" if index == 0 else "refining"
@@ -2038,40 +2179,54 @@ def _run_phase(runner: Callable[..., None], session: Session, agents: list[tuple
         runner(session, agents, phase, tick, status, message, log_prompt)
 
 
-def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent,
+def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, aider: Agent,
+            grok: Agent, qwen: Agent,
             tick: Callable[[str, str], None],
             status: Callable[[Iterable[str], str], None],
             followup: bool = False, collab: str = "parallel", synthesizer: str = "rotate",
             log_prompt: Callable[[str, str], None] = lambda *_: None,
             balance_load: bool = False, task_status_check: bool = False,
-            reassign_idle: bool = False) -> None:
-    agents = [("Codex", codex), ("Claude", claude), ("Antigravity", antigravity)]
+            reassign_idle: bool = False, synthesis_passes: int = 6,
+            checkpoint: Callable[[], None] = lambda: None,
+            completed_phases: set[str] | None = None) -> None:
+    agents = [("Codex", codex), ("Claude", claude), ("Antigravity", antigravity), ("Aider", aider),
+             ("Grok", grok), ("Qwen", qwen)]
     agent_speed: dict[str, list[float]] | None = {} if balance_load else None
     phase = "followup-proposal" if followup else "proposal"
     proposal_runner = _run_sequential_phase if collab == "sequential" else _run_parallel_phase
     style = "in sequence" if proposal_runner is _run_sequential_phase else "in parallel"
     message = (f"Agents are addressing the follow-up {style}" if followup else
                f"Agents are developing solutions {style}")
-    _run_phase(proposal_runner, session, agents, phase, tick, status, message, log_prompt,
-              agent_speed, task_status_check, reassign_idle)
+    completed_phases = completed_phases or set()
+    if phase not in completed_phases:
+        _run_phase(proposal_runner, session, agents, phase, tick, status, message, log_prompt,
+                  agent_speed, task_status_check, reassign_idle)
+        checkpoint()
     for round_no in range(1, session.rounds + 1):
         phase = f"followup-review {round_no}" if followup else f"review {round_no}"
         runner = _phase_runner(collab, round_no)
         round_style = "in sequence" if runner is _run_sequential_phase else "in parallel"
-        _run_phase(
-            runner, session, agents, phase, tick, status,
-            f"Agents are reviewing {round_style} · round {round_no}/{session.rounds}",
-            log_prompt, agent_speed, task_status_check, reassign_idle,
-        )
+        if phase not in completed_phases:
+            _run_phase(
+                runner, session, agents, phase, tick, status,
+                f"Agents are reviewing {round_style} · round {round_no}/{session.rounds}",
+                log_prompt, agent_speed, task_status_check, reassign_idle,
+            )
+            checkpoint()
+    if "consensus" in completed_phases:
+        return
     drain_queued_prompts(session)
-    order = synthesis_order(synthesizer, session, codex, claude, antigravity)
+    order = synthesis_order(synthesizer, session, codex, claude, antigravity, aider, grok, qwen,
+                            synthesis_passes)
     session.final = synthesize(session, order, tick, status, log_prompt, followup)
     session.turns.append(Turn("Final", "consensus", session.final))
+    checkpoint()
 
 
 def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
-            codex: Agent, claude: Agent, antigravity: Agent,
-            resumed: bool = False) -> int:
+            codex: Agent, claude: Agent, antigravity: Agent, aider: Agent, grok: Agent, qwen: Agent,
+            resumed: bool = False, checkpoint: Callable[[], None] = lambda: None,
+            completed_phases: set[str] | None = None) -> int:
     suppress_focus_reporting()
     run_log = RunLog(log_path_for(session, Path(args.output_dir)))
     ui = Display(stdscr, session, args.touch_mode, run_log)
@@ -2082,7 +2237,8 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
         ui.busy = True
         stdscr.nodelay(True)
         if not args.skip_preflight:
-            run_preflight([("Codex", codex), ("Claude", claude), ("Antigravity", antigravity)],
+            run_preflight([("Codex", codex), ("Claude", claude), ("Antigravity", antigravity),
+                           ("Aider", aider), ("Grok", grok), ("Qwen", qwen)],
                           ui.tick, status, timeout=args.preflight_timeout)
         ui.busy = False
         ui.status = "Ready"
@@ -2099,10 +2255,13 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
         while True:
             ui.busy = True
             stdscr.nodelay(True)
-            conduct(session, codex, claude, antigravity, ui.tick, status, followup,
+            conduct(session, codex, claude, antigravity, aider, grok, qwen, ui.tick, status,
+                   followup,
                    collab=args.collab, synthesizer=args.synthesizer, log_prompt=ui.log_prompt,
                    balance_load=args.balance_load, task_status_check=args.task_status_check,
-                   reassign_idle=args.reassign_idle)
+                   reassign_idle=args.reassign_idle,
+                   synthesis_passes=getattr(args, "synthesis_passes", 6), checkpoint=checkpoint,
+                   completed_phases=completed_phases)
             ui.busy = False
             paths = save_session(session, Path(args.output_dir))
             ui.status = "Complete"
@@ -2115,6 +2274,12 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
                 session.turns.append(Turn("User", "follow-up", request))
             ui.status = "Continuing"
             followup = True
+        return 0
+    except SelfRestartRequired:
+        paths = save_session(session, Path(args.output_dir))
+        ui.log(f"Source changed; restarting from {paths[0]}", kind="info")
+        curses.endwin()
+        restart_self(args, paths[0], followup)
         return 0
     except KeyboardInterrupt:
         ui.busy = False
@@ -2146,7 +2311,8 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
 def verify_clis(mock: bool) -> None:
     if mock:
         return
-    missing = [name for name in ("codex", "claude", "agy") if not shutil.which(name)]
+    missing = [name for name in ("codex", "claude", "agy", "aider", "grok", "qwen")
+              if not shutil.which(name)]
     if missing:
         raise SystemExit(f"Missing required CLI(s): {', '.join(missing)}")
 
@@ -2159,9 +2325,74 @@ def positive_finite_float(value: str) -> float:
     return number
 
 
+def source_fingerprint(path: Path | None = None) -> str:
+    """Hash the loaded program so --self detects edits that require a restart."""
+    source = path or Path(__file__).resolve()
+    return hashlib.sha256(source.read_bytes()).hexdigest()
+
+
+def self_checkpoint(enabled: bool) -> Callable[[], None]:
+    """Return a phase checkpoint which requests one restart after this process is edited."""
+    if not enabled:
+        return lambda: None
+    original = source_fingerprint()
+
+    def check() -> None:
+        if source_fingerprint() != original:
+            raise SelfRestartRequired
+
+    return check
+
+
+def restart_arguments(args: argparse.Namespace, session_path: Path,
+                      followup: bool) -> list[str]:
+    """Build the equivalent invocation used after a checkpointed self-edit."""
+    output_dir = str(args.output_dir or ".roundtable")
+    command = [sys.executable, str(Path(__file__).resolve()), "--resume", str(session_path),
+               "--continue-after-restart", "followup" if followup else "initial", "--self",
+               "--output-dir", output_dir, "--collab", args.collab,
+               "--synthesizer", args.synthesizer, "--synthesis-passes",
+               str(args.synthesis_passes), "--skip-preflight"]
+    if getattr(args, "rounds", None) is not None:
+        command.extend(("--rounds", str(args.rounds)))
+    if getattr(args, "workspace", None):
+        command.extend(("--workspace", str(args.workspace)))
+    for option, value in (("--codex-model", args.codex_model),
+                          ("--claude-model", args.claude_model),
+                          ("--antigravity-model", args.antigravity_model),
+                          ("--aider-model", args.aider_model),
+                          ("--grok-model", args.grok_model),
+                          ("--qwen-model", args.qwen_model)):
+        if value:
+            command.extend((option, value))
+    for value in args.elevated:
+        command.extend(("--elevated", value))
+    for option, enabled in (("--plain", args.plain), ("--mock", args.mock),
+                            ("--balance-load", args.balance_load),
+                            ("--task-status-check", args.task_status_check),
+                            ("--extended-preflight", getattr(args, "extended_preflight", False)),
+                            ("--reassign-idle", args.reassign_idle),
+                            ("--debug", getattr(args, "debug", False))):
+        if enabled:
+            command.append(option)
+    if args.touch is not None:
+        command.append("--touch" if args.touch else "--no-touch")
+    return command
+
+
+def restart_self(args: argparse.Namespace, session_path: Path, followup: bool) -> None:
+    """Replace this process with the edited program and its saved session."""
+    command = restart_arguments(args, session_path, followup)
+    print(f"Roundtable updated itself; restarting with progress saved to {session_path}",
+          file=sys.stderr, flush=True)
+    os.execv(command[0], command)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="roundtable",
-                                     description="A shared terminal roundtable for Codex, Claude, and Antigravity")
+    parser = argparse.ArgumentParser(
+        prog="roundtable",
+        description="A shared terminal roundtable for Codex, Claude, Antigravity, Aider, Grok, "
+                    "and Qwen")
     parser.add_argument("objective", nargs="?", help="the problem the agents should solve")
     parser.add_argument("-r", "--rounds", type=int, choices=range(0, 6), metavar="0-5")
     parser.add_argument("-C", "--workspace", help="shared working directory")
@@ -2173,14 +2404,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--codex-model")
     parser.add_argument("--claude-model")
     parser.add_argument("--antigravity-model")
+    parser.add_argument("--aider-model", default="mistral/codestral-latest",
+                        help="model for Aider in LiteLLM naming (default: mistral/codestral-latest, "
+                             "so Aider's underlying model doesn't just duplicate one of the other "
+                             "lab-native agents)")
+    parser.add_argument("--grok-model")
+    parser.add_argument("--qwen-model", default="qwen3-coder-plus",
+                        help="model for Qwen (default: qwen3-coder-plus). Always required in "
+                             "practice -- verified against the real CLI, Qwen Code silently fails "
+                             "auth with a misleading 'Invalid API-key' error if no -m/--model is "
+                             "passed, even with OPENAI_MODEL set in the environment")
     parser.add_argument("--collab", choices=["parallel", "sequential", "mixed"], default="parallel",
                         help="how agents coordinate: independent parallel turns (default), a "
-                             "strict Codex-Claude-Antigravity relay, or a mix that alternates "
-                             "relay and parallel review rounds")
-    parser.add_argument("--synthesizer", choices=["codex", "claude", "antigravity", "rotate"],
+                             "strict relay through every agent, or a mix that alternates relay and "
+                             "parallel review rounds")
+    parser.add_argument("--synthesizer",
+                        choices=["codex", "claude", "antigravity", "aider", "grok", "qwen", "rotate"],
                         default="rotate",
-                        help="who drafts the final answer first, before the other two refine it in "
+                        help="who drafts the final answer first, before the others refine it in "
                              "turn (default: rotate by objective so no one model always drafts)")
+    parser.add_argument("--synthesis-passes", type=int, choices=range(1, 7), default=6,
+                        metavar="1-6",
+                        help="number of sequential final-answer passes: one draft plus up to five "
+                             "refinements (default: 6; use 1 for lowest latency and model usage)")
     parser.add_argument("--balance-load", action="store_true",
                         help="in parallel phases, give an agent running notably slower than the "
                              "others a narrower-scoped prompt instead of the same full task, so "
@@ -2194,7 +2440,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="in parallel phases, an agent that finishes while others are still "
                              "working gets one extra prompt to pick up different unclaimed work or "
                              "help a still-running agent, instead of sitting idle for the round")
-    parser.add_argument("--elevated", choices=["codex", "claude", "antigravity", "all"],
+    parser.add_argument("--elevated",
+                        choices=["codex", "claude", "antigravity", "aider", "grok", "qwen", "all"],
                         action="append", default=[], metavar="AGENT",
                         help="run the named agent (repeatable, or 'all') with its CLI's own "
                              "permission-bypass flag instead of the sandboxed default, so tool "
@@ -2206,14 +2453,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", help="transcript directory")
     parser.add_argument("--resume", type=Path, metavar="SESSION.json",
                         help="resume a saved JSON session; objective becomes a follow-up")
+    parser.add_argument("--continue-after-restart", choices=("initial", "followup"),
+                        help=argparse.SUPPRESS)
     parser.add_argument("--plain", action="store_true", help="disable fullscreen UI")
     parser.add_argument("--touch", action=argparse.BooleanOptionalAction, default=None,
                         help="enable or disable touchscreen controls (auto-detected by default)")
-    parser.add_argument("--preflight-timeout", type=positive_finite_float, default=25.0,
-                        help="timeout in seconds for each agent's preflight connectivity check "
-                             "(default: 25.0)")
+    parser.add_argument("--preflight-timeout", type=positive_finite_float, default=None,
+                        help=f"timeout in seconds for each agent's preflight connectivity check "
+                             f"(default: {DEFAULT_PREFLIGHT_TIMEOUT_SECONDS:g}, or "
+                             f"{EXTENDED_PREFLIGHT_TIMEOUT_SECONDS:g} with --extended-preflight)")
     parser.add_argument("--skip-preflight", action="store_true",
                         help="skip the preliminary system check entirely")
+    parser.add_argument("--extended-preflight", action="store_true",
+                        help=f"use a {EXTENDED_PREFLIGHT_TIMEOUT_SECONDS:g}s preflight timeout "
+                             f"instead of the {DEFAULT_PREFLIGHT_TIMEOUT_SECONDS:g}s default, for "
+                             f"agents with slow but healthy startup (e.g. sandbox/container setup); "
+                             f"ignored if --preflight-timeout is set explicitly")
+    parser.add_argument("--debug", action="store_true",
+                        help="enable verbose diagnostic logging of agent sub-processes, PIDs, exit codes, and tracebacks")
     parser.add_argument("--mock", action="store_true", help=argparse.SUPPRESS)
     return parser
 
@@ -2230,7 +2487,9 @@ def main() -> int:
             "task_status_check": args.task_status_check,
             "self": args.self,
             "skip_preflight": args.skip_preflight,
+            "extended_preflight": args.extended_preflight,
             "reassign_idle": args.reassign_idle,
+            "debug": args.debug,
         })
         if toggled["elevated"] != started_elevated:
             # Only overwrite a specific --elevated CODEX/CLAUDE/... choice if the toggle actually
@@ -2240,10 +2499,17 @@ def main() -> int:
         args.task_status_check = toggled["task_status_check"]
         args.self = toggled["self"]
         args.skip_preflight = toggled["skip_preflight"]
+        args.extended_preflight = toggled["extended_preflight"]
         args.reassign_idle = toggled["reassign_idle"]
+        args.debug = toggled["debug"]
+    if args.preflight_timeout is None:
+        args.preflight_timeout = (EXTENDED_PREFLIGHT_TIMEOUT_SECONDS if args.extended_preflight
+                                  else DEFAULT_PREFLIGHT_TIMEOUT_SECONDS)
     verify_clis(args.mock)
     self_dir = Path(__file__).resolve().parent
     resumed = args.resume is not None
+    if args.continue_after_restart and not resumed:
+        parser.error("--continue-after-restart requires --resume")
     if resumed:
         resume_path = args.resume.expanduser().resolve()
         try:
@@ -2263,19 +2529,20 @@ def main() -> int:
     if not workspace.is_dir():
         parser.error(f"workspace is not a directory: {workspace}")
     request = args.objective
-    if not request and not (resumed and sys.stdin.isatty()):
+    continuing = args.continue_after_restart is not None
+    if not request and not continuing and not (resumed and sys.stdin.isatty()):
         if not sys.stdin.isatty():
             request = sys.stdin.read().strip()
         else:
             request = curses.wrapper(read_objective_ui, workspace, args.touch_mode)
-    if resumed:
+    if resumed and not continuing:
         if request:
             session.turns.append(Turn("User", "follow-up", request))
         elif not sys.stdin.isatty():
             parser.error("a follow-up is required when resuming in non-interactive mode")
         elif args.plain:
             parser.error("--resume with --plain requires follow-up text as an argument or piped stdin")
-    else:
+    elif not resumed:
         if not request:
             parser.error("an objective is required")
         if args.self:
@@ -2290,11 +2557,25 @@ def main() -> int:
         "codex": elevated_all or "codex" in args.elevated,
         "claude": elevated_all or "claude" in args.elevated,
         "antigravity": elevated_all or "antigravity" in args.elevated,
+        "aider": elevated_all or "aider" in args.elevated,
+        "grok": elevated_all or "grok" in args.elevated,
+        "qwen": elevated_all or "qwen" in args.elevated,
     }
-    codex = cls("Codex", workspace, args.codex_model, elevated=elevated["codex"])
-    claude = cls("Claude", workspace, args.claude_model, elevated=elevated["claude"])
+    codex = cls("Codex", workspace, args.codex_model, elevated=elevated["codex"], debug=args.debug)
+    claude = cls("Claude", workspace, args.claude_model, elevated=elevated["claude"], debug=args.debug)
     antigravity = cls("Antigravity", workspace, args.antigravity_model,
-                      elevated=elevated["antigravity"])
+                      elevated=elevated["antigravity"], debug=args.debug)
+    aider = cls("Aider", workspace, args.aider_model, elevated=elevated["aider"], debug=args.debug)
+    grok = cls("Grok", workspace, args.grok_model, elevated=elevated["grok"], debug=args.debug)
+    qwen = cls("Qwen", workspace, args.qwen_model, elevated=elevated["qwen"], debug=args.debug)
+    followup = (args.continue_after_restart == "followup" if continuing else resumed)
+    current_turns = session.turns
+    if continuing and followup:
+        last_user = max((index for index, turn in enumerate(session.turns)
+                         if turn.speaker == "User"), default=-1)
+        current_turns = session.turns[last_user + 1:]
+    completed_phases = ({turn.phase for turn in current_turns} if continuing else None)
+    checkpoint = self_checkpoint(args.self)
 
     if args.plain or not (sys.stdin.isatty() and sys.stdout.isatty()):
         run_log = RunLog(log_path_for(session, Path(args.output_dir)))
@@ -2311,12 +2592,21 @@ def main() -> int:
             run_log.write("prompt", f"[{name}] PROMPT:\n{prompt}")
         try:
             if not args.skip_preflight:
-                run_preflight([("Codex", codex), ("Claude", claude), ("Antigravity", antigravity)],
+                run_preflight([("Codex", codex), ("Claude", claude), ("Antigravity", antigravity),
+                               ("Aider", aider), ("Grok", grok), ("Qwen", qwen)],
                               tick, status, timeout=args.preflight_timeout)
-            conduct(session, codex, claude, antigravity, tick, status, followup=resumed,
+            conduct(session, codex, claude, antigravity, aider, grok, qwen, tick, status,
+                   followup=followup,
                    collab=args.collab, synthesizer=args.synthesizer, log_prompt=log_prompt,
                    balance_load=args.balance_load, task_status_check=args.task_status_check,
-                   reassign_idle=args.reassign_idle)
+                   reassign_idle=args.reassign_idle, synthesis_passes=args.synthesis_passes,
+                   checkpoint=checkpoint, completed_phases=completed_phases)
+        except SelfRestartRequired:
+            paths = save_session(session, Path(args.output_dir))
+            run_log.write("info", f"Source changed; restarting from {paths[0]}")
+            run_log.close()
+            restart_self(args, paths[0], followup)
+            return 0
         except KeyboardInterrupt:
             run_log.write("error", "Cancelled by user")
             if session.turns:
@@ -2325,6 +2615,9 @@ def main() -> int:
             return 130
         except Exception as exc:
             run_log.write("error", str(exc))
+            if getattr(args, "debug", False):
+                traceback.print_exc()
+                run_log.write("debug", traceback.format_exc())
             if session.turns:
                 try:
                     save_session(session, Path(args.output_dir))
@@ -2337,7 +2630,8 @@ def main() -> int:
         _, md_path = save_session(session, Path(args.output_dir))
         print(f"\n{session.final}\n\nTranscript: {md_path}")
     else:
-        return curses.wrapper(run_tui, args, session, codex, claude, antigravity, resumed)
+        return curses.wrapper(run_tui, args, session, codex, claude, antigravity, aider, grok, qwen,
+                              followup, checkpoint, completed_phases)
     return 0
 
 
