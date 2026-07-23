@@ -416,7 +416,7 @@ class Agent:
         self.debug = debug
         self.cancel_event: threading.Event | None = None
 
-    def command(self, prompt: str, output_file: Path | None = None) -> list[str]:
+    def command(self, prompt: str, output_file: Path | None = None, no_edit: bool = False) -> list[str]:
         if self.name == "Codex":
             cmd = ["codex", "exec", "--skip-git-repo-check", "--color", "never", "--ephemeral",
                    "-C", str(self.workspace)]
@@ -449,6 +449,15 @@ class Agent:
             cmd = ["aider", "--message", prompt, "--yes-always", "--no-pretty",
                    "--no-check-update", "--no-analytics", "--no-git"]
             cmd += ["--suggest-shell-commands"] if self.elevated else ["--no-suggest-shell-commands"]
+            if no_edit:
+                # Verified in practice: without this, synthesis-phase prompts (which ask for prose,
+                # not file changes, but often quote code from other agents' proposals) can make Aider
+                # mistake a quoted snippet for a malformed edit attempt. It then burns up to 3 retries
+                # (its own hard cap) re-sending the entire transcript to the model each time -- 900+
+                # seconds observed in practice against a slow provider, for a turn that never needed
+                # to touch a file at all. --edit-format ask is Aider's own no-edit Q&A mode, which
+                # skips edit-parsing entirely and can't hit this failure mode.
+                cmd += ["--edit-format", "ask"]
             if self.model:
                 cmd += ["--model", self.model]
             return cmd
@@ -480,11 +489,11 @@ class Agent:
         raise ValueError(f"Unsupported agent: {self.name}")
 
     def run(self, prompt: str, on_tick: Callable[[str], None],
-            cancel_event: threading.Event | None = None) -> str:
+            cancel_event: threading.Event | None = None, no_edit: bool = False) -> str:
         cancel_event = cancel_event or self.cancel_event
         with tempfile.TemporaryDirectory(prefix="roundtable-") as td:
             output_file = Path(td) / "last.txt" if self.name == "Codex" else None
-            cmd = self.command(prompt, output_file)
+            cmd = self.command(prompt, output_file, no_edit)
             if self.debug:
                 sys.stderr.write(f"[debug] [{self.name}] exec cmd: {' '.join(cmd)} (cwd={self.workspace})\n")
                 sys.stderr.flush()
@@ -561,7 +570,7 @@ class Agent:
 
 class MockAgent(Agent):
     def run(self, prompt: str, on_tick: Callable[[str], None],
-            cancel_event: threading.Event | None = None) -> str:
+            cancel_event: threading.Event | None = None, no_edit: bool = False) -> str:
         cancel_event = cancel_event or self.cancel_event
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError(f"{self.name} cancelled")
@@ -1796,7 +1805,7 @@ def _wait_for_agent_availability(agent: Agent, on_tick: Callable[[str], None],
         if cancel_event.wait(wait_seconds):
             raise RuntimeError(f"{agent.name} cancelled")
         try:
-            agent.run(PREFLIGHT_PROMPT, on_tick, cancel_event)
+            agent.run(PREFLIGHT_PROMPT, on_tick, cancel_event, no_edit=True)
         except RuntimeError as exc:
             if str(exc) == f"{agent.name} cancelled" or cancel_event.is_set():
                 raise RuntimeError(f"{agent.name} cancelled") from exc
@@ -1807,7 +1816,7 @@ def _wait_for_agent_availability(agent: Agent, on_tick: Callable[[str], None],
 
 
 def _run_with_retry(agent: Agent, prompt: str, on_tick: Callable[[str], None],
-                    cancel_event: threading.Event | None = None) -> str:
+                    cancel_event: threading.Event | None = None, no_edit: bool = False) -> str:
     """Run one agent turn, recovering from transient failures and provider usage limits.
 
     Real CLI failures seen in practice during a long run (a nonzero exit, an empty response) are
@@ -1833,7 +1842,7 @@ def _run_with_retry(agent: Agent, prompt: str, on_tick: Callable[[str], None],
     current_prompt = prompt
     while True:
         try:
-            return agent.run(current_prompt, on_tick, active_cancel)
+            return agent.run(current_prompt, on_tick, active_cancel, no_edit)
         except RuntimeError as exc:
             if str(exc) == f"{agent.name} cancelled" or active_cancel.is_set():
                 raise RuntimeError(f"{agent.name} cancelled") from exc
@@ -2070,9 +2079,12 @@ def synthesize(session: Session, order: list[tuple[str, Agent]],
         log_prompt(name, prompt)
         # Pass a fresh Event explicitly rather than relying on agent.cancel_event: a prior phase's
         # task_status_check cancellation could otherwise leave that attribute already set, which
-        # would abort this agent's turn before it starts.
+        # would abort this agent's turn before it starts. no_edit=True: this turn asks for prose,
+        # never a file change -- for Aider specifically, that avoids it mistaking a quoted code
+        # snippet in the draft/transcript for a malformed edit attempt and burning up to three
+        # expensive retries (its own hard cap) trying to reconcile it against a real file.
         draft = _run_with_retry(agent, prompt, lambda line, speaker=name: tick(speaker, line),
-                                threading.Event())
+                                threading.Event(), no_edit=True)
     status([], "Final answer complete")
     return draft
 
@@ -2089,7 +2101,7 @@ def preflight_check(name: str, agent: Agent, tick: Callable[[str, str], None],
     timer.daemon = True
     timer.start()
     try:
-        agent.run(PREFLIGHT_PROMPT, lambda line: tick(name, line))
+        agent.run(PREFLIGHT_PROMPT, lambda line: tick(name, line), no_edit=True)
         return True, "ready"
     except Exception as exc:
         if cancel_event.is_set():

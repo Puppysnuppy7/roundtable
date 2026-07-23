@@ -17,7 +17,7 @@ import roundtable
 
 
 class FailingAgent(roundtable.Agent):
-    def run(self, prompt, on_tick, cancel_event=None):
+    def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
         raise RuntimeError("boom: simulated failure")
 
 
@@ -403,7 +403,7 @@ class RoundtableTests(unittest.TestCase):
             stopped = 0
             lock = threading.Lock()
 
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 on_tick("started")
                 while not self.cancel_event.is_set():
                     time.sleep(0.01)
@@ -446,7 +446,7 @@ class RoundtableTests(unittest.TestCase):
 
     def test_run_preflight_reports_timeout_without_hanging(self):
         class HangingAgent(roundtable.Agent):
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 while not self.cancel_event.is_set():
                     time.sleep(0.01)
                 raise RuntimeError(f"{self.name} cancelled")
@@ -462,7 +462,7 @@ class RoundtableTests(unittest.TestCase):
 
     def test_run_preflight_allows_usage_limited_agent_to_wait_during_task(self):
         class LimitedAgent(roundtable.Agent):
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 raise RuntimeError(
                     "Claude exited with status 1\n"
                     "You've hit your session limit · resets 5:30pm (America/Chicago)")
@@ -674,7 +674,23 @@ class RoundtableTests(unittest.TestCase):
         self.assertIn("--yes-always", command)
         self.assertIn("--no-git", command)
         self.assertIn("--no-suggest-shell-commands", command)
+        self.assertNotIn("--edit-format", command)
         self.assertEqual(command[-2:], ["--model", "mistral/codestral-latest"])
+
+    def test_aider_no_edit_uses_ask_mode_to_avoid_the_edit_reflection_loop(self):
+        # Verified in practice: without --edit-format ask, a synthesis-phase prompt (prose only,
+        # but often quoting code from another agent's proposal) can make Aider mistake that quote
+        # for a malformed edit attempt, burning up to 3 retries (its own hard cap) re-sending the
+        # full transcript to the model each time -- 900+ seconds observed against a slow provider.
+        agent = roundtable.Agent("Aider", Path("/tmp/work"), "mistral/codestral-latest")
+        command = agent.command("Write a summary", no_edit=True)
+        self.assertIn("--edit-format", command)
+        self.assertEqual(command[command.index("--edit-format") + 1], "ask")
+
+    def test_other_agents_ignore_no_edit_since_they_have_no_edit_reflection_loop(self):
+        for name in ("Codex", "Claude", "Antigravity", "Grok", "Qwen"):
+            agent = roundtable.Agent(name, Path("/tmp/work"))
+            self.assertEqual(agent.command("Solve this"), agent.command("Solve this", no_edit=True))
 
     def test_grok_command_is_noninteractive_with_claude_style_permission_modes(self):
         agent = roundtable.Agent("Grok", Path("/tmp/work"), "grok-4")
@@ -1248,7 +1264,7 @@ class RoundtableTests(unittest.TestCase):
             active = 0
             maximum = 0
 
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 with self.lock:
                     type(self).active += 1
                     type(self).maximum = max(type(self).maximum, type(self).active)
@@ -1279,7 +1295,7 @@ class RoundtableTests(unittest.TestCase):
         seen_prompts: dict[str, str] = {}
 
         class StaggeredAgent(roundtable.Agent):
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 time.sleep(delays[self.name])
                 seen_prompts[self.name] = prompt
                 return f"{self.name} done"
@@ -1308,7 +1324,7 @@ class RoundtableTests(unittest.TestCase):
         seen_prompts: dict[str, str] = {}
 
         class SlowAgent(roundtable.Agent):
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 time.sleep(0.05 if self.name == "Antigravity" else 0.01)
                 seen_prompts[self.name] = prompt
                 return f"{self.name} done"
@@ -1330,7 +1346,7 @@ class RoundtableTests(unittest.TestCase):
         seen_prompts: list[tuple[str, str]] = []
 
         class StaggeredAgent(roundtable.Agent):
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 time.sleep(delays[self.name])
                 return f"{self.name} done"
 
@@ -1352,7 +1368,7 @@ class RoundtableTests(unittest.TestCase):
         seen_prompts = {}
 
         class RelayAgent(roundtable.Agent):
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 seen_prompts[self.name] = prompt
                 return f"{self.name} says hi"
 
@@ -1375,7 +1391,7 @@ class RoundtableTests(unittest.TestCase):
             active = 0
             maximum = 0
 
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 with self.lock:
                     type(self).active += 1
                     type(self).maximum = max(type(self).maximum, type(self).active)
@@ -1399,7 +1415,7 @@ class RoundtableTests(unittest.TestCase):
             active = 0
             maxima = []
 
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 with self.lock:
                     type(self).active += 1
                 time.sleep(0.03)
@@ -1475,7 +1491,7 @@ class RoundtableTests(unittest.TestCase):
         seen_prompts: list[tuple[str, str]] = []
 
         class RecordingAgent(roundtable.Agent):
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 seen_prompts.append((self.name, prompt))
                 return f"{self.name}'s version"
 
@@ -1574,7 +1590,7 @@ class RoundtableTests(unittest.TestCase):
         delays = {"Codex": 0.02, "Claude": 0.12, "Antigravity": 0.22}
 
         class StaggeredAgent(roundtable.Agent):
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 time.sleep(delays[self.name])
                 return self.name
 
@@ -1597,7 +1613,7 @@ class RoundtableTests(unittest.TestCase):
         delays = {"Codex": 0.02, "Claude": 0.12, "Antigravity": 0.22}
 
         class StaggeredAgent(roundtable.Agent):
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 time.sleep(delays[self.name])
                 return self.name
 
@@ -1643,13 +1659,13 @@ class RoundtableTests(unittest.TestCase):
 
     def test_run_parallel_phase_stops_other_agents_once_one_signals_task_complete(self):
         class WaitingAgent(roundtable.Agent):
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 while not self.cancel_event.is_set():
                     time.sleep(0.01)
                 raise RuntimeError(f"{self.name} cancelled")
 
         class DoneAgent(roundtable.Agent):
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 return "Wrote the file and verified it.\nTASK STATUS: complete"
 
         with tempfile.TemporaryDirectory() as td:
@@ -1671,7 +1687,7 @@ class RoundtableTests(unittest.TestCase):
 
     def test_run_parallel_phase_without_task_status_check_ignores_the_marker(self):
         class DoneAgent(roundtable.Agent):
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 time.sleep(0.02)
                 return "Done.\nTASK STATUS: complete"
 
@@ -1687,7 +1703,7 @@ class RoundtableTests(unittest.TestCase):
         calls = {"Codex": 0}
 
         class MixedAgent(roundtable.Agent):
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 if self.name == "Codex":
                     calls["Codex"] += 1
                     return "Codex extra content" if calls["Codex"] > 1 else "Codex proposal content"
@@ -1714,7 +1730,7 @@ class RoundtableTests(unittest.TestCase):
         calls = {"Codex": 0}
 
         class MixedAgent(roundtable.Agent):
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 if self.name == "Codex":
                     calls["Codex"] += 1
                     return "Codex proposal content"
@@ -1732,13 +1748,13 @@ class RoundtableTests(unittest.TestCase):
 
     def test_reassign_idle_does_not_apply_to_the_agent_that_declared_task_complete(self):
         class WaitingAgent(roundtable.Agent):
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 while not self.cancel_event.is_set():
                     time.sleep(0.01)
                 raise RuntimeError(f"{self.name} cancelled")
 
         class DoneAgent(roundtable.Agent):
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 return "Wrote the file and verified it.\nTASK STATUS: complete"
 
         with tempfile.TemporaryDirectory() as td:
@@ -1757,7 +1773,7 @@ class RoundtableTests(unittest.TestCase):
         class HangingBonusAgent(roundtable.Agent):
             calls = 0
 
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 type(self).calls += 1
                 if type(self).calls == 1:
                     return "Codex proposal content"
@@ -1768,7 +1784,7 @@ class RoundtableTests(unittest.TestCase):
         HangingBonusAgent.calls = 0
 
         class SlowAgent(roundtable.Agent):
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 time.sleep(0.2)
                 return f"{self.name} proposal content"
 
@@ -1787,7 +1803,7 @@ class RoundtableTests(unittest.TestCase):
 
     def test_conduct_lets_agents_skipped_by_task_status_check_review_next_round(self):
         class DoneOnceAgent(roundtable.Agent):
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 if f"YOUR TURN ({self.name}, proposal)" in prompt:
                     if self.name == "Codex":
                         return "Wrote the file and verified it.\nTASK STATUS: complete"
@@ -1814,7 +1830,7 @@ class RoundtableTests(unittest.TestCase):
         such call (synthesize(), which used to call agent.run this way) saw an already-cancelled
         Event and aborted the whole run before producing anything."""
         class RealisticAgent(roundtable.Agent):
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 cancel_event = cancel_event or self.cancel_event
                 if cancel_event is not None and cancel_event.is_set():
                     raise RuntimeError(f"{self.name} cancelled")
@@ -1839,7 +1855,7 @@ class RoundtableTests(unittest.TestCase):
         class FlakyAgent(roundtable.Agent):
             attempts = 0
 
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 type(self).attempts += 1
                 if type(self).attempts == 1:
                     raise RuntimeError(f"{self.name} exited with status 1\ntimeout waiting for response")
@@ -1858,7 +1874,7 @@ class RoundtableTests(unittest.TestCase):
         class FlakyAgent(roundtable.Agent):
             prompts = []
 
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 type(self).prompts.append(prompt)
                 if len(type(self).prompts) == 1:
                     raise RuntimeError(f"{self.name} exited with status 1\ntimeout")
@@ -1875,7 +1891,7 @@ class RoundtableTests(unittest.TestCase):
         class AlwaysFailsAgent(roundtable.Agent):
             attempts = 0
 
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 type(self).attempts += 1
                 raise RuntimeError(f"{self.name} exited with status 1\nstill broken")
 
@@ -1889,7 +1905,7 @@ class RoundtableTests(unittest.TestCase):
         class CancelledAgent(roundtable.Agent):
             attempts = 0
 
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 type(self).attempts += 1
                 raise RuntimeError(f"{self.name} cancelled")
 
@@ -1905,7 +1921,7 @@ class RoundtableTests(unittest.TestCase):
             task_prompts = []
             probes = 0
 
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 if prompt == roundtable.PREFLIGHT_PROMPT:
                     type(self).probes += 1
                     if type(self).probes == 1:
@@ -1933,7 +1949,7 @@ class RoundtableTests(unittest.TestCase):
 
     def test_usage_limit_wait_stops_when_round_is_cancelled(self):
         class LimitedAgent(roundtable.Agent):
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 raise roundtable.UsageLimitError("Codex unavailable: rate limit exceeded")
 
         agent = LimitedAgent("Codex", Path("/tmp"))
@@ -1973,7 +1989,7 @@ class RoundtableTests(unittest.TestCase):
 
     def test_wait_for_agent_availability_sleeps_until_reset_time_instead_of_polling(self):
         class ReadyAgent(roundtable.Agent):
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 return "OK"
 
         agent = ReadyAgent("Claude", Path("/tmp"))
@@ -1989,7 +2005,7 @@ class RoundtableTests(unittest.TestCase):
 
     def test_wait_for_agent_availability_falls_back_to_polling_without_a_reset_time(self):
         class ReadyAgent(roundtable.Agent):
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 return "OK"
 
         agent = ReadyAgent("Claude", Path("/tmp"))
@@ -2004,7 +2020,7 @@ class RoundtableTests(unittest.TestCase):
         class FlakyThenReadyAgent(roundtable.Agent):
             probes = 0
 
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 type(self).probes += 1
                 if type(self).probes < 3:
                     raise roundtable.UsageLimitError("still rate limited, no reset given")
@@ -2025,7 +2041,7 @@ class RoundtableTests(unittest.TestCase):
         class FlakyAgent(roundtable.Agent):
             attempts = 0
 
-            def run(self, prompt, on_tick, cancel_event=None):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
                 if self.name != "Antigravity":
                     return f"{self.name} content"
                 type(self).attempts += 1
