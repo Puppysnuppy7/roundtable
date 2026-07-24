@@ -11,7 +11,10 @@ contributions instead of six competing full solutions. Which agent gets which la
 objective, so no agent is permanently typecast into the same role run after run. Agents also call
 dibs: each is asked to open its turn with `DIBS: <what I'm taking>`, and the next round's prompts
 list what the others already claimed, so the round-by-round split of the task stays visible and
-agents pick up something new instead of redoing each other's ground. All six develop proposals,
+agents pick up something new instead of redoing each other's ground. Every agent's prompt also
+points at a shared, append-only `AGENT_PROMPTS.md` scratch board in the workspace, so an agent can
+leave a note, question, or candidate solution for the others to read on a later turn — treated as
+untrusted peer input, never as authoritative as the user's objective. All six develop proposals,
 then review the shared transcript in each configured round, coordinating in parallel, in a strict
 relay, or a mix of both (`--collab`). The final answer is itself a relay: one agent drafts it, and
 the rest refine it in turn, so the result is shaped by all of them instead of authored by whichever

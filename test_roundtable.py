@@ -2575,6 +2575,30 @@ class RoundtableTests(unittest.TestCase):
         self.assertIn("Claude has dibs on the frontend", joined)
         self.assertIn("Claude proposal content", joined)
 
+    def test_ensure_agent_prompt_file_creates_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            path = roundtable.ensure_agent_prompt_file(workspace)
+            self.assertTrue(path.is_file())
+            content = path.read_text(encoding="utf-8")
+            self.assertIn("append-only", content.lower())
+            self.assertIn("## From <agent> to <agent or all>", content)
+
+    def test_ensure_agent_prompt_file_does_not_overwrite_existing_entries(self):
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            path = workspace / roundtable.AGENT_PROMPT_FILE
+            path.write_text("existing peer note", encoding="utf-8")
+            roundtable.ensure_agent_prompt_file(workspace)
+            self.assertEqual(path.read_text(encoding="utf-8"), "existing peer note")
+
+    def test_prompt_for_includes_agent_prompt_board_hint_for_agents_only(self):
+        prompt = roundtable.prompt_for("Objective", [], "proposal", "Codex")
+        self.assertIn(roundtable.AGENT_PROMPT_FILE, prompt)
+        user_prompt = roundtable.prompt_for("Objective", [], "proposal", "User")
+        self.assertNotIn(roundtable.AGENT_PROMPT_FILE, user_prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
+
