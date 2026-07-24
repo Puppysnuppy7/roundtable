@@ -2530,5 +2530,51 @@ class RoundtableTests(unittest.TestCase):
         killpg.assert_called_once_with(proc.pid, roundtable.signal.SIGTERM)
         proc.terminate.assert_not_called()
 
+    def test_reassign_idle_prompt_includes_same_phase_finished_turns(self):
+        """A mid-phase · extra prompt must see co-agents who already finished this phase.
+
+        session.turns is only updated after the phase ends, so without folding in-flight
+        finished_results into the reassignment transcript, same-round DIBS claims are invisible.
+        """
+        bonus_prompts: list[str] = []
+        claude_done = threading.Event()
+
+        class TrackingAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                if self.name == "Claude":
+                    claude_done.set()
+                    return "DIBS: the frontend\nClaude proposal content"
+                if self.name == "Codex":
+                    # Wait until Claude's primary turn is done so finished_results has it.
+                    if not claude_done.wait(2.0):
+                        raise RuntimeError("Claude did not finish before Codex reassignment")
+                    if "· extra" in prompt or "pick up a different" in prompt:
+                        bonus_prompts.append(prompt)
+                        return "Codex extra content"
+                    return "Codex proposal content"
+                # Stay busy long enough for Codex's reassignment to run.
+                deadline = time.monotonic() + 0.6
+                while time.monotonic() < deadline:
+                    if cancel_event is not None and cancel_event.is_set():
+                        break
+                    time.sleep(0.02)
+                return f"{self.name} proposal content"
+
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            session = roundtable.Session("Goal", td, 0, "now", [])
+            agents = [(name, TrackingAgent(name, workspace))
+                      for name in ("Claude", "Codex", "Antigravity")]
+            roundtable._run_parallel_phase(
+                session, agents, "proposal", lambda *_: None, lambda *_: None, "Working",
+                reassign_idle=True, stagger=0,
+            )
+
+        self.assertTrue(bonus_prompts, "Codex should have received a reassignment prompt")
+        joined = "\n".join(bonus_prompts)
+        self.assertIn("Claude has dibs on the frontend", joined)
+        self.assertIn("Claude proposal content", joined)
+
+
 if __name__ == "__main__":
     unittest.main()

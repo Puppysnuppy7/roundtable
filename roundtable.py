@@ -1960,6 +1960,9 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
     completed_by: str | None = None
     skipped: set[str] = set()
     bonus_futures: dict[str, concurrent.futures.Future] = {}
+    # Primary-turn results collected as agents finish, so --reassign-idle bonus prompts can see
+    # same-phase co-agent output (and DIBS claims) before session.turns is updated at phase end.
+    finished_results: dict[str, str] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(agents),
                                                thread_name_prefix="roundtable") as pool:
         futures: dict[str, concurrent.futures.Future] = {}
@@ -1978,7 +1981,17 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
                     tick("", "")
                 remaining = {name for name in names if not futures[name].done()}
                 if remaining != pending:
-                    for name in pending - remaining:
+                    just_finished = pending - remaining
+                    # Collect every newly finished primary result first so same-poll co-agents
+                    # appear in reassignment transcripts (session.turns updates only at phase end).
+                    for name in just_finished:
+                        if name in skipped:
+                            continue
+                        try:
+                            finished_results[name] = futures[name].result()
+                        except Exception:
+                            pass
+                    for name in just_finished:
                         elapsed = time.monotonic() - phase_start
                         if name in skipped:
                             tick(name, f"stopped early ({elapsed:.1f}s) — {completed_by} already "
@@ -1991,7 +2004,8 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
                         declared_complete = False
                         if task_status_check and completed_by is None and remaining:
                             try:
-                                declared_complete = signals_task_complete(futures[name].result())
+                                declared_complete = signals_task_complete(
+                                    finished_results.get(name, ""))
                             except Exception:
                                 declared_complete = False
                             if declared_complete:
@@ -2001,8 +2015,13 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
                                             f"{', '.join(sorted(skipped))} this phase")
                         if (reassign_idle and not declared_complete and completed_by is None
                                 and remaining and name not in bonus_futures):
-                            bonus_prompt = reassignment_prompt(session.objective, session.turns,
-                                                               phase, name, remaining)
+                            partial_turns = list(session.turns)
+                            partial_turns.extend(
+                                Turn(done_name, phase, content)
+                                for done_name, content in finished_results.items()
+                            )
+                            bonus_prompt = reassignment_prompt(
+                                session.objective, partial_turns, phase, name, remaining)
                             log_prompt(name, bonus_prompt)
                             tick(name, f"picking up extra work while "
                                         f"{', '.join(sorted(remaining))} finish")
@@ -2043,7 +2062,10 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
                     bonus_results[name] = future.result(timeout=4.0)
                 except Exception:
                     continue
-        results = {name: futures[name].result() for name in names if name not in skipped}
+        results = {
+            name: finished_results[name] if name in finished_results else futures[name].result()
+            for name in names if name not in skipped
+        }
     # A task_status_check completion sets cancel_event on every agent (line ~1404 above) so the
     # other agents in THIS phase stop — but that Event object stays attached to the Agent instances
     # after this function returns. Left alone, it silently poisons the next call that runs any of
