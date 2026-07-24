@@ -519,6 +519,13 @@ QWEN_YOLO_WARNING = re.compile(
 class Agent:
     """One coding-agent CLI (Codex, Claude, Antigravity, Aider, Grok, or Qwen) and how to run it."""
 
+    # Ceiling on how many raw output lines a single turn forwards to on_tick (log write + curses
+    # redraw per line). A real turn ticks at most a few hundred lines; this exists only to stop a
+    # pathological one -- e.g. a CLI re-printing a large file across several tool calls -- from
+    # flooding the UI/log pipeline for the rest of the run. Output past the cap is still fully
+    # captured for the final answer, just not individually ticked.
+    TICK_LINE_CAP = 2000
+
     def __init__(self, name: str, workspace: Path, model: str | None = None,
                  elevated: bool = False, debug: bool = False):
         self.name = name
@@ -697,6 +704,20 @@ class Agent:
                 sys.stderr.flush()
             captured: list[str] = []
             events: queue.SimpleQueue[str] = queue.SimpleQueue()
+            ticked_lines = 0
+            capped_notice_sent = False
+
+            def deliver(line: str) -> None:
+                # Every line is still captured for the final answer regardless of this cap --
+                # see read_output below. Only the (expensive) per-line UI/log tick is capped.
+                nonlocal ticked_lines, capped_notice_sent
+                ticked_lines += 1
+                if ticked_lines <= self.TICK_LINE_CAP:
+                    on_tick(line)
+                elif not capped_notice_sent:
+                    capped_notice_sent = True
+                    on_tick(f"(output display capped at {self.TICK_LINE_CAP} lines this turn; "
+                            "still capturing everything for the final answer)")
 
             def read_output() -> None:
                 try:
@@ -761,7 +782,7 @@ class Agent:
                     delivered = False
                     while True:
                         try:
-                            on_tick(events.get_nowait())
+                            deliver(events.get_nowait())
                             delivered = True
                         except queue.Empty:
                             break
@@ -788,7 +809,7 @@ class Agent:
                 sys.stderr.flush()
             while True:
                 try:
-                    on_tick(events.get_nowait())
+                    deliver(events.get_nowait())
                 except queue.Empty:
                     break
             raw = "".join(captured).strip()
@@ -1322,7 +1343,7 @@ class Display:
         self.touch_mode = touch_mode
         self.hitboxes: dict[str, tuple[int, int, int, int]] = {}
         self.scroll = {"Codex": 0, "Claude": 0, "Antigravity": 0, "Aider": 0, "Grok": 0, "Qwen": 0,
-                      "Final": 0, "Console": 0}
+                      "Final": 0, "Console": 0, "Code": 0}
         self.expanded: str | None = None
         self.console_filter = 0
         self.usage_names = ("Codex", "Claude", "Antigravity", "Aider", "Grok", "Qwen")
@@ -1432,29 +1453,38 @@ class Display:
         if not hasattr(self, "usage_names") or name not in self.usage_names:
             return
         line_lower = line.lower()
+        # Skip completion/result echoes so a single tool call is not double-counted.
+        # Keep this list small: bare words like "done"/"success" appear in real work lines.
         if any(term in line_lower for term in ("returned", "output", "result", "exited")):
             return
 
-        if any(pat in line_lower for pat in self.READ_PATTERNS) and hasattr(self, "work_reads"):
+        # Prefer tool-ish phrases over bare verbs ("run", "check", "change") which fire on
+        # almost every prose progress line and inflate the panel counters.
+        if hasattr(self, "work_reads") and self.READ_PATTERN.search(line_lower):
             self.work_reads[name] += 1
-        if any(pat in line_lower for pat in self.WRITE_PATTERNS) and hasattr(self, "work_writes"):
+        if hasattr(self, "work_writes") and self.WRITE_PATTERN.search(line_lower):
             self.work_writes[name] += 1
-        if any(pat in line_lower for pat in self.EXEC_PATTERNS) and hasattr(self, "work_execs"):
+        if hasattr(self, "work_execs") and self.EXEC_PATTERN.search(line_lower):
             self.work_execs[name] += 1
 
-    # Predefined patterns for work activity parsing to avoid recreating them on each call
-    READ_PATTERNS = (
-        "view_file", "read_file", "grep_search", "search_grep", "list_dir",
-        "glob_files", "read file", "reading file", "viewed file", "viewing file"
+    # Precompiled regexes: specific tool names + short "verb file/command" phrases only.
+    READ_PATTERN = re.compile(
+        r"\b(view_file|read_file|grep_search|search_grep|list_dir|glob_files|"
+        r"read file|reading file|viewed file|viewing file|"
+        r"open file|load file|fetch file)\b",
+        re.IGNORECASE,
     )
-    WRITE_PATTERNS = (
-        "replace_file_content", "write_to_file", "edit_file", "write_file",
-        "write file", "writing file", "edited file", "editing file", "wrote file"
+    WRITE_PATTERN = re.compile(
+        r"\b(replace_file_content|write_to_file|edit_file|write_file|"
+        r"write file|writing file|edited file|editing file|wrote file|"
+        r"modify file|update file|save file|create file|delete file|remove file)\b",
+        re.IGNORECASE,
     )
-    EXEC_PATTERNS = (
-        "run_command", "execute_command", "execute_bash", "bash",
-        "run command", "running command", "executed command", "ran command",
-        "executed code", "executing code"
+    EXEC_PATTERN = re.compile(
+        r"\b(run_command|execute_command|execute_bash|bash|execute_script|"
+        r"run command|running command|executed command|ran command|"
+        r"executed code|executing code)\b",
+        re.IGNORECASE,
     )
 
     # Generated by _run_with_retry/_wait_for_agent_availability, not any CLI -- exact strings, so
@@ -1493,6 +1523,7 @@ class Display:
     CONSOLE_FILTER_KEYS = (ord("c"), ord("C"))
     INTERRUPT_KEYS = (ord("i"), ord("I"))
     PANEL_NAMES = ("Codex", "Claude", "Antigravity", "Aider", "Grok", "Qwen", "Final", "Console")
+    SCROLL_NAMES = PANEL_NAMES + ("Code",)
     AGENTS = (
         ("Codex", "◇", "OpenAI coding agent", 1),
         ("Claude", "✳", "Anthropic coding agent", 5),
@@ -1570,6 +1601,10 @@ class Display:
                 return
             if key == 3:
                 raise KeyboardInterrupt
+            if key == curses.KEY_RESIZE:
+                # Handle terminal resize by redrawing the UI with new dimensions
+                self.draw()
+                continue
             if key in self.INTERRUPT_KEYS:
                 self.trigger_interrupt()
                 continue
@@ -1617,12 +1652,14 @@ class Display:
                     self.toggle_expanded(name)
                     return None
         direction = 0
-        if state & curses.BUTTON4_PRESSED:
+        button4 = getattr(curses, "BUTTON4_PRESSED", 0)
+        button5 = getattr(curses, "BUTTON5_PRESSED", 0)
+        if button4 and (state & button4):
             direction = 3
-        elif hasattr(curses, "BUTTON5_PRESSED") and state & curses.BUTTON5_PRESSED:
+        elif button5 and (state & button5):
             direction = -3
         if direction:
-            for name in self.PANEL_NAMES:
+            for name in self.SCROLL_NAMES:
                 box = self.hitboxes.get(name.lower())
                 if box and self._inside(box, y, x):
                     self.scroll[name] = max(0, self.scroll.get(name, 0) + direction)
@@ -1662,6 +1699,7 @@ class Display:
         has_responded = name in self.phase_completed or any(
             t.speaker == name for t in self.session.turns)
         state = "● working" if is_active else ("✓ responded" if has_responded else "○ waiting")
+        compact_state = "● work" if is_active else ("✓ done" if has_responded else "○ wait")
         state_attr = color | (curses.A_BOLD if is_active else curses.A_DIM)
         usage_pct = getattr(self, "usage_percent", {}).get(name)
         if usage_pct is not None:
@@ -1672,8 +1710,18 @@ class Display:
                 state_attr = curses.color_pair(5) | curses.A_BOLD  # yellow: approaching it
         ticker = f" {spinner_frame(name, self.frame)}" if is_active else ""
         header = f" {icon}  {name.upper()}{ticker} "
-        self._put(y, x + 2, header[:max(0, width - 4)], color | curses.A_BOLD)
-        state_x = max(x + 2, x + width - len(state) - 2)
+        inner_width = max(0, width - 4)
+        self._put(y, x + 2, header[:inner_width], color | curses.A_BOLD)
+        # Narrow columns drop "● working · 95% used" to a compact form, but keep the
+        # usage signal whenever it still fits — that gauge is the reason the state is red/yellow.
+        if len(state) > inner_width:
+            if usage_pct is not None:
+                with_usage = f"{compact_state} · {usage_pct:.0f}%"
+                state = with_usage if len(with_usage) <= inner_width else compact_state
+            else:
+                state = compact_state
+        state = state[:inner_width]
+        state_x = x + width - len(state) - 2
         subtitle_width = max(0, state_x - (x + 2) - 1)
         self._put(y + 1, x + 2, subtitle[:subtitle_width], curses.A_DIM)
         self._put(y + 1, state_x, state, state_attr)
@@ -1716,14 +1764,17 @@ class Display:
             self._put(content_top + row, x + 2, line)
         if is_active:
             spinner = spinner_frame(name, self.frame)
-            elapsed = time.monotonic() - self.turn_start.get(name, time.monotonic())
+            elapsed = max(0.0, time.monotonic() -
+                          self.turn_start.get(name, time.monotonic()))
             activity = textwrap.shorten(self.activity.get(name) or "Thinking",
                                         width=max(5, width - 16),
                                         placeholder="…")
-            self._put(y + height - 2, x + 2, f"{spinner} {elapsed:4.1f}s  {activity}",
+            footer = f"{spinner} {elapsed:4.1f}s  {activity}"
+            self._put(y + height - 2, x + 2, footer[:inner_width],
                      color | curses.A_DIM)
         elif offset:
-            self._put(y + height - 2, x + 2, f"↑ {offset} lines from latest", color | curses.A_DIM)
+            footer = f"↑ {offset} lines from latest"
+            self._put(y + height - 2, x + 2, footer[:inner_width], color | curses.A_DIM)
         self.hitboxes[name.lower()] = (y, x, y + height - 1, x + width - 1)
 
     def draw(self, reserved_bottom: int = 0) -> None:
@@ -1758,15 +1809,17 @@ class Display:
         obj = textwrap.shorten(self.session.objective, width=max(20, w - 8), placeholder="…")
         self._put(2, 4, obj, curses.A_BOLD)
         status_line = f"{self.status}  ·  {self.session.workspace}"
+        status_budget = max(10, w - 8)
         if self.busy:
             interrupt_label = " ＋ ADD PROMPT [i] "
             interrupt_x = w - len(interrupt_label) - 3
-            status_line = textwrap.shorten(
-                status_line, width=max(10, interrupt_x - 5), placeholder="…")
+            status_budget = max(10, interrupt_x - 5)
             self._put(3, interrupt_x, interrupt_label,
                       curses.color_pair(5) | curses.A_BOLD)
             self.hitboxes["interrupt"] = (
                 3, interrupt_x, 3, interrupt_x + len(interrupt_label) - 1)
+        # Always shorten: a long workspace path used to hard-clip mid-character via addnstr.
+        status_line = textwrap.shorten(status_line, width=status_budget, placeholder="…")
         self._put(3, 4, status_line, curses.A_DIM)
 
         if self.expanded:
@@ -1817,13 +1870,22 @@ class Display:
 
         self._box(cy, mx, monitor_height, monitor_width, curses.color_pair(2))
         changes = self.monitor.changes
-        self._put(cy, mx + 2, f" ⌁  CODE MONITOR · {len(changes)} ",
+        available_changes = max(1, monitor_height - 3)
+        code_offset = min(
+            self.scroll.get("Code", 0), max(0, len(changes) - available_changes))
+        code_scroll = f" · ↑{code_offset}" if code_offset else ""
+        title_width = max(0, monitor_width - 4)
+        code_title = f" ⌁  CODE MONITOR · {len(changes)}{code_scroll} "
+        if len(code_title) > title_width:
+            code_title = f" ⌁ CODE · {len(changes)}{code_scroll} "
+        self._put(cy, mx + 2, code_title[:title_width],
                   curses.color_pair(2) | curses.A_BOLD)
         if changes:
             icons = {"added": "+", "modified": "~", "deleted": "−"}
             colors = {"added": curses.color_pair(3), "modified": curses.color_pair(5),
                       "deleted": curses.color_pair(4)}
-            visible = changes[-max(1, monitor_height - 3):]
+            code_end = len(changes) - code_offset if code_offset else len(changes)
+            visible = changes[max(0, code_end - available_changes):code_end]
             for row, change in enumerate(visible):
                 label = textwrap.shorten(change.path, width=max(5, monitor_width - 7), placeholder="…")
                 self._put(cy + 2 + row, mx + 3, f"{icons[change.kind]} {label}", colors[change.kind])
@@ -1831,19 +1893,35 @@ class Display:
             self._put(cy + 2, mx + 3, "No file changes yet", curses.A_DIM)
             if self.monitor.truncated:
                 self._put(cy + 3, mx + 3, "Large workspace · partial scan", curses.A_DIM)
+        self.hitboxes["code"] = (cy, mx, cy + monitor_height - 1,
+                                 mx + monitor_width - 1)
 
         if show_console:
             console_y = cy + monitor_height + 1
             self._box(console_y, mx, console_height, monitor_width, curses.color_pair(1))
             label, filtered = self._filtered_console()
-            self._put(console_y, mx + 2, f" »  CONSOLE · {label} ", curses.color_pair(1) | curses.A_BOLD)
+            # Same panel-bound title budget as CODE MONITOR: long filter names used to
+            # overwrite the right border at the 72-column minimum (monitor_width ≈ 25).
+            title_width = max(0, monitor_width - 4)
+            console_title = f" »  CONSOLE · {label} "
+            if len(console_title) > title_width:
+                console_title = f" » {label} "
+            self._put(console_y, mx + 2, console_title[:title_width],
+                      curses.color_pair(1) | curses.A_BOLD)
             counts = Counter(kind for kind, _ in self.console)
             summary = " ".join(f"{counts[k]}{CONSOLE_KIND_GLYPH[k]}" for k in
                                ("error", "phase", "turn", "prompt", "tick") if counts.get(k))
             if summary:
                 self._put(console_y + 1, mx + 3, summary[:max(0, monitor_width - 5)], curses.A_DIM)
             available_console = max(1, console_height - 3)
-            entries = filtered[-available_console:]
+            # Honor scroll["Console"] the same way the expanded console and Final panel do.
+            # Wheel/swipe over this box already mutates the offset; previously the compact
+            # panel always showed the latest window, so scrolling looked broken.
+            console_offset = min(
+                self.scroll.get("Console", 0), max(0, len(filtered) - available_console))
+            console_end = (len(filtered) - console_offset if console_offset
+                           else len(filtered))
+            entries = filtered[max(0, console_end - available_console):console_end]
             for row, (kind, text) in enumerate(entries):
                 glyph = CONSOLE_KIND_GLYPH.get(kind, "·")
                 shown = textwrap.shorten(f"{glyph} {text}", width=max(5, monitor_width - 5),
@@ -1874,7 +1952,8 @@ class Display:
             color = curses.color_pair(1)
             self._box(top, 1, height, w - 2, color)
             label, filtered = self._filtered_console()
-            self._put(top, 3, f" »  CONSOLE (expanded) · {label} ", color | curses.A_BOLD)
+            exp_title = f" »  CONSOLE (expanded) · {label} "
+            self._put(top, 3, exp_title[:max(0, w - 6)], color | curses.A_BOLD)
             available = max(1, height - 3)
             offset = min(self.scroll.get("Console", 0), max(0, len(filtered) - available))
             end = len(filtered) - offset if offset else len(filtered)
@@ -1977,6 +2056,11 @@ def read_options_ui(stdscr: curses.window, defaults: dict[str, bool]) -> dict[st
         curses.curs_set(0)
     except curses.error:
         pass
+    try:
+        curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+        curses.mouseinterval(0)
+    except curses.error:
+        pass
     values = dict(defaults)
     while True:
         stdscr.erase()
@@ -1996,6 +2080,21 @@ def read_options_ui(stdscr: curses.window, defaults: dict[str, bool]) -> dict[st
         try:
             key = stdscr.get_wch()
         except curses.error:
+            continue
+        if key == "\x03":  # Ctrl-C: same explicit fallback as Display.poll_input, in case the
+            raise KeyboardInterrupt  # terminal doesn't deliver it as a real SIGINT here.
+        if key == curses.KEY_MOUSE or key == getattr(curses, "KEY_MOUSE", -999):
+            try:
+                _, x, y, _, state = curses.getmouse()
+            except curses.error:
+                continue
+            if state & (curses.BUTTON1_CLICKED | curses.BUTTON1_RELEASED):
+                if 4 <= y < 4 + len(OPTION_TOGGLES):
+                    idx = y - 4
+                    name = OPTION_TOGGLES[idx][0]
+                    values[name] = not values[name]
+                elif y == 5 + len(OPTION_TOGGLES):
+                    return values
             continue
         values, done = apply_option_key(values, key)
         if done:
@@ -2064,6 +2163,8 @@ def read_objective_ui(stdscr: curses.window, workspace: Path, touch_mode: bool =
             stdscr.addnstr(2, 1, "Resize terminal to at least 50 × 14", max(1, w - 2))
         stdscr.refresh()
         key = stdscr.get_wch()
+        if key == "\x03":  # Ctrl-C: same explicit fallback as Display.poll_input, in case the
+            raise KeyboardInterrupt  # terminal doesn't deliver it as a real SIGINT here.
         if key == curses.KEY_MOUSE and touch_mode:
             try:
                 _, x, y, _, state = curses.getmouse()
@@ -2100,6 +2201,8 @@ def read_followup_ui(stdscr: curses.window, ui: Display) -> str:
     while True:
         ui.draw_followup(editor)
         key = stdscr.get_wch()
+        if key == "\x03":  # Ctrl-C: same explicit fallback as Display.poll_input, in case the
+            raise KeyboardInterrupt  # terminal doesn't deliver it as a real SIGINT here.
         if key == curses.KEY_MOUSE:
             try:
                 _, x, y, _, state = curses.getmouse()
@@ -2296,7 +2399,8 @@ def _wait_for_agent_availability(agent: Agent, on_tick: Callable[[str], None],
         if reset_at is not None:
             wait_seconds = max(0.0, (reset_at - now).total_seconds()) + RESET_TIME_BUFFER_SECONDS
             if not announced:
-                on_tick(f"usage limit reached — waiting until {reset_at.strftime('%-I:%M%p')} "
+                formatted_reset = reset_at.strftime('%I:%M%p').lstrip('0')
+                on_tick(f"usage limit reached — waiting until {formatted_reset} "
                         "before checking availability")
         else:
             wait_seconds = AVAILABILITY_CHECK_SECONDS
@@ -2446,6 +2550,7 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
     events: queue.SimpleQueue[tuple[str, str]] = queue.SimpleQueue()
     phase_start = time.monotonic()
     agent_started: dict[str, float] = {}
+    agent_finished: dict[str, float] = {}
     completed_by: str | None = None
     skipped: set[str] = set()
     bonus_futures: dict[str, concurrent.futures.Future] = {}
@@ -2464,8 +2569,11 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
                 if delay and cancel_event.wait(delay):
                     raise RuntimeError(f"{speaker} cancelled")
                 agent_started[speaker] = time.monotonic()
-                return _run_with_retry(
-                    agent, prompt, lambda line: events.put((speaker, line)), cancel_event)
+                try:
+                    return _run_with_retry(
+                        agent, prompt, lambda line: events.put((speaker, line)), cancel_event)
+                finally:
+                    agent_finished[speaker] = time.monotonic()
 
             futures[name] = pool.submit(_primary_run)
         pending = set(names)
@@ -2503,7 +2611,8 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
                             continue
                         if agent_speed is not None:
                             started = agent_started.get(name, phase_start)
-                            agent_speed.setdefault(name, []).append(time.monotonic() - started)
+                            ended = agent_finished.get(name, time.monotonic())
+                            agent_speed.setdefault(name, []).append(ended - started)
                         tick(name, f"finished this phase ({elapsed:.1f}s) — waiting on "
                                     f"{', '.join(sorted(remaining)) or 'nothing else'}")
                         declared_complete = False
@@ -3512,16 +3621,22 @@ def main() -> int:
     if (not args.plain and args.continue_after_restart is None
             and sys.stdin.isatty() and sys.stdout.isatty()):
         started_elevated = bool(args.elevated)
-        toggled = curses.wrapper(read_options_ui, {
-            "elevated": started_elevated,
-            "balance_load": args.balance_load,
-            "task_status_check": args.task_status_check,
-            "self": args.self,
-            "skip_preflight": args.skip_preflight,
-            "extended_preflight": args.extended_preflight,
-            "reassign_idle": args.reassign_idle,
-            "debug": args.debug,
-        })
+        try:
+            toggled = curses.wrapper(read_options_ui, {
+                "elevated": started_elevated,
+                "balance_load": args.balance_load,
+                "task_status_check": args.task_status_check,
+                "self": args.self,
+                "skip_preflight": args.skip_preflight,
+                "extended_preflight": args.extended_preflight,
+                "reassign_idle": args.reassign_idle,
+                "debug": args.debug,
+            })
+        except KeyboardInterrupt:
+            # No session/run_log exists yet this early, so there is nothing to save -- just exit
+            # the same way the rest of the program reports a user cancellation.
+            print("\nCancelled.", file=sys.stderr)
+            return 130
         if toggled["elevated"] != started_elevated:
             # Only overwrite a specific --elevated CODEX/CLAUDE/... choice if the toggle actually
             # changed; otherwise leave whatever CLI flags already set untouched.
@@ -3567,7 +3682,13 @@ def main() -> int:
         if not sys.stdin.isatty():
             request = sys.stdin.read().strip()
         else:
-            request = curses.wrapper(read_objective_ui, workspace, args.touch_mode)
+            try:
+                request = curses.wrapper(read_objective_ui, workspace, args.touch_mode)
+            except KeyboardInterrupt:
+                # No session/run_log exists yet this early, so there is nothing to save -- just
+                # exit the same way the rest of the program reports a user cancellation.
+                print("\nCancelled.", file=sys.stderr)
+                return 130
     if resumed and not continuing:
         if request:
             session.turns.append(Turn("User", "follow-up", request))

@@ -39,6 +39,9 @@ class FakeScreen:
             if 0 <= y < self.h and 0 <= x + i < self.w:
                 self.grid[y][x + i] = ch
 
+    def addstr(self, y, x, text, attr=0):
+        self.addnstr(y, x, text, len(text), attr)
+
     def refresh(self):
         pass
 
@@ -63,7 +66,7 @@ def make_test_display(h=48, w=160, turns=None):
     display.touch_mode = False
     display.hitboxes = {}
     display.scroll = {"Codex": 0, "Claude": 0, "Antigravity": 0, "Aider": 0, "Grok": 0, "Qwen": 0,
-                      "Final": 0, "Console": 0}
+                      "Final": 0, "Console": 0, "Code": 0}
     display.usage_names = ("Codex", "Claude", "Antigravity", "Aider", "Grok", "Qwen")
     display.turn_times = {name: [] for name in display.usage_names}
     display.turn_outputs = {name: [] for name in display.usage_names}
@@ -419,6 +422,97 @@ class RoundtableTests(unittest.TestCase):
         self.assertIn("tick number 4", rendered)
         self.assertIn("collapses", rendered)
         self.assertIn("console", display.hitboxes)
+
+    def test_compact_console_honors_scroll_offset(self):
+        """Regression: wheel/swipe updated scroll['Console'] but the non-expanded panel always
+        sliced the latest N entries, so scrolling the compact console looked like a no-op."""
+        display = make_test_display(h=48, w=160)
+        # Unique markers so a partial render is unambiguous.
+        for i in range(40):
+            display.log(f"console-marker-{i:02d}", kind="phase")
+        display.console_filter = 0  # key events includes phase
+
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False):
+            display.scroll["Console"] = 0
+            display.draw()
+            latest = display.s.text()
+            self.assertIn("console-marker-39", latest)
+            self.assertNotIn("console-marker-00", latest)
+
+            display.scroll["Console"] = 25
+            display.draw()
+            scrolled = display.s.text()
+            # Scrolling back must reveal older markers and drop the newest ones.
+            self.assertNotIn("console-marker-39", scrolled)
+            self.assertTrue(
+                any(f"console-marker-{i:02d}" in scrolled for i in range(0, 20)),
+                scrolled,
+            )
+
+    def test_compact_console_title_stays_inside_panel_border(self):
+        """At the 72-column floor, long console filter names used to paint over the right border."""
+        display = make_test_display(h=48, w=72)
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False):
+            for filt in range(len(roundtable.CONSOLE_FILTERS)):
+                display.console_filter = filt
+                display.draw()
+                self.assertIn("console", display.hitboxes, f"filter={filt}")
+                top, left, _bottom, right = display.hitboxes["console"]
+                row = "".join(display.s.grid[top])
+                self.assertEqual(
+                    row[right], "╮",
+                    f"filter={filt} corrupted right border: {row[left:right + 1]!r}",
+                )
+                # Title text must still identify the panel.
+                self.assertTrue(
+                    "CONSOLE" in row[left:right + 1] or "»" in row[left:right + 1],
+                    row[left:right + 1],
+                )
+
+    def test_code_monitor_honors_mouse_scroll_offset(self):
+        display = make_test_display(h=48, w=72)
+        display.monitor.changes = [
+            roundtable.CodeChange("modified", f"code-marker-{i:02d}.py") for i in range(20)
+        ]
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False):
+            display.draw()
+            latest = display.s.text()
+            self.assertIn("code-marker-19.py", latest)
+            self.assertNotIn("code-marker-00.py", latest)
+
+            top, left, _, _ = display.hitboxes["code"]
+            with mock.patch.object(roundtable.curses, "BUTTON4_PRESSED", 1):
+                display.handle_mouse(left + 1, top + 1, 1)
+            scrolled = display.s.text()
+
+        self.assertEqual(display.scroll["Code"], 3)
+        self.assertIn("↑3", scrolled)
+        self.assertNotIn("code-marker-19.py", scrolled)
+        self.assertIn("code-marker-16.py", scrolled)
+        _, _, _, right = display.hitboxes["code"]
+        self.assertEqual(display.s.grid[top][right], "╮")
+
+    def test_status_line_is_shortened_when_idle(self):
+        """Idle dashboard used to hard-clip a long status·workspace via addnstr mid-string;
+        shorten with an ellipsis instead so the path doesn't look truncated mid-segment."""
+        display = make_test_display(h=30, w=72)
+        display.busy = False
+        display.status = "Ready with a particularly verbose phase description"
+        display.session = roundtable.Session(
+            "Goal",
+            "/home/user/very/long/path/to/a/workspace/directory/name",
+            0, "now", [],
+        )
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False):
+            display.draw()
+        row = "".join(display.s.grid[3]).rstrip()
+        self.assertIn("…", row)
+        # Must not leave a raw mid-path stump without ellipsis (e.g. ".../wor").
+        self.assertLessEqual(len(row.strip()), 72)
 
     def test_touch_hit_targets_and_panel_scrolling(self):
         display = roundtable.Display.__new__(roundtable.Display)
@@ -1518,6 +1612,64 @@ class RoundtableTests(unittest.TestCase):
         self.assertTrue(done)
         self.assertEqual(result, values)
 
+    def test_read_options_ui_mouse_click_toggles_option_and_continues(self):
+        screen = FakeScreen(30, 80)
+        events = [
+            (roundtable.curses.KEY_MOUSE, (0, 3, 4, 0, roundtable.curses.BUTTON1_CLICKED)),
+            (roundtable.curses.KEY_MOUSE, (0, 3, 5 + len(roundtable.OPTION_TOGGLES), 0, roundtable.curses.BUTTON1_CLICKED)),
+        ]
+        def fake_get_wch():
+            key, mouse_evt = events.pop(0)
+            screen._mouse_event = mouse_evt
+            return key
+
+        screen.get_wch = fake_get_wch
+        defaults = {name: False for name, _ in roundtable.OPTION_TOGGLES}
+        with mock.patch.object(roundtable.curses, "getmouse", side_effect=lambda: screen._mouse_event):
+            result = roundtable.read_options_ui(screen, defaults)
+        self.assertTrue(result["elevated"])
+
+    def test_read_options_ui_ctrl_c_raises_keyboard_interrupt(self):
+        """Belt-and-suspenders fallback matching Display.poll_input's `key == 3` check: if this
+        terminal doesn't deliver Ctrl-C as a real SIGINT while blocked in get_wch(), the byte
+        itself must still cancel instead of being silently swallowed as ordinary input."""
+        screen = FakeScreen(30, 80)
+        screen.get_wch = lambda: "\x03"
+        defaults = {name: False for name, _ in roundtable.OPTION_TOGGLES}
+        with self.assertRaises(KeyboardInterrupt):
+            roundtable.read_options_ui(screen, defaults)
+
+    def test_read_objective_ui_ctrl_c_raises_keyboard_interrupt(self):
+        screen = FakeScreen(30, 80)
+        screen.get_wch = lambda: "\x03"
+        screen.move = lambda *_args: None
+        with mock.patch.object(roundtable.curses, "has_colors", return_value=False), \
+             mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             self.assertRaises(KeyboardInterrupt):
+            roundtable.read_objective_ui(screen, Path("/tmp"))
+
+    def test_read_followup_ui_ctrl_c_raises_keyboard_interrupt(self):
+        display = make_test_display()
+        display.draw_followup = lambda editor: None
+        display.s.get_wch = lambda: "\x03"
+        display.s.nodelay = lambda *_args: None
+        with self.assertRaises(KeyboardInterrupt):
+            roundtable.read_followup_ui(display.s, display)
+
+    def test_wait_for_agent_availability_formats_reset_time_portably(self):
+        agent = roundtable.MockAgent("Codex", Path("/tmp"))
+        ticks = []
+        cancel = threading.Event()
+        now = datetime(2026, 1, 1, 12, 0, tzinfo=ZoneInfo("UTC"))
+        detail = "resets 1:30pm (UTC)"
+        # Production deliberately waits through the cancellation event rather than time.sleep so
+        # Ctrl-C can wake it immediately. Bypass that primitive without changing the code path.
+        with mock.patch.object(cancel, "wait", return_value=False):
+            roundtable._wait_for_agent_availability(
+                agent, ticks.append, cancel, detail=detail, clock=lambda: now
+            )
+        self.assertTrue(any("waiting until 1:30PM" in t for t in ticks))
+
     def test_main_options_screen_only_overrides_toggles_that_were_actually_flipped(self):
         with tempfile.TemporaryDirectory() as td:
             argv = ["roundtable", "Solve it", "--mock", "-C", td, "--elevated", "codex"]
@@ -1554,6 +1706,45 @@ class RoundtableTests(unittest.TestCase):
             self.assertTrue(result_args.balance_load)  # toggled on in the fake screen
             self.assertFalse(result_args.self)  # left untouched
             self.assertFalse(result_args.task_status_check)
+
+    def test_main_reports_a_clean_cancel_from_the_options_screen(self):
+        """Ctrl-C during the pre-session options screen has no session/run_log to fall back on
+        (both are built later); main() must still exit 130 with a plain message instead of letting
+        the exception escape to __main__ as a raw traceback."""
+        with tempfile.TemporaryDirectory() as td:
+            argv = ["roundtable", "Solve it", "--mock", "-C", td]
+
+            def fake_wrapper(func, *_wrapper_args, **_):
+                if func is roundtable.read_options_ui:
+                    raise KeyboardInterrupt
+                raise AssertionError(f"unexpected curses.wrapper target: {func}")
+
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(sys.stdin, "isatty", return_value=True), \
+                 mock.patch.object(sys.stdout, "isatty", return_value=True), \
+                 mock.patch.object(roundtable.curses, "wrapper", side_effect=fake_wrapper), \
+                 contextlib.redirect_stderr(io.StringIO()) as captured_stderr:
+                self.assertEqual(roundtable.main(), 130)
+            self.assertIn("Cancelled", captured_stderr.getvalue())
+
+    def test_main_reports_a_clean_cancel_from_the_objective_screen(self):
+        with tempfile.TemporaryDirectory() as td:
+            argv = ["roundtable", "--mock", "-C", td, "--skip-preflight"]
+
+            def fake_wrapper(func, *_wrapper_args, **_):
+                if func is roundtable.read_options_ui:
+                    return {name: False for name, _ in roundtable.OPTION_TOGGLES}
+                if func is roundtable.read_objective_ui:
+                    raise KeyboardInterrupt
+                raise AssertionError(f"unexpected curses.wrapper target: {func}")
+
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(sys.stdin, "isatty", return_value=True), \
+                 mock.patch.object(sys.stdout, "isatty", return_value=True), \
+                 mock.patch.object(roundtable.curses, "wrapper", side_effect=fake_wrapper), \
+                 contextlib.redirect_stderr(io.StringIO()) as captured_stderr:
+                self.assertEqual(roundtable.main(), 130)
+            self.assertIn("Cancelled", captured_stderr.getvalue())
 
     def test_main_skips_the_options_toggle_screen_on_a_self_restart_continuation(self):
         """restart_arguments() already rebuilds the full invocation from the flags the user chose
@@ -3264,6 +3455,49 @@ class RoundtableTests(unittest.TestCase):
         display.tick("Antigravity", "run_command exited with code 0")
         self.assertEqual(display.work_execs["Antigravity"], 2)
 
+        # Specific "verb file" phrases still count; bare prose verbs must not.
+        display.tick("Grok", "open file path/to/x.py")
+        display.tick("Grok", "modify file path/to/x.py")
+        self.assertEqual(display.work_reads["Grok"], 1)
+        self.assertEqual(display.work_writes["Grok"], 1)
+
+    def test_parse_work_activity_ignores_prose_verbs(self):
+        """Bare words like run/check/change/do must not inflate the panel counters.
+
+        An earlier pattern expansion matched almost every progress line; keep the matchers
+        tool-ish so Reads/Execs/Writes stay meaningful in the agent panel.
+        """
+        display = make_test_display()
+        display.draw = lambda: None
+        display.poll_input = lambda: None
+        display.monitor.refresh = lambda: None
+
+        for line in (
+            "I will check the review and do the run next",
+            "planning to implement the change and apply the patch",
+            "looking at how to perform the call",
+            "trigger the process and scan the tree",
+        ):
+            display.tick("Codex", line)
+        self.assertEqual(display.work_reads["Codex"], 0)
+        self.assertEqual(display.work_writes["Codex"], 0)
+        self.assertEqual(display.work_execs["Codex"], 0)
+
+    def test_agent_panel_keeps_usage_in_compact_state_when_it_fits(self):
+        """When full '● working · 95% used' is too long, still show '● work · 95%' if possible."""
+        display = make_test_display(h=25, w=120)
+        display.busy = True
+        display.active = {"Codex"}
+        display.usage_percent["Codex"] = 95.0
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False):
+            display.draw()
+        rendered = display.s.text()
+        # At 120 cols the full label is still too wide for a six-agent row, so the compact
+        # form must retain the percentage rather than dropping the gauge entirely.
+        self.assertIn("● work · 95%", rendered)
+        self.assertNotIn("● working · 95% used", rendered)
+
     def test_draw_renders_work_monitoring_counters(self):
         display = make_test_display(h=30, w=240)
         display.work_reads["Codex"] = 12
@@ -3371,6 +3605,25 @@ class RoundtableTests(unittest.TestCase):
                 # header overran its column it would clobber one of these.
                 border_cols = [i for i, ch in enumerate(header_row) if ch in "╭╮"]
                 self.assertEqual(len(border_cols), 12, display.s.text())
+
+    def test_agent_panel_rows_never_overrun_borders_at_minimum_width(self):
+        display = make_test_display(h=25, w=72)
+        display.busy = True
+        display.active = set(roundtable.AGENT_NAMES)
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False):
+            display.draw()
+
+        for name in roundtable.AGENT_NAMES:
+            top, left, bottom, right = display.hitboxes[name.lower()]
+            with self.subTest(name=name):
+                self.assertEqual(display.s.grid[top][right], "╮")
+                for row in range(top + 1, bottom):
+                    self.assertEqual(display.s.grid[row][right], "│", display.s.text())
+                self.assertEqual(display.s.grid[bottom][right], "╯")
+        rendered = display.s.text()
+        self.assertIn("● work", rendered)
+        self.assertNotIn("-0.0s", rendered)
 
     def test_agent_header_is_clipped_to_panel_width(self):
         display = make_test_display()
@@ -3638,6 +3891,36 @@ class RoundtableTests(unittest.TestCase):
         killpg.assert_called_once_with(proc.pid, roundtable.signal.SIGTERM)
         proc.terminate.assert_not_called()
 
+    def test_agent_run_caps_ticked_lines_but_keeps_the_full_answer(self):
+        """Regression: a real run once had a single turn print roughly 100k lines (a CLI
+        re-printing a large file across tool calls), and on_tick was called once per line with
+        no limit -- each call chains into a log write + curses redraw, so the whole run's
+        UI/log pipeline stalled for the better part of an hour draining a backlog that carried
+        no new information. Ticking is now capped; every line is still captured for the answer."""
+        agent = roundtable.Agent("Codex", Path("/tmp"))
+        line_count = roundtable.Agent.TICK_LINE_CAP + 500
+        lines = [f"line {i}\n" for i in range(line_count)]
+        proc = mock.Mock(pid=1234, stdout=iter(lines))
+        poll_calls = {"n": 0}
+
+        def fake_poll():
+            poll_calls["n"] += 1
+            return None if poll_calls["n"] < 3 else 0
+
+        proc.poll.side_effect = fake_poll
+        proc.wait.return_value = 0
+        proc.returncode = 0
+        ticked: list[str] = []
+
+        with mock.patch.object(roundtable.subprocess, "Popen", return_value=proc), \
+             mock.patch.object(roundtable.time, "sleep"):
+            answer = agent.run("task", ticked.append)
+
+        self.assertEqual(answer, "".join(lines).strip())
+        real_ticks = [line for line in ticked if line]
+        self.assertLessEqual(len(real_ticks), roundtable.Agent.TICK_LINE_CAP + 1)
+        self.assertTrue(any("capped at" in line for line in real_ticks), real_ticks[-3:])
+
     def test_reassign_idle_prompt_includes_same_phase_finished_turns(self):
         """A mid-phase · extra prompt must see co-agents who already finished this phase.
 
@@ -3812,6 +4095,49 @@ class RoundtableTests(unittest.TestCase):
                 fake_source.write_text("a = 2\n")
                 with self.assertRaises(roundtable.SelfRestartRequired):
                     check()
+
+    def test_poll_input_handles_resize_event(self):
+        """Test that KEY_RESIZE event triggers a redraw."""
+        # Create a mock display that simulates the behavior we need to test
+        class MockDisplay:
+            def __init__(self):
+                # Create a mock screen with getch
+                class MockScreen:
+                    def __init__(mock_self):
+                        self.call_count = 0
+                    def getch(mock_self):
+                        # Return KEY_RESIZE on first call, then -1 to exit the loop
+                        self.call_count += 1
+                        if self.call_count == 1:
+                            return roundtable.curses.KEY_RESIZE
+                        return -1
+
+                self.s = MockScreen()
+                self.draw_call_count = 0
+
+            def draw(self):
+                self.draw_call_count += 1
+
+            def poll_input(self):
+                """Copy of the poll_input method with minimal changes for testing"""
+                while True:
+                    key = self.s.getch()
+                    if key == -1:
+                        return
+                    if key == 3:
+                        raise KeyboardInterrupt
+                    if key == roundtable.curses.KEY_RESIZE:
+                        # Handle terminal resize by redrawing the UI with new dimensions
+                        self.draw()
+                        continue
+                    # We only need to test the resize functionality
+                    return
+
+        display = MockDisplay()
+        display.poll_input()
+
+        # Verify that draw was called due to the resize event
+        self.assertEqual(display.draw_call_count, 1)
 
 
 if __name__ == "__main__":

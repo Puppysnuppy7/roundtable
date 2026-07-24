@@ -154,7 +154,8 @@ response. Read/execute/write counters provide an at-a-glance summary; because CL
 differ, they are progress indicators rather than audit totals. A live elapsed-time readout, a wrapped
 multiline task composer, and a task-outcome box summarizing completed, failed, and incomplete work,
 plus a live code monitor showing files changed during the session and a console panel round out the
-diagnostics. Expand an individual agent pane to inspect its full response.
+diagnostics. Expand an individual agent pane to inspect its full response. Mouse-wheel or
+two-finger scrolling over the code monitor reveals earlier changes and marks the offset in its title.
 
 Once the first task phase completes, phase status lines also show a coarse completion estimate.
 It is derived only from wall time observed in the current run and the remaining scheduled work:
@@ -265,6 +266,10 @@ the panel.
 The same key, a click on the expanded panel, or `Esc`/`q` collapses it back to the dashboard. Keyboard
 shortcuts are only live while agents are working (not while typing a follow-up, so digits still type
 normally there); clicking a panel works in both.
+At the 72-column minimum, agent states use compact labels and panel activity is clipped to its own
+column so neighboring panels and their borders remain distinct. When a usage-limit percentage is
+known, the compact state keeps a short `· N%` suffix whenever the column still has room for it.
+Panel work counters (Reads / Execs / Writes) match tool-style phrases only, not bare prose verbs.
 
 Every run also writes `.roundtable/roundtable-<stamp>.log`. It records the full prompt and every
 subprocess output line without the dashboard's truncation or sampling, plus reproducibility
@@ -291,6 +296,9 @@ Ctrl+C     Cancel active work
 Ctrl+C cancels cleanly at any point in the process, not just once agents are working — including the
 startup options screen, the objective prompt, and the preflight connectivity check — printing
 `Cancelled.` and exiting instead of a raw traceback.
+
+The UI automatically adjusts when you resize your terminal window, maintaining proper layout and
+preventing display corruption.
 
 ## Touchscreen and convertible use
 
