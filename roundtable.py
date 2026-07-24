@@ -1698,6 +1698,14 @@ AVAILABILITY_CHECK_SECONDS = 30.0
 DEFAULT_PREFLIGHT_TIMEOUT_SECONDS = 25.0
 EXTENDED_PREFLIGHT_TIMEOUT_SECONDS = 90.0
 
+# Observed in practice on modest hardware: launching six agent subprocesses in the same instant
+# (interpreter/runtime startup for several CLIs at once) creates a real CPU/memory contention spike
+# that can push every agent's response past its own timeout, even ones that are individually fast.
+# Staggering submission spreads that startup burst out while still running everyone concurrently
+# overall -- each agent's own timeout clock only starts once its own call begins, so nobody's
+# effective budget shrinks, they just don't all begin in the same instant.
+AGENT_SPAWN_STAGGER_SECONDS = 0.75
+
 RERUN_PROGRESS_NOTE = (
     "This is a rerun of a task that didn't finish last time (a transient CLI failure, or a "
     "provider usage limit that has now cleared). Before doing anything else, check current "
@@ -1865,7 +1873,8 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
                         status: Callable[[Iterable[str], str], None], message: str,
                         log_prompt: Callable[[str, str], None] = lambda *_: None,
                         agent_speed: dict[str, list[float]] | None = None,
-                        task_status_check: bool = False, reassign_idle: bool = False) -> None:
+                        task_status_check: bool = False, reassign_idle: bool = False,
+                        stagger: float | None = None) -> None:
     """Run one collaboration phase concurrently and record results deterministically.
 
     When agent_speed is provided, an agent running notably slower than the others (based on
@@ -1883,6 +1892,8 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
     At most one extra attempt per agent per phase; it's cancelled if it's still going once the round
     would otherwise be over, so it can't drag a phase out past its slowest primary agent.
     """
+    if stagger is None:
+        stagger = AGENT_SPAWN_STAGGER_SECONDS
     names = [name for name, _ in agents]
     by_name = dict(agents)
     status(names, message)
@@ -1904,11 +1915,12 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
     bonus_futures: dict[str, concurrent.futures.Future] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(agents),
                                                thread_name_prefix="roundtable") as pool:
-        futures = {
-            name: pool.submit(_run_with_retry, agent, prompts[name],
-                              lambda line, speaker=name: events.put((speaker, line)))
-            for name, agent in agents
-        }
+        futures: dict[str, concurrent.futures.Future] = {}
+        for index, (name, agent) in enumerate(agents):
+            if index and stagger:
+                time.sleep(stagger)
+            futures[name] = pool.submit(_run_with_retry, agent, prompts[name],
+                                        lambda line, speaker=name: events.put((speaker, line)))
         pending = set(names)
         try:
             while not all(future.done() for future in futures.values()):
@@ -2116,24 +2128,28 @@ def preflight_check(name: str, agent: Agent, tick: Callable[[str, str], None],
 
 
 def run_preflight(agents: list[tuple[str, Agent]], tick: Callable[[str, str], None],
-                  status: Callable[[Iterable[str], str], None], timeout: float = 25.0) -> None:
+                  status: Callable[[Iterable[str], str], None], timeout: float = 25.0,
+                  stagger: float | None = None) -> None:
     """Check every agent CLI is reachable before committing to the real task.
 
     Without this, a hung or unauthenticated CLI leaves every panel stuck on
     'waiting for task' with no explanation. This fails fast with a clear reason instead.
     """
+    if stagger is None:
+        stagger = AGENT_SPAWN_STAGGER_SECONDS
     names = [name for name, _ in agents]
     status(names, "Running a preliminary system check")
     cancel_events = {name: threading.Event() for name in names}
     events: queue.SimpleQueue[tuple[str, str]] = queue.SimpleQueue()
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(agents),
                                                thread_name_prefix="preflight") as pool:
-        futures = {
-            name: pool.submit(preflight_check, name, agent,
-                              lambda speaker, line: events.put((speaker, line)),
-                              cancel_events[name], timeout)
-            for name, agent in agents
-        }
+        futures: dict[str, concurrent.futures.Future] = {}
+        for index, (name, agent) in enumerate(agents):
+            if index and stagger:
+                time.sleep(stagger)
+            futures[name] = pool.submit(preflight_check, name, agent,
+                                        lambda speaker, line: events.put((speaker, line)),
+                                        cancel_events[name], timeout)
         pending = set(names)
         try:
             while not all(future.done() for future in futures.values()):
@@ -2178,15 +2194,16 @@ def _run_phase(runner: Callable[..., None], session: Session, agents: list[tuple
               status: Callable[[Iterable[str], str], None], message: str,
               log_prompt: Callable[[str, str], None],
               agent_speed: dict[str, list[float]] | None,
-              task_status_check: bool = False, reassign_idle: bool = False) -> None:
-    """Dispatch to a phase runner, passing agent_speed/task_status_check/reassign_idle only to the
-    parallel runner that uses them."""
+              task_status_check: bool = False, reassign_idle: bool = False,
+              stagger: float | None = None) -> None:
+    """Dispatch to a phase runner, passing agent_speed/task_status_check/reassign_idle/stagger only
+    to the parallel runner that uses them."""
     drained = drain_queued_prompts(session)
     if drained and not phase.startswith("followup-"):
         phase = f"followup-{phase}"
     if runner is _run_parallel_phase:
         runner(session, agents, phase, tick, status, message, log_prompt, agent_speed,
-              task_status_check, reassign_idle)
+              task_status_check, reassign_idle, stagger)
     else:
         runner(session, agents, phase, tick, status, message, log_prompt)
 
@@ -2200,7 +2217,8 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
             balance_load: bool = False, task_status_check: bool = False,
             reassign_idle: bool = False, synthesis_passes: int = 6,
             checkpoint: Callable[[], None] = lambda: None,
-            completed_phases: set[str] | None = None) -> None:
+            completed_phases: set[str] | None = None,
+            stagger: float | None = None) -> None:
     agents = [("Codex", codex), ("Claude", claude), ("Antigravity", antigravity), ("Aider", aider),
              ("Grok", grok), ("Qwen", qwen)]
     agent_speed: dict[str, list[float]] | None = {} if balance_load else None
@@ -2212,7 +2230,7 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
     completed_phases = completed_phases or set()
     if phase not in completed_phases:
         _run_phase(proposal_runner, session, agents, phase, tick, status, message, log_prompt,
-                  agent_speed, task_status_check, reassign_idle)
+                  agent_speed, task_status_check, reassign_idle, stagger)
         checkpoint()
     for round_no in range(1, session.rounds + 1):
         phase = f"followup-review {round_no}" if followup else f"review {round_no}"
@@ -2222,7 +2240,7 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
             _run_phase(
                 runner, session, agents, phase, tick, status,
                 f"Agents are reviewing {round_style} · round {round_no}/{session.rounds}",
-                log_prompt, agent_speed, task_status_check, reassign_idle,
+                log_prompt, agent_speed, task_status_check, reassign_idle, stagger,
             )
             checkpoint()
     if "consensus" in completed_phases:

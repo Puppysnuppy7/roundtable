@@ -82,6 +82,17 @@ def make_test_display(h=48, w=160, turns=None):
 
 
 class RoundtableTests(unittest.TestCase):
+    def setUp(self):
+        # Real runs stagger agent spawns (see AGENT_SPAWN_STAGGER_SECONDS) to avoid a startup
+        # resource-contention spike when launching several CLI subprocesses at once. Tests want the
+        # old instant-concurrent behavior instead -- both so short mock-agent sleeps still overlap
+        # the way concurrency assertions expect, and so the suite doesn't accumulate real delay
+        # across dozens of parallel-phase/preflight tests. The staggering mechanism itself still
+        # gets exercised directly, with an explicit override, in its own dedicated test.
+        patcher = mock.patch.object(roundtable, "AGENT_SPAWN_STAGGER_SECONDS", 0.0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_work_event_strips_terminal_codes_and_labels_common_operations(self):
         self.assertEqual(roundtable.work_event("\x1b[32mReading app.py\x1b[0m"),
                          "⌕ Reading app.py")
@@ -421,6 +432,71 @@ class RoundtableTests(unittest.TestCase):
                     lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()),
                     lambda *_: None, "working")
             self.assertEqual(WaitingAgent.stopped, 3)
+
+    def test_run_preflight_staggers_agent_start_times(self):
+        # Regression coverage for the actual mechanism (setUp patches AGENT_SPAWN_STAGGER_SECONDS
+        # to 0 for every other test, so this needs its own explicit override to observe it at all).
+        start_times: dict[str, float] = {}
+
+        class TimestampingAgent(roundtable.MockAgent):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                start_times[self.name] = time.monotonic()
+                return super().run(prompt, on_tick, cancel_event, no_edit)
+
+        with tempfile.TemporaryDirectory() as td:
+            agents = [(name, TimestampingAgent(name, Path(td)))
+                      for name in ("Codex", "Claude", "Antigravity")]
+            roundtable.run_preflight(agents, lambda *_: None, lambda *_: None, stagger=0.2)
+            ordered = [start_times[name] for name in ("Codex", "Claude", "Antigravity")]
+            self.assertEqual(ordered, sorted(ordered))
+            self.assertGreaterEqual(ordered[1] - ordered[0], 0.15)
+            self.assertGreaterEqual(ordered[2] - ordered[1], 0.15)
+
+    def test_run_parallel_phase_staggers_agent_start_times(self):
+        start_times: dict[str, float] = {}
+
+        class TimestampingAgent(roundtable.MockAgent):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                start_times[self.name] = time.monotonic()
+                return super().run(prompt, on_tick, cancel_event, no_edit)
+
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            session = roundtable.Session("Stagger check", td, 0, "now", [])
+            agents = [(name, TimestampingAgent(name, workspace))
+                      for name in ("Codex", "Claude", "Antigravity")]
+            roundtable._run_parallel_phase(session, agents, "proposal", lambda *_: None,
+                                           lambda *_: None, "Working", stagger=0.2)
+            ordered = [start_times[name] for name in ("Codex", "Claude", "Antigravity")]
+            self.assertEqual(ordered, sorted(ordered))
+            self.assertGreaterEqual(ordered[1] - ordered[0], 0.15)
+            self.assertGreaterEqual(ordered[2] - ordered[1], 0.15)
+
+    def test_zero_stagger_still_runs_concurrently(self):
+        # stagger=0 (what setUp uses for every other test) must not become sequential -- it should
+        # just skip the extra sleep, not stop agents from genuinely overlapping.
+        class ConcurrentAgent(roundtable.Agent):
+            lock = threading.Lock()
+            active = 0
+            maximum = 0
+
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                with self.lock:
+                    type(self).active += 1
+                    type(self).maximum = max(type(self).maximum, type(self).active)
+                time.sleep(0.05)
+                with self.lock:
+                    type(self).active -= 1
+                return self.name
+
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            session = roundtable.Session("Stagger check", td, 0, "now", [])
+            agents = [(name, ConcurrentAgent(name, workspace))
+                      for name in ("Codex", "Claude", "Antigravity")]
+            roundtable._run_parallel_phase(session, agents, "proposal", lambda *_: None,
+                                           lambda *_: None, "Working", stagger=0)
+            self.assertEqual(ConcurrentAgent.maximum, 3)
 
     def test_run_preflight_passes_with_healthy_agents(self):
         with tempfile.TemporaryDirectory() as td:
