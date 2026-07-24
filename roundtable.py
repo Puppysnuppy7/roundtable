@@ -2475,6 +2475,30 @@ def source_fingerprint(path: Path | None = None) -> str:
     return hashlib.sha256(source.read_bytes()).hexdigest()
 
 
+def create_self_test_sandbox(workspace: Path, output_dir: Path) -> Path:
+    """Copy the current roundtable.py/test_roundtable.py into a throwaway directory so a --self
+    agent can smoke-test a real invocation of its edited file without running inside the live
+    shared workspace other agents may be concurrently editing, or interfering with this run's own
+    process. Called again on every restart, so its contents track the workspace at each restart."""
+    sandbox = output_dir / "self-test-sandbox"
+    sandbox.mkdir(parents=True, exist_ok=True)
+    for name in ("roundtable.py", "test_roundtable.py"):
+        source = workspace / name
+        if source.is_file():
+            shutil.copy2(source, sandbox / name)
+    return sandbox
+
+
+def self_test_sandbox_note(sandbox: Path) -> str:
+    return (
+        f"A throwaway copy of the current source is kept at `{sandbox}`, refreshed each time this "
+        "run (re)starts. Copy your edited roundtable.py there to smoke-test a real invocation (e.g. "
+        f"`python3 {sandbox}/roundtable.py --mock \"...\"`) without touching the shared workspace or "
+        "interfering with this run's own process. The required `python3 -m unittest test_roundtable` "
+        "check above still runs against the real workspace files, not this copy."
+    )
+
+
 def self_checkpoint(enabled: bool) -> Callable[[], None]:
     """Return a phase checkpoint which requests one restart after this process is edited."""
     if not enabled:
@@ -2679,6 +2703,8 @@ def main() -> int:
         args.output_dir = args.output_dir or ".roundtable"
     if not workspace.is_dir():
         parser.error(f"workspace is not a directory: {workspace}")
+    if args.self:
+        sandbox = create_self_test_sandbox(workspace, Path(args.output_dir))
     request = args.objective
     continuing = args.continue_after_restart is not None
     if not request and not continuing and not (resumed and sys.stdin.isatty()):
@@ -2699,7 +2725,7 @@ def main() -> int:
         if args.self:
             # Suffixed, not prefixed: the header shows a truncated objective, and the real request
             # should survive that truncation rather than the boilerplate note leading it.
-            request = f"{request}\n\n{SELF_EDIT_NOTE}"
+            request = f"{request}\n\n{SELF_EDIT_NOTE}\n\n{self_test_sandbox_note(sandbox)}"
         session = Session(request, str(workspace), args.rounds if args.rounds is not None else 1,
                           datetime.now(timezone.utc).isoformat(), [])
     cls = MockAgent if args.mock else Agent

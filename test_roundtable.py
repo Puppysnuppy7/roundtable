@@ -918,6 +918,48 @@ class RoundtableTests(unittest.TestCase):
             self.assertIn(roundtable.SELF_EDIT_NOTE, session.objective)
             self.assertIn("run `python3 -m unittest test_roundtable`", session.objective)
 
+    def test_create_self_test_sandbox_copies_source_files(self):
+        with tempfile.TemporaryDirectory() as workspace_dir, \
+             tempfile.TemporaryDirectory() as output_dir:
+            workspace = Path(workspace_dir)
+            (workspace / "roundtable.py").write_text("print('rt')")
+            (workspace / "test_roundtable.py").write_text("print('tests')")
+            sandbox = roundtable.create_self_test_sandbox(workspace, Path(output_dir))
+            self.assertEqual(sandbox, Path(output_dir) / "self-test-sandbox")
+            self.assertEqual((sandbox / "roundtable.py").read_text(), "print('rt')")
+            self.assertEqual((sandbox / "test_roundtable.py").read_text(), "print('tests')")
+
+    def test_create_self_test_sandbox_refreshes_on_repeat_calls(self):
+        with tempfile.TemporaryDirectory() as workspace_dir, \
+             tempfile.TemporaryDirectory() as output_dir:
+            workspace = Path(workspace_dir)
+            (workspace / "roundtable.py").write_text("version 1")
+            roundtable.create_self_test_sandbox(workspace, Path(output_dir))
+            (workspace / "roundtable.py").write_text("version 2")
+            sandbox = roundtable.create_self_test_sandbox(workspace, Path(output_dir))
+            self.assertEqual((sandbox / "roundtable.py").read_text(), "version 2")
+
+    def test_create_self_test_sandbox_skips_missing_source_files(self):
+        with tempfile.TemporaryDirectory() as workspace_dir, \
+             tempfile.TemporaryDirectory() as output_dir:
+            sandbox = roundtable.create_self_test_sandbox(Path(workspace_dir), Path(output_dir))
+            self.assertTrue(sandbox.is_dir())
+            self.assertFalse((sandbox / "roundtable.py").exists())
+
+    def test_self_flag_note_points_agents_at_a_real_sandbox_copy(self):
+        with tempfile.TemporaryDirectory() as td:
+            output_dir = Path(td) / "out"
+            argv = ["roundtable", "Improve the console panel", "--plain", "-r", "0", "--mock",
+                    "--self", "--output-dir", str(output_dir)]
+            with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(roundtable.main(), 0)
+            saved = sorted(output_dir.glob("*.json"))[-1]
+            session = roundtable.load_session(saved)
+            sandbox = output_dir / "self-test-sandbox"
+            self.assertIn(str(sandbox), session.objective)
+            self.assertTrue((sandbox / "roundtable.py").is_file())
+            self.assertTrue((sandbox / "test_roundtable.py").is_file())
+
     def test_explicit_workspace_flag_overrides_self(self):
         with tempfile.TemporaryDirectory() as td:
             argv = ["roundtable", "Improve the console panel", "--plain", "-r", "0", "--mock",

@@ -281,6 +281,12 @@ run saves its transcript with an atomic file replacement, then replaces the runn
 updated program. Completed phases and consensus are skipped on the resumed process, so work continues
 from the saved progress rather than starting over or synthesizing the same answer twice.
 
+Every `--self` run is also told about a throwaway copy of the source kept at
+`<output-dir>/self-test-sandbox`, refreshed at the start of the run and again on every restart. An
+agent can copy its edited `roundtable.py` there and run it directly (e.g. `--mock` a real invocation)
+to smoke-test a change without running inside the live shared workspace other agents may be
+concurrently editing, or interfering with this run's own in-memory process.
+
 ## Smoke test
 
 Mock mode checks the orchestration and transcript path without making model calls:
