@@ -39,13 +39,16 @@ Or launch it without an objective to get an interactive prompt:
 roundtable
 ```
 
-In a real terminal (not `--plain` or piped), startup shows a quick numbered toggle screen for the
-opt-in options below before anything else — press the number shown next to an option to flip it,
-then Enter (or Esc/`q`) to continue (skipped on a `--self` restart, which carries forward the
+In a real terminal (not `--plain` or piped), startup shows a quick options screen for the
+opt-in flags below before anything else — ↑/↓ (or j/k) moves the highlight, Space/Tab or the
+row's number toggles it, and the header shows how many flags are currently on. Dangerous
+options (elevated permissions) draw in bold/red when enabled. Enter (or Esc/`q`, or the Continue
+button) proceeds with the current checks (skipped on a `--self` restart, which carries forward the
 choices already made before the source changed, so it can relaunch unattended). Any matching CLI
-flag you already passed sets that toggle's
-starting state; leaving a toggle untouched keeps whatever the flag specified (so a specific
-`--elevated codex` survives even if you don't touch that option).
+flag you already passed sets that toggle's starting state; leaving a toggle untouched keeps
+whatever the flag specified (so a specific `--elevated codex` survives even if you don't touch
+that option). The interactive objective prompt that follows uses the same panel chrome as the
+dashboard, shows a live character/line count, and documents the multiline editing shortcuts.
 
 Useful options:
 
@@ -146,16 +149,21 @@ completion state, so restarting a run does not restore review rounds that were a
 The fullscreen view provides evenly spaced live Codex, Claude, Antigravity, Aider, Grok, and Qwen
 panes, independent working/waiting states, and agent-specific activity tickers next to agent names
 (a pulsing circle for Codex, an asterisk pulse for Claude, moving braille dots for Antigravity, a
-rotating quadrant for Aider, a dashing line for Grok, and a spinning arc for Qwen). Per-agent usage
-sparklines show response time, output size, and activity, while a live work feed inside each active
-agent's own pane keeps reported file reads, searches, edits, commands, tests, and other CLI progress
-attributed to the agent that emitted them; once the agent finishes, its pane returns to the completed
-response. Read/execute/write counters provide an at-a-glance summary; because CLI output formats
-differ, they are progress indicators rather than audit totals. A live elapsed-time readout, a wrapped
-multiline task composer, and a task-outcome box summarizing completed, failed, and incomplete work,
-plus a live code monitor showing files changed during the session and a console panel round out the
-diagnostics. Expand an individual agent pane to inspect its full response. Mouse-wheel or
-two-finger scrolling over the code monitor reveals earlier changes and marks the offset in its title.
+rotating quadrant for Aider, a dashing line for Grok, and a spinning arc for Qwen). On tall enough
+terminals the six panes lay out as a 2×3 grid (roughly double the panel width of a single six-wide
+row); shorter terminals keep one row of six so the outcome/monitor band still fits. A one-line roster
+under the status line shows each agent's icon and ● working / ✓ done / ○ waiting mark at a glance.
+Per-agent usage sparklines show response time, output size, and activity, while a live work feed
+inside each active agent's own pane keeps reported file reads, searches, edits, commands, tests, and
+other CLI progress attributed to the agent that emitted them; once the agent finishes, its pane
+returns to the completed response. Read/execute/write counters provide an at-a-glance summary;
+because CLI output formats differ, they are progress indicators rather than audit totals. The header
+always shows turn count and session elapsed time (battery and touch mode append when present rather
+than replacing them). A wrapped multiline task composer and a task-outcome box summarizing completed,
+failed, and incomplete work, plus a live code monitor showing files changed during the session and a
+console panel round out the diagnostics. Expand an individual agent pane to inspect its full
+response. Mouse-wheel or two-finger scrolling over any panel (including compact agent panes) reveals
+earlier content and marks the offset as `↑N` in that panel's title.
 
 Once the first task phase completes, phase status lines also show a coarse completion estimate.
 It is derived only from wall time observed in the current run and the remaining scheduled work:
@@ -192,7 +200,11 @@ agent), and **errors only**; each line is tagged with a small glyph (`▶` phase
 by kind sits under the console title. Press `0` or click the console to expand it full-screen for the
 complete filtered history, same as the agent and answer panels. Mouse wheel or two-finger scroll works
 on the console the same as any other panel, whether it's expanded or still in the compact dashboard
-view, and the title shows `↑N` while scrolled back from the latest entry.
+view, and the title shows `↑N` while scrolled back from the latest entry. Pressing `?` or `h`
+(or, in touch mode, tapping the `? HELP` button in the header) opens an interactive Help modal
+overlay detailing all keyboard shortcuts and controls. In any expanded panel,
+the arrow keys scroll one line; Page Up/Page Down move a screen at a time; and Home/End jump to the
+oldest/latest content, so long output remains navigable without a mouse.
 
 In a parallel phase, agents finish independently but the transcript only advances once every agent
 in the round is done — so a lone slow agent can leave the screen looking stuck. The console and log
@@ -265,7 +277,13 @@ expanded to full-screen for its complete, un-truncated content: press `1`-`6`/`f
 the panel.
 The same key, a click on the expanded panel, or `Esc`/`q` collapses it back to the dashboard. Keyboard
 shortcuts are only live while agents are working (not while typing a follow-up, so digits still type
-normally there); clicking a panel works in both.
+normally there); clicking a panel works in both. Prompt and follow-up text boxes support multiline
+editing with Up/Down arrow line navigation, Tab insertion, multiline pasting, and standard readline
+shortcuts (`Ctrl+A` / `Ctrl+E` home/end, `Ctrl+U` clear-before-cursor, `Ctrl+K` clear-after-cursor,
+`Ctrl+W` delete-word-backward).
+While agents are working, press `i` to add a prompt without cancelling them. Dashboard and expanded
+panel footers adapt their help to the terminal width, keeping cancel, expand/collapse, and scrolling
+controls visible instead of truncating the control list with an ellipsis.
 At the 72-column minimum, agent states use compact labels and panel activity is clipped to its own
 column so neighboring panels and their borders remain distinct. When a usage-limit percentage is
 known, the compact state keeps a short `· N%` suffix whenever the column still has room for it.

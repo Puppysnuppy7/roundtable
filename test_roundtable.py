@@ -81,6 +81,7 @@ def make_test_display(h=48, w=160, turns=None):
     display.console = roundtable.deque(maxlen=300)
     display.run_log = roundtable.RunLog(None)
     display.expanded = None
+    display.show_help = False
     display.console_filter = 0
     return display
 
@@ -143,15 +144,37 @@ class RoundtableTests(unittest.TestCase):
         self.assertEqual(editor.handle_key("\n"), "submit")
         self.assertEqual(roundtable.LineEditor().handle_key("\x1b"), "cancel")
 
-    def test_line_editor_supports_cursor_and_multiline_layout(self):
-        editor = roundtable.LineEditor("abcd")
-        editor.handle_key(roundtable.curses.KEY_LEFT)
-        editor.handle_key("X")
-        editor.handle_key("\x0e")
-        self.assertEqual(editor.text, "abcX\nd")
-        lines, cursor_y, cursor_x = roundtable.editor_layout(editor, 4, 3)
-        self.assertEqual(lines, ["abcX", "d"])
-        self.assertEqual((cursor_y, cursor_x), (1, 0))
+    def test_line_editor_readline_shortcuts_and_multiline_navigation(self):
+        editor = roundtable.LineEditor("hello world")
+        # Ctrl-A (home)
+        editor.handle_key("\x01")
+        self.assertEqual(editor.cursor, 0)
+        # Ctrl-E (end)
+        editor.handle_key("\x05")
+        self.assertEqual(editor.cursor, 11)
+        # Ctrl-W (delete word backward)
+        editor.handle_key("\x17")
+        self.assertEqual(editor.text, "hello ")
+        # Ctrl-U (clear line before cursor)
+        editor.handle_key("\x15")
+        self.assertEqual(editor.text, "")
+        # Tab (insert 2 spaces)
+        editor.handle_key("\t")
+        self.assertEqual(editor.text, "  ")
+        # Multiline string paste
+        editor.handle_key("first line\nsecond line")
+        self.assertEqual(editor.text, "  first line\nsecond line")
+        # Ctrl-K (clear text after cursor)
+        editor.handle_key("\x01")  # go home
+        editor.handle_key(roundtable.curses.KEY_RIGHT)  # cursor at index 1
+        editor.handle_key("\x0b")  # clear after
+        self.assertEqual(editor.text, " ")
+        # Up and Down navigation
+        m_editor = roundtable.LineEditor("line 1\nline 2")
+        m_editor.handle_key(roundtable.curses.KEY_UP)
+        self.assertEqual(m_editor.cursor, 6)  # at end of line 1
+        m_editor.handle_key(roundtable.curses.KEY_DOWN)
+        self.assertEqual(m_editor.cursor, 13)  # at end of line 2
 
     def test_workspace_monitor_tracks_file_changes(self):
         with tempfile.TemporaryDirectory() as td:
@@ -239,6 +262,8 @@ class RoundtableTests(unittest.TestCase):
         """Regression: terminals that report focus-in/out send ESC [ I / ESC [ O on every alt-tab.
         Every text box here treats a bare Escape as cancel, so without disabling that reporting mode,
         switching focus away and back could look like the user hit Escape and silently end the run."""
+        import linecache
+        linecache.clearcache()
         for name in ("read_options_ui", "read_objective_ui", "run_tui"):
             with self.subTest(entry_point=name):
                 source = inspect.getsource(getattr(roundtable, name))
@@ -269,6 +294,39 @@ class RoundtableTests(unittest.TestCase):
         display.s.getch = mock.Mock(side_effect=[ord("1"), -1])
         display.poll_input()
         self.assertIsNone(display.expanded)
+
+    def test_expanded_panel_keyboard_scrolling_and_bounds(self):
+        display = make_test_display(h=30)
+        display.expanded = "Console"
+        display.console.extend(("phase", f"event {i}") for i in range(80))
+        display.s.getch = mock.Mock(side_effect=[
+            roundtable.curses.KEY_UP,
+            roundtable.curses.KEY_PPAGE,
+            roundtable.curses.KEY_DOWN,
+            roundtable.curses.KEY_HOME,
+            roundtable.curses.KEY_END,
+            -1,
+        ])
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False):
+            display.poll_input()
+        self.assertEqual(display.scroll["Console"], 0)
+
+        display.s.getch = mock.Mock(side_effect=[roundtable.curses.KEY_HOME, -1])
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False):
+            display.poll_input()
+        self.assertEqual(display.scroll["Console"], 60)
+        self.assertIn("↑60", display.s.text())
+        self.assertIn("event 0", display.s.text())
+
+    def test_scroll_keys_do_nothing_without_an_expanded_panel(self):
+        display = make_test_display()
+        display.s.getch = mock.Mock(side_effect=[roundtable.curses.KEY_UP, -1])
+        with mock.patch.object(display, "draw") as draw:
+            display.poll_input()
+        self.assertEqual(display.scroll["Console"], 0)
+        draw.assert_not_called()
 
     def test_draw_expanded_reuses_agent_panel_and_shows_full_content(self):
         class Screen:
@@ -449,6 +507,50 @@ class RoundtableTests(unittest.TestCase):
                 any(f"console-marker-{i:02d}" in scrolled for i in range(0, 20)),
                 scrolled,
             )
+
+    def test_compact_console_title_shows_scroll_offset(self):
+        """Compact Console gave no visual cue that scroll["Console"] had moved you away from the
+        live tail, unlike CODE MONITOR's title, which already showed a "· ↑N" suffix."""
+        display = make_test_display(h=48, w=160)
+        for i in range(40):
+            display.log(f"console-marker-{i:02d}", kind="phase")
+        display.console_filter = 0  # key events includes phase
+
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False):
+            display.scroll["Console"] = 0
+            display.draw()
+            top, left, _bottom, right = display.hitboxes["console"]
+            title_row = "".join(display.s.grid[top])[left:right + 1]
+            self.assertNotIn("↑", title_row)
+
+            display.scroll["Console"] = 25
+            display.draw()
+            top, left, _bottom, right = display.hitboxes["console"]
+            title_row = "".join(display.s.grid[top])[left:right + 1]
+            self.assertIn(f"↑{display.scroll['Console']}", title_row)
+
+    def test_compact_final_title_shows_scroll_offset(self):
+        """Compact Final (TASK OUTCOME) gave no visual cue that scroll["Final"] had moved you away
+        from the live tail, unlike CODE MONITOR's title, which already showed a "· ↑N" suffix."""
+        display = make_test_display(h=48, w=160)
+        display.session.final = "\n".join(f"final-marker-{i:02d}" for i in range(60))
+
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False):
+            display.scroll["Final"] = 0
+            display.draw()
+            top, left, _bottom, right = display.hitboxes["final"]
+            title_row = "".join(display.s.grid[top])[left:right + 1]
+            self.assertNotIn("↑", title_row)
+            self.assertIn("TASK OUTCOME", title_row)
+
+            display.scroll["Final"] = 20
+            display.draw()
+            top, left, _bottom, right = display.hitboxes["final"]
+            title_row = "".join(display.s.grid[top])[left:right + 1]
+            self.assertIn(f"↑{display.scroll['Final']}", title_row)
+            self.assertIn("TASK OUTCOME", title_row)
 
     def test_compact_console_title_stays_inside_panel_border(self):
         """At the 72-column floor, long console filter names used to paint over the right border."""
@@ -1585,32 +1687,95 @@ class RoundtableTests(unittest.TestCase):
 
     def test_apply_option_key_toggles_by_number_and_enter_confirms(self):
         values = {"elevated": False, "balance_load": False, "task_status_check": False}
-        values, done = roundtable.apply_option_key(values, "1")
+        values, cursor, done = roundtable.apply_option_key(values, "1", 0)
         self.assertFalse(done)
+        self.assertEqual(cursor, 0)
         self.assertTrue(values["elevated"])
-        values, done = roundtable.apply_option_key(values, "1")
+        values, cursor, done = roundtable.apply_option_key(values, "1", cursor)
         self.assertFalse(values["elevated"])
-        values, done = roundtable.apply_option_key(values, "9")  # out of range: no-op
+        values, cursor, done = roundtable.apply_option_key(values, "9", cursor)  # out of range: no-op
         self.assertFalse(done)
         self.assertEqual(values, {"elevated": False, "balance_load": False,
                                   "task_status_check": False})
-        values, done = roundtable.apply_option_key(values, "\n")
+        values, cursor, done = roundtable.apply_option_key(values, "\n", cursor)
         self.assertTrue(done)
 
     def test_apply_option_key_toggles_skip_preflight(self):
         values = {"elevated": False, "balance_load": False, "task_status_check": False, "self": False, "skip_preflight": False}
-        values, done = roundtable.apply_option_key(values, "5")
+        values, cursor, done = roundtable.apply_option_key(values, "5", 0)
         self.assertFalse(done)
+        self.assertEqual(cursor, 4)
         self.assertTrue(values["skip_preflight"])
 
     def test_apply_option_key_escape_and_q_confirm_without_toggling(self):
         values = {"elevated": True, "balance_load": False, "task_status_check": False}
-        result, done = roundtable.apply_option_key(values, "\x1b")
+        result, cursor, done = roundtable.apply_option_key(values, "\x1b", 0)
         self.assertTrue(done)
         self.assertEqual(result, values)
-        result, done = roundtable.apply_option_key(values, "q")
+        result, cursor, done = roundtable.apply_option_key(values, "q", 0)
         self.assertTrue(done)
         self.assertEqual(result, values)
+
+    def test_apply_option_key_cursor_navigation_and_space_toggle(self):
+        defaults = {name: False for name, _ in roundtable.OPTION_TOGGLES}
+        # Start at cursor 0 ("elevated"), navigate down to cursor 1 ("balance_load")
+        values, cursor, done = roundtable.apply_option_key(defaults, roundtable.curses.KEY_DOWN, 0)
+        self.assertEqual(cursor, 1)
+        self.assertFalse(done)
+        # Toggle option at cursor 1 ("balance_load") with Space key
+        values, cursor, done = roundtable.apply_option_key(values, " ", cursor)
+        self.assertTrue(values["balance_load"])
+        self.assertEqual(cursor, 1)
+        # Navigate up with 'k' to wraparound or previous
+        values, cursor, done = roundtable.apply_option_key(values, "k", cursor)
+        self.assertEqual(cursor, 0)
+
+    def test_options_summary_counts_enabled_flags(self):
+        values = {name: False for name, _ in roundtable.OPTION_TOGGLES}
+        self.assertEqual(roundtable.options_summary(values), "none on")
+        values["elevated"] = True
+        values["debug"] = True
+        self.assertEqual(roundtable.options_summary(values), "2 on")
+
+    def test_objective_editor_stats_reports_chars_and_lines(self):
+        self.assertEqual(roundtable.objective_editor_stats(""), "empty")
+        self.assertEqual(roundtable.objective_editor_stats("x"), "1 char · 1 line")
+        self.assertEqual(roundtable.objective_editor_stats("ab\ncd"), "5 chars · 2 lines")
+
+    def test_read_options_ui_draws_summary_checkboxes_and_continue(self):
+        """Options chrome: header count, checkbox glyphs, reverse focus, Continue button."""
+        screen = FakeScreen(30, 100)
+        screen.get_wch = lambda: "\n"  # continue immediately after first paint
+        defaults = {name: False for name, _ in roundtable.OPTION_TOGGLES}
+        defaults["elevated"] = True
+        with mock.patch.object(roundtable.curses, "has_colors", return_value=False), \
+             mock.patch.object(roundtable.curses, "color_pair", return_value=0):
+            result = roundtable.read_options_ui(screen, defaults)
+        text = screen.text()
+        self.assertTrue(result["elevated"])
+        self.assertIn("1 on", text)
+        self.assertIn("☑", text)
+        self.assertIn("☐", text)
+        self.assertIn("Continue", text)
+        self.assertIn("OPTIONS", text)
+
+    def test_agent_panel_title_shows_scroll_offset_cue(self):
+        """Agent panes get the same · ↑N title cue as Console/Final when scrolled back."""
+        long = "\n".join(f"line {i}" for i in range(40))
+        display = make_test_display(
+            h=40, w=120,
+            turns=[roundtable.Turn("Codex", "proposal", long)],
+        )
+        display.scroll["Codex"] = 12
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False), \
+             mock.patch.object(roundtable, "battery_summary", return_value=""):
+            display.draw()
+        # Expanded? No — compact panel title should still show the cue.
+        self.assertIn("↑", display.s.text())
+        # Clamp may shrink the requested offset; whatever is kept must appear in the title band.
+        self.assertGreater(display.scroll["Codex"], 0)
+        self.assertIn(f"↑{display.scroll['Codex']}", display.s.text())
 
     def test_read_options_ui_mouse_click_toggles_option_and_continues(self):
         screen = FakeScreen(30, 80)
@@ -2046,6 +2211,101 @@ class RoundtableTests(unittest.TestCase):
         columns = roundtable.balanced_columns(121, 3, gap=2)
         self.assertEqual(columns, [(1, 39), (42, 38), (82, 38)])
         self.assertEqual(columns[-1][0] + columns[-1][1], 120)
+
+    def test_format_duration_compact_forms(self):
+        self.assertEqual(roundtable.format_duration(0), "0:00")
+        self.assertEqual(roundtable.format_duration(65), "1:05")
+        self.assertEqual(roundtable.format_duration(3600 + 2 * 60 + 3), "1:02:03")
+        self.assertEqual(roundtable.format_duration(-5), "0:00")
+
+    def test_dashboard_hint_prioritizes_actions_and_reveals_add_prompt(self):
+        compact = roundtable.dashboard_hint(67, touch_mode=False, busy=True)
+        self.assertLessEqual(len(compact), 67)
+        self.assertIn("ctrl+c cancel", compact)
+        self.assertIn("i add prompt", compact)
+        self.assertIn("1-6/f/0", compact)
+        self.assertIn("? help", compact)
+        self.assertNotIn("…", compact)
+
+        wide = roundtable.dashboard_hint(120, touch_mode=False, busy=False)
+        self.assertIn("c filter", wide)
+        self.assertIn("click panel", wide)
+        self.assertIn("transcript autosaved", wide)
+        self.assertNotIn("add prompt", wide)
+
+    def test_expanded_hint_keeps_collapse_and_scroll_help_at_minimum_width(self):
+        compact = roundtable.expanded_hint(67, touch_mode=False)
+        self.assertLessEqual(len(compact), 67)
+        self.assertIn("Esc/q collapse", compact)
+        self.assertIn("1-6/f/0 switch", compact)
+        self.assertIn("↑/↓", compact)
+        self.assertIn("scroll", compact)
+        self.assertNotIn("…", compact)
+
+    def test_agent_grid_uses_two_rows_when_tall_enough(self):
+        # 2*8 + 1 gap = 17 is the minimum for 2×3; short areas stay 1×6.
+        cols, short = roundtable.agent_grid(120, 16, 6, top=5)
+        self.assertEqual(cols, 6)
+        self.assertEqual(len(short), 6)
+        self.assertEqual(len({y for y, _x, _h, _w in short}), 1)
+
+        cols, tall = roundtable.agent_grid(120, 17, 6, top=5)
+        self.assertEqual(cols, 3)
+        self.assertEqual(len(tall), 6)
+        rows = sorted({y for y, _x, _h, _w in tall})
+        self.assertEqual(len(rows), 2)
+        # Wider panels: three columns beat six at the same terminal width.
+        self.assertGreater(tall[0][3], short[0][3])
+
+    def test_draw_uses_two_row_agent_grid_on_tall_terminals(self):
+        display = make_test_display(h=48, w=160)
+        display.busy = True
+        display.active = {"Codex", "Grok"}
+        display.phase_completed = {"Claude"}
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False), \
+             mock.patch.object(roundtable, "battery_summary", return_value=""):
+            display.draw()
+        # Two distinct panel header rows (not a single six-wide strip).
+        header_rows = [i for i, row in enumerate(display.s.grid)
+                       if sum(1 for ch in row if ch == "╭") >= 3]
+        self.assertGreaterEqual(len(header_rows), 2, display.s.text())
+        # Second row hosts Aider/Grok/Qwen.
+        self.assertIn("AIDER", display.s.text())
+        self.assertIn("GROK", display.s.text())
+        self.assertIn("QWEN", display.s.text())
+        # Roster strip: short Antigravity label + working/done marks.
+        roster = "".join(display.s.grid[4])
+        self.assertIn("Anti", roster)
+        self.assertIn("●", roster)  # active
+        self.assertIn("✓", roster)  # responded
+
+    def test_draw_header_shows_turns_and_elapsed_even_with_battery(self):
+        display = make_test_display(h=25, w=120)
+        display.session.turns = [
+            roundtable.Turn("Codex", "proposal", "hello"),
+            roundtable.Turn("Claude", "proposal", "world"),
+        ]
+        display.started = time.monotonic() - 125  # ~2:05
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False), \
+             mock.patch.object(roundtable, "battery_summary", return_value="🔋 80%"):
+            display.draw()
+        header = "".join(display.s.grid[0])
+        self.assertIn("2 turns", header)
+        self.assertIn("2:05", header)
+        self.assertIn("80%", header)
+
+    def test_draw_keeps_single_row_agent_grid_when_short(self):
+        """At the 72×25 floor, agent area is too short for 2×3 — stay one row of six."""
+        display = make_test_display(h=25, w=72)
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False), \
+             mock.patch.object(roundtable, "battery_summary", return_value=""):
+            display.draw()
+        header_row = display.s.grid[5]
+        border_cols = [i for i, ch in enumerate(header_row) if ch in "╭╮"]
+        self.assertEqual(len(border_cols), 12, display.s.text())
 
     def test_followup_editor_reserves_its_own_bottom_band(self):
         class Screen:
@@ -4114,6 +4374,7 @@ class RoundtableTests(unittest.TestCase):
 
                 self.s = MockScreen()
                 self.draw_call_count = 0
+                self.show_help = False
 
             def draw(self):
                 self.draw_call_count += 1
@@ -4138,6 +4399,70 @@ class RoundtableTests(unittest.TestCase):
 
         # Verify that draw was called due to the resize event
         self.assertEqual(display.draw_call_count, 1)
+
+    def test_display_help_modal_toggle_and_drawing(self):
+        """Test that ? key toggles show_help modal overlay and renders shortcut help."""
+        display = make_test_display(h=30, w=100)
+        self.assertFalse(display.show_help)
+        display.show_help = True
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False), \
+             mock.patch.object(roundtable, "battery_summary", return_value=""):
+            display.draw()
+        rendered = display.s.text()
+        self.assertIn("KEYBOARD SHORTCUTS & HELP", rendered)
+        self.assertIn("Expand / collapse Agent", rendered)
+
+        # ? toggles help on, then getch returns -1 so poll_input exits (nodelay style).
+        display.show_help = False
+        keys = iter([ord("?"), -1])
+        display.s.getch = lambda: next(keys)
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False), \
+             mock.patch.object(roundtable, "battery_summary", return_value=""):
+            display.poll_input()
+        self.assertTrue(display.show_help)
+
+    def test_touch_mode_draws_tappable_help_button(self):
+        """Touch users have no "?" key, so draw() must register a real help hitbox.
+
+        Regression check: handle_mouse() reads self.hitboxes["help"], but nothing populated
+        it -- the overlay was completely unreachable from a touchscreen.
+        """
+        display = make_test_display(h=30, w=100)
+        display.touch_mode = True
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False), \
+             mock.patch.object(roundtable, "battery_summary", return_value=""):
+            display.draw()
+        self.assertIn("help", display.hitboxes)
+        self.assertIn("HELP", display.s.text())
+
+        top, left, bottom, right = display.hitboxes["help"]
+        self.assertFalse(display.show_help)
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False), \
+             mock.patch.object(roundtable, "battery_summary", return_value=""):
+            display.handle_mouse(left, top, roundtable.curses.BUTTON1_CLICKED)
+        self.assertTrue(display.show_help)
+
+    def test_touch_mode_help_modal_shows_gestures_not_keyboard_shortcuts(self):
+        """The help overlay is keyboard-shortcut text by default; touch users need gestures."""
+        display = make_test_display(h=30, w=100)
+        display.touch_mode = True
+        display.show_help = True
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False), \
+             mock.patch.object(roundtable, "battery_summary", return_value=""):
+            display.draw()
+        rendered = display.s.text()
+        self.assertIn("TOUCH CONTROLS & HELP", rendered)
+        self.assertIn("Tap panel", rendered)
+        self.assertNotIn("PgUp/PgDn", rendered)
+
+    def test_dashboard_hint_touch_mode_mentions_help_button(self):
+        wide = roundtable.dashboard_hint(120, touch_mode=True, busy=True)
+        self.assertIn("tap ? for help", wide)
 
 
 if __name__ == "__main__":

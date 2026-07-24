@@ -220,13 +220,56 @@ class LineEditor:
             self.cursor = max(0, self.cursor - 1)
         elif key == curses.KEY_RIGHT:
             self.cursor = min(len(self.buffer), self.cursor + 1)
-        elif key == curses.KEY_HOME:
+        elif key in (curses.KEY_HOME, "\x01"):  # Home / Ctrl-A
             self.cursor = 0
-        elif key == curses.KEY_END:
+        elif key in (curses.KEY_END, "\x05"):  # End / Ctrl-E
             self.cursor = len(self.buffer)
+        elif key == "\x15":  # Ctrl-U: clear text before cursor
+            self.buffer = self.buffer[self.cursor:]
+            self.cursor = 0
+        elif key == "\x0b":  # Ctrl-K: clear text from cursor to end
+            self.buffer = self.buffer[:self.cursor]
+        elif key == "\x17":  # Ctrl-W: delete word backwards
+            while self.cursor > 0 and self.buffer[self.cursor - 1].isspace():
+                self.buffer.pop(self.cursor - 1)
+                self.cursor -= 1
+            while self.cursor > 0 and not self.buffer[self.cursor - 1].isspace():
+                self.buffer.pop(self.cursor - 1)
+                self.cursor -= 1
+        elif key == curses.KEY_UP:
+            text_before = "".join(self.buffer[:self.cursor])
+            lines = text_before.split("\n")
+            if len(lines) > 1:
+                cur_col = len(lines[-1])
+                prev_line_len = len(lines[-2])
+                target_col = min(cur_col, prev_line_len)
+                offset = cur_col + 1 + (prev_line_len - target_col)
+                self.cursor = max(0, self.cursor - offset)
+        elif key == curses.KEY_DOWN:
+            text_before = "".join(self.buffer[:self.cursor])
+            text_after = "".join(self.buffer[self.cursor:])
+            cur_col = len(text_before.split("\n")[-1])
+            lines_after = text_after.split("\n")
+            if len(lines_after) > 1:
+                next_line_len = len(lines_after[1])
+                target_col = min(cur_col, next_line_len)
+                offset = len(lines_after[0]) + 1 + target_col
+                self.cursor = min(len(self.buffer), self.cursor + offset)
         elif key == "\x0e":  # Ctrl-N: newline without submitting.
             self.buffer.insert(self.cursor, "\n")
             self.cursor += 1
+        elif key in ("\t", ord("\t")):
+            for _ in range(2):
+                self.buffer.insert(self.cursor, " ")
+                self.cursor += 1
+        elif isinstance(key, str) and len(key) > 1:
+            for char in key:
+                if char == "\n":
+                    self.buffer.insert(self.cursor, "\n")
+                    self.cursor += 1
+                elif char.isprintable():
+                    self.buffer.insert(self.cursor, char)
+                    self.cursor += 1
         elif isinstance(key, str) and key.isprintable():
             self.buffer.insert(self.cursor, key)
             self.cursor += 1
@@ -270,6 +313,121 @@ def balanced_columns(total_width: int, count: int, gap: int = 2,
         columns.append((x, width))
         x += width + gap
     return columns
+
+
+def format_duration(seconds: float) -> str:
+    """Compact mm:ss (or h:mm:ss) for the dashboard header."""
+    total = max(0, int(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def dashboard_hint(width: int, touch_mode: bool, busy: bool) -> str:
+    """Return actionable footer help that fits ``width`` without an opaque ellipsis."""
+    if touch_mode:
+        choices = [
+            "tap STOP to cancel · tap a panel to expand · swipe to scroll · tap ? for help · "
+            "transcript autosaved",
+            "tap STOP to cancel · tap a panel to expand · swipe to scroll · tap ? for help",
+            "tap STOP to cancel · tap panel to expand · swipe to scroll",
+            "tap STOP · tap panel to expand",
+        ]
+    else:
+        add_prompt = " · i add prompt" if busy else ""
+        choices = [
+            f"ctrl+c cancel{add_prompt} · 1-6/f/0 expand · click panel · c filter · ? help · "
+            "transcript autosaved",
+            f"ctrl+c cancel{add_prompt} · 1-6/f/0 expand · ? help",
+            f"ctrl+c cancel{add_prompt} · 1-6/f/0 expand",
+        ]
+    return next((choice for choice in choices if len(choice) <= width), choices[-1][:width])
+
+
+def expanded_hint(width: int, touch_mode: bool) -> str:
+    """Return width-aware help for a full-screen panel."""
+    if touch_mode:
+        choices = [
+            "tap panel to collapse · swipe to scroll · tap another panel to switch",
+            "tap panel to collapse · swipe to scroll",
+        ]
+    else:
+        choices = [
+            "same key or Esc/q collapses · 1-6/f/0 switch panels · c cycles filter · "
+            "↑/↓/PgUp/PgDn/Home/End or wheel scrolls",
+            "Esc/q collapse · 1-6/f/0 switch · ↑/↓/PgUp/PgDn scroll · c filter",
+            "Esc/q collapse · 1-6/f/0 switch · ↑/↓ scroll",
+        ]
+    return next((choice for choice in choices if len(choice) <= width), choices[-1][:width])
+
+
+def agent_grid(total_width: int, agent_area_height: int, count: int,
+               top: int = 5, gap: int = 2, row_gap: int = 1,
+               min_row_height: int = 8) -> tuple[int, list[tuple[int, int, int, int]]]:
+    """Lay out agent panels as 2×3 when height allows, otherwise one row of ``count``.
+
+    Returns (cols_per_row, [(y, x, height, width), ...]) in agent order. Empty when the
+    area is too small to place anything. Preferring two rows of three roughly doubles
+    each panel's width versus a single six-column row at the same terminal size — the
+    live work feed and response text become readable instead of single-word columns.
+
+    Responsive layout: As terminal gets smaller, panels shrink gracefully while maintaining
+    readability. When very small, prioritizes showing all agents with minimal info over detail.
+    """
+    if count < 1 or agent_area_height < 3 or total_width < 8:
+        return 0, []
+    cols = count
+    if count >= 4 and agent_area_height >= (2 * min_row_height + row_gap):
+        cols = min(3, count)
+    rows = (count + cols - 1) // cols
+    if rows > 1:
+        panel_h = max(3, (agent_area_height - row_gap * (rows - 1)) // rows)
+    else:
+        panel_h = agent_area_height
+    columns = balanced_columns(total_width, cols, gap=gap)
+    if not columns:
+        return 0, []
+    placements: list[tuple[int, int, int, int]] = []
+    for index in range(count):
+        row, col = divmod(index, cols)
+        x, panel_w = columns[col]
+        y = top + row * (panel_h + row_gap)
+        placements.append((y, x, panel_h, panel_w))
+    return cols, placements
+
+
+def adaptive_layout_params(height: int, width: int) -> dict:
+    """Calculate optimal layout parameters based on terminal dimensions."""
+    params = {
+        'gap': 2,
+        'row_gap': 1,
+        'min_row_height': 8,
+        'consensus_height_ratio': 1/3,
+        'monitor_width_ratio': 1/3,
+        'min_consensus_height': 6,
+        'max_consensus_height': 14
+    }
+
+    # Adjust for very small terminals
+    if height < 25:
+        params['min_row_height'] = 6
+        params['consensus_height_ratio'] = 1/4
+        params['min_consensus_height'] = 5
+
+    # Adjust for larger terminals
+    if height > 40:
+        params['min_row_height'] = 10
+        params['max_consensus_height'] = 20
+
+    # Adjust for narrow terminals
+    if width < 100:
+        params['monitor_width_ratio'] = 1/2
+    elif width > 200:
+        params['monitor_width_ratio'] = 1/4
+
+    return params
 
 
 @dataclass(frozen=True)
@@ -1345,6 +1503,7 @@ class Display:
         self.scroll = {"Codex": 0, "Claude": 0, "Antigravity": 0, "Aider": 0, "Grok": 0, "Qwen": 0,
                       "Final": 0, "Console": 0, "Code": 0}
         self.expanded: str | None = None
+        self.show_help = False
         self.console_filter = 0
         self.usage_names = ("Codex", "Claude", "Antigravity", "Aider", "Grok", "Qwen")
         self.turn_times: dict[str, list[float]] = {name: [] for name in self.usage_names}
@@ -1522,6 +1681,11 @@ class Display:
     COLLAPSE_KEYS = (27, ord("q"), ord("Q"))  # Esc, q
     CONSOLE_FILTER_KEYS = (ord("c"), ord("C"))
     INTERRUPT_KEYS = (ord("i"), ord("I"))
+    HELP_KEYS = (ord("?"), ord("h"), ord("H"))
+    SCROLL_KEYS = (
+        curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE,
+        curses.KEY_HOME, curses.KEY_END,
+    )
     PANEL_NAMES = ("Codex", "Claude", "Antigravity", "Aider", "Grok", "Qwen", "Final", "Console")
     SCROLL_NAMES = PANEL_NAMES + ("Code",)
     AGENTS = (
@@ -1542,6 +1706,30 @@ class Display:
         """Switch the console between key-events / all-activity / prompts-only / errors-only."""
         self.console_filter = (getattr(self, "console_filter", 0) + 1) % len(CONSOLE_FILTERS)
         self.draw()
+
+    def scroll_expanded(self, key: int) -> bool:
+        """Scroll the expanded panel from the keyboard, returning whether the key was handled."""
+        name = self.expanded
+        if not name or key not in self.SCROLL_KEYS:
+            return False
+        page = max(3, self.s.getmaxyx()[0] - 10)
+        offset = self.scroll.get(name, 0)
+        if key == curses.KEY_HOME:
+            # draw() clamps this sentinel to the actual oldest visible page.
+            offset = sys.maxsize
+        elif key == curses.KEY_END:
+            offset = 0
+        elif key == curses.KEY_UP:
+            offset += 1
+        elif key == curses.KEY_DOWN:
+            offset = max(0, offset - 1)
+        elif key == curses.KEY_PPAGE:
+            offset += page
+        else:  # KEY_NPAGE
+            offset = max(0, offset - page)
+        self.scroll[name] = offset
+        self.draw()
+        return True
 
     def _filtered_console(self) -> tuple[str, list[tuple[str, str]]]:
         label, kinds = CONSOLE_FILTERS[getattr(self, "console_filter", 0) % len(CONSOLE_FILTERS)]
@@ -1605,8 +1793,18 @@ class Display:
                 # Handle terminal resize by redrawing the UI with new dimensions
                 self.draw()
                 continue
+            if getattr(self, "show_help", False):
+                self.show_help = False
+                self.draw()
+                continue
+            if key in self.HELP_KEYS:
+                self.show_help = not getattr(self, "show_help", False)
+                self.draw()
+                continue
             if key in self.INTERRUPT_KEYS:
                 self.trigger_interrupt()
+                continue
+            if self.scroll_expanded(key):
                 continue
             if key in self.EXPAND_KEYS:
                 self.toggle_expanded(self.EXPAND_KEYS[key])
@@ -1632,11 +1830,15 @@ class Display:
 
     def handle_mouse(self, x: int, y: int, state: int) -> str | None:
         """Translate terminal mouse events, including touchscreen taps and swipes."""
-        # BUTTON1_PRESSED is deliberately excluded: with mouse-position reporting on (needed for
-        # swipe/scroll), most terminals send a press event AND a separate release event for one
-        # physical click. Treating both as a "tap" fired every toggle twice — expand then instantly
-        # collapse again — which looked like clicking only worked while held down.
         tapped = state & (curses.BUTTON1_CLICKED | curses.BUTTON1_RELEASED)
+        if tapped and "help" in self.hitboxes and self._inside(self.hitboxes["help"], y, x):
+            self.show_help = not getattr(self, "show_help", False)
+            self.draw()
+            return None
+        if getattr(self, "show_help", False) and tapped:
+            self.show_help = False
+            self.draw()
+            return None
         if tapped and "stop" in self.hitboxes and self._inside(self.hitboxes["stop"], y, x):
             return "stop"
         if tapped and "interrupt" in self.hitboxes and self._inside(self.hitboxes["interrupt"], y, x):
@@ -1709,9 +1911,8 @@ class Display:
             elif usage_pct >= 80:
                 state_attr = curses.color_pair(5) | curses.A_BOLD  # yellow: approaching it
         ticker = f" {spinner_frame(name, self.frame)}" if is_active else ""
-        header = f" {icon}  {name.upper()}{ticker} "
         inner_width = max(0, width - 4)
-        self._put(y, x + 2, header[:inner_width], color | curses.A_BOLD)
+        # Title is drawn after scroll offset is known so it can include a "· ↑N" cue.
         # Narrow columns drop "● working · 95% used" to a compact form, but keep the
         # usage signal whenever it still fits — that gauge is the reason the state is red/yellow.
         if len(state) > inner_width:
@@ -1730,6 +1931,8 @@ class Display:
         content_top = y + 3
         available = max(1, height - 5)
         usage_width = width - 4
+
+        # Enhanced usage statistics display
         if name in self.usage_names and usage_width >= 24 and height >= 9:
             spark_width = max(4, min(6, (usage_width - 10) // 3))
             time_spark = sparkline(self.turn_times[name], spark_width)
@@ -1744,24 +1947,43 @@ class Display:
                 reads = getattr(self, "work_reads", {}).get(name, 0)
                 writes = getattr(self, "work_writes", {}).get(name, 0)
                 execs = getattr(self, "work_execs", {}).get(name, 0)
-                work_line = f"Reads: {reads}  Execs: {execs}  Writes: {writes}"
-                self._put(y + 4, x + 2, work_line[:usage_width], color | curses.A_DIM)
+                # Full labels need ~28 cols; mid-width 2×3 panels use R/E/W shorthand.
+                if usage_width >= 28:
+                    work_line = f"Reads: {reads}  Execs: {execs}  Writes: {writes}"
+                else:
+                    work_line = f"R:{reads} E:{execs} W:{writes}"
+                work_attr = color | (curses.A_BOLD if reads + execs + writes > 0 else curses.A_DIM)
+                self._put(y + 4, x + 2, work_line[:usage_width], work_attr)
                 content_top = y + 5
                 available = max(1, height - 7)
 
         items = [t for t in self.session.turns if t.speaker == name]
         feed = list(getattr(self, "work_activity", {}).get(name, ()))
+
+        # Show different content based on activity state
         if is_active:
-            content = (f"LIVE WORK · {len(feed)} events\n" + "\n".join(feed) if feed else
-                       "LIVE WORK\n· Waiting for the agent's first progress event…")
+            if feed:
+                # Show live work with activity events
+                content = f"LIVE WORK · {len(feed)} events\n" + "\n".join(feed)
+            else:
+                content = "LIVE WORK\n· Waiting for the agent's first progress event…"
         else:
+            # Show the latest response when not active
             content = items[-1].content if items else "Waiting for the shared task…"
+
         lines = self._wrapped(content, width - 4)
         offset = min(self.scroll[name], max(0, len(lines) - available))
+        self.scroll[name] = offset
+        # Same "· ↑N" title cue as Console / Final / Code Monitor.
+        scroll_cue = f" · ↑{offset}" if offset else ""
+        header = f" {icon}  {name.upper()}{ticker}{scroll_cue} "
+        self._put(y, x + 2, header[:inner_width], color | curses.A_BOLD)
         end = len(lines) - offset if offset else len(lines)
         lines = lines[max(0, end - available):end]
+
         for row, line in enumerate(lines):
             self._put(content_top + row, x + 2, line)
+
         if is_active:
             spinner = spinner_frame(name, self.frame)
             elapsed = max(0.0, time.monotonic() -
@@ -1775,7 +1997,30 @@ class Display:
         elif offset:
             footer = f"↑ {offset} lines from latest"
             self._put(y + height - 2, x + 2, footer[:inner_width], color | curses.A_DIM)
+        elif not is_active and items:
+            response_chars = len(items[-1].content)
+            footer = (f"Response: {response_chars} chars" if inner_width >= 18
+                      else f"{response_chars} ch")
+            self._put(y + height - 2, x + 2, footer[:inner_width], color | curses.A_DIM)
+
         self.hitboxes[name.lower()] = (y, x, y + height - 1, x + width - 1)
+
+    def _draw_agent_roster(self, y: int, w: int) -> None:
+        """One-line at-a-glance status for every agent (● working / ✓ done / ○ wait)."""
+        parts: list[str] = []
+        for name, icon, _subtitle, _color_num in self.AGENTS:
+            is_active = name in self.active and self.busy
+            has_responded = (name in getattr(self, "phase_completed", set())
+                             or any(t.speaker == name for t in self.session.turns))
+            mark = "●" if is_active else ("✓" if has_responded else "○")
+            # Short labels keep six agents visible at the 72-col minimum.
+            short = {"Antigravity": "Anti"}.get(name, name)
+            if w < 90:
+                short = short[:4]
+            parts.append(f"{icon}{short}{mark}")
+        line = "  ".join(parts)
+        self._put(y, 2, textwrap.shorten(line, width=max(10, w - 4), placeholder="…"),
+                  curses.A_DIM)
 
     def draw(self, reserved_bottom: int = 0) -> None:
         """Draw the dashboard above an optional reserved area at the bottom."""
@@ -1794,16 +2039,38 @@ class Display:
         # Product-style header, close to the restrained chrome of coding CLIs.
         self._put(0, 0, " " * (w - 1), curses.A_REVERSE)
         self._put(0, 2, "◈  ROUNDTABLE", curses.A_REVERSE | curses.A_BOLD)
-        phase = f"{len([t for t in self.session.turns if t.speaker != 'Final'])} turns"
-        hardware = "  ".join(item for item in
-                             (("☝ touch" if self.touch_mode else ""), battery_summary()) if item)
-        right = hardware or phase
+        turns = len([t for t in self.session.turns if t.speaker != "Final"])
+        # Always keep turn count + elapsed visible; battery/touch append when present
+        # rather than replacing the session clock (the old `hardware or phase` form
+        # hid turn progress entirely whenever a battery reading existed).
+        right_bits = [f"{turns} turns",
+                      format_duration(time.monotonic() - self.started)]
+        if self.touch_mode:
+            right_bits.append("☝ touch")
+        battery = battery_summary()
+        if battery:
+            right_bits.append(battery)
+        right = " · ".join(right_bits)
+        # Leave room for the brand mark on the left; shorten rather than overwrite it.
+        max_right = max(8, w - 20)
+        if len(right) > max_right:
+            right = textwrap.shorten(right, width=max_right, placeholder="…")
         self._put(0, w - len(right) - 3, right, curses.A_REVERSE | curses.A_DIM)
+        left_edge = w - len(right) - 3
         if self.busy and self.touch_mode:
             label = "  ■ STOP  "
             stop_x = max(20, w - len(right) - len(label) - 6)
             self._put(0, stop_x, label, curses.color_pair(4) | curses.A_REVERSE | curses.A_BOLD)
             self.hitboxes["stop"] = (0, stop_x, 0, stop_x + len(label) - 1)
+            left_edge = stop_x
+        if self.touch_mode:
+            # Touch users have no "?" key to reach for, so the help overlay needs a real
+            # tappable entry point -- without this button, self.hitboxes["help"] (read in
+            # handle_mouse) was never populated and the overlay was unreachable on touch.
+            help_label = "  ? HELP  "
+            help_x = max(2, left_edge - len(help_label) - 2)
+            self._put(0, help_x, help_label, curses.color_pair(1) | curses.A_REVERSE | curses.A_BOLD)
+            self.hitboxes["help"] = (0, help_x, 0, help_x + len(help_label) - 1)
 
         self._put(2, 2, "›", curses.color_pair(3) | curses.A_BOLD)
         obj = textwrap.shorten(self.session.objective, width=max(20, w - 8), placeholder="…")
@@ -1821,36 +2088,51 @@ class Display:
         # Always shorten: a long workspace path used to hard-clip mid-character via addnstr.
         status_line = textwrap.shorten(status_line, width=status_budget, placeholder="…")
         self._put(3, 4, status_line, curses.A_DIM)
+        self._draw_agent_roster(4, w)
 
         if self.expanded:
             self._draw_expanded(content_height, w)
             self.s.refresh()
             return
 
+        # Use adaptive layout parameters based on terminal size
+        layout_params = adaptive_layout_params(h, w)
         top = 5
-        consensus_height = max(6, min(14, content_height // 3))
-        agent_height = content_height - top - consensus_height - 4
-        gap = 2
+        consensus_height = max(
+            layout_params['min_consensus_height'],
+            min(layout_params['max_consensus_height'],
+                int(content_height * layout_params['consensus_height_ratio']))
+        )
+        agent_area = content_height - top - consensus_height - 4
+        gap = layout_params['gap']
         agents = [(name, icon, subtitle, curses.color_pair(color_num))
                  for name, icon, subtitle, color_num in self.AGENTS]
-        columns = balanced_columns(w, len(agents), gap=gap)
-        for (x, panel_w), (name, icon, subtitle, color) in zip(columns, agents):
-            self._agent_panel(top, x, agent_height, panel_w,
-                              name, icon, subtitle, color)
+        _cols, placements = agent_grid(w, agent_area, len(agents), top=top, gap=gap,
+                                      min_row_height=layout_params['min_row_height'],
+                                      row_gap=layout_params['row_gap'])
+        for (y, x, panel_h, panel_w), (name, icon, subtitle, color) in zip(placements, agents):
+            self._agent_panel(y, x, panel_h, panel_w, name, icon, subtitle, color)
 
-        cy = top + agent_height + 1
-        monitor_width = max(25, min(38, w // 3))
+        cy = top + agent_area + 1
+        monitor_width = max(25, min(38, int(w * layout_params['monitor_width_ratio'])))
         answer_width = w - monitor_width - 4
         self._box(cy, 1, consensus_height, answer_width, curses.color_pair(3))
 
-        self._put(cy, 3, " ◆  TASK OUTCOME · COMPLETED / FAILED "[:max(0, answer_width - 4)],
-                  curses.color_pair(3) | curses.A_BOLD)
         final_text = (self.session.final or
                       "Completed and failed work will be summarized here after the task.")
         all_final_lines = self._wrapped(final_text, answer_width - 4)
         available_final = consensus_height - 3
         final_rows = available_final
         final_offset = min(self.scroll["Final"], max(0, len(all_final_lines) - final_rows))
+        self.scroll["Final"] = final_offset
+        # Same "· ↑N" scroll cue as CODE MONITOR's title -- compact Final used to give no sign
+        # at all that scroll["Final"] had moved you away from the live tail.
+        final_scroll = f" · ↑{final_offset}" if final_offset else ""
+        title_width = max(0, answer_width - 4)
+        final_title = f" ◆  TASK OUTCOME · COMPLETED / FAILED{final_scroll} "
+        if len(final_title) > title_width:
+            final_title = f" ◆ OUTCOME{final_scroll} "
+        self._put(cy, 3, final_title[:title_width], curses.color_pair(3) | curses.A_BOLD)
         final_end = len(all_final_lines) - final_offset if final_offset else len(all_final_lines)
         final_lines = all_final_lines[max(0, final_end - final_rows):final_end]
         for row, line in enumerate(final_lines):
@@ -1900,12 +2182,22 @@ class Display:
             console_y = cy + monitor_height + 1
             self._box(console_y, mx, console_height, monitor_width, curses.color_pair(1))
             label, filtered = self._filtered_console()
+            available_console = max(1, console_height - 3)
+            # Honor scroll["Console"] the same way the expanded console and Final panel do.
+            # Wheel/swipe over this box already mutates the offset; previously the compact
+            # panel always showed the latest window, so scrolling looked broken.
+            console_offset = min(
+                self.scroll.get("Console", 0), max(0, len(filtered) - available_console))
+            self.scroll["Console"] = console_offset
+            # Same "· ↑N" scroll cue as CODE MONITOR's title -- compact Console used to give no
+            # sign that scroll["Console"] had moved you away from the live tail.
+            console_scroll = f" · ↑{console_offset}" if console_offset else ""
             # Same panel-bound title budget as CODE MONITOR: long filter names used to
             # overwrite the right border at the 72-column minimum (monitor_width ≈ 25).
             title_width = max(0, monitor_width - 4)
-            console_title = f" »  CONSOLE · {label} "
+            console_title = f" »  CONSOLE · {label}{console_scroll} "
             if len(console_title) > title_width:
-                console_title = f" » {label} "
+                console_title = f" » {label}{console_scroll} "
             self._put(console_y, mx + 2, console_title[:title_width],
                       curses.color_pair(1) | curses.A_BOLD)
             counts = Counter(kind for kind, _ in self.console)
@@ -1913,12 +2205,6 @@ class Display:
                                ("error", "phase", "turn", "prompt", "tick") if counts.get(k))
             if summary:
                 self._put(console_y + 1, mx + 3, summary[:max(0, monitor_width - 5)], curses.A_DIM)
-            available_console = max(1, console_height - 3)
-            # Honor scroll["Console"] the same way the expanded console and Final panel do.
-            # Wheel/swipe over this box already mutates the offset; previously the compact
-            # panel always showed the latest window, so scrolling looked broken.
-            console_offset = min(
-                self.scroll.get("Console", 0), max(0, len(filtered) - available_console))
             console_end = (len(filtered) - console_offset if console_offset
                            else len(filtered))
             entries = filtered[max(0, console_end - available_console):console_end]
@@ -1930,14 +2216,63 @@ class Display:
             self.hitboxes["console"] = (console_y, mx, console_y + console_height - 1,
                                         mx + monitor_width - 1)
 
-        controls = ("tap STOP to cancel   ·   tap a panel to expand" if self.touch_mode else
-                    "ctrl+c cancel   ·   1-6/f/0 expand   ·   c cycles console filter   ·   "
-                    "click a panel to expand")
-        footer = self.error or f"{controls}   ·   transcript saved automatically"
+        footer = self.error or dashboard_hint(w - 5, self.touch_mode, self.busy)
         attr = curses.color_pair(4) if self.error and curses.has_colors() else curses.A_DIM
         self._put(content_height - 1, 2,
                   textwrap.shorten(footer, width=max(10, w - 5), placeholder="…"), attr)
+        if getattr(self, "show_help", False):
+            self._draw_help_modal()
         self.s.refresh()
+
+    def _draw_help_modal(self) -> None:
+        """Draw a centered modal overlay window showing keyboard shortcuts and GUI controls."""
+        h, w = self.s.getmaxyx()
+        modal_w = min(68, max(44, w - 6))
+        modal_h = min(18, max(12, h - 4))
+        top = (h - modal_h) // 2
+        left = (w - modal_w) // 2
+
+        self._box(top, left, modal_h, modal_w, curses.color_pair(1))
+        if self.touch_mode:
+            title = " ◈  ROUNDTABLE — TOUCH CONTROLS & HELP "
+        else:
+            title = " ◈  ROUNDTABLE — KEYBOARD SHORTCUTS & HELP "
+        self._put(top, left + 2, title[:max(1, modal_w - 4)], curses.color_pair(1) | curses.A_BOLD)
+
+        if self.touch_mode:
+            # Keyboard shortcuts don't help a touch-only user; show the equivalent gestures.
+            shortcuts = [
+                ("Tap panel", "Expand / collapse that Agent, Final, or Console panel"),
+                ("Swipe panel", "Scroll expanded panel or Console log"),
+                ("Tap STOP", "Cancel the running task"),
+                ("Tap + ADD PROMPT", "Interrupt to queue a follow-up prompt"),
+                ("Tap ? HELP", "Toggle this Help overlay"),
+                ("Tap anywhere", "Close this Help overlay"),
+            ]
+        else:
+            shortcuts = [
+                ("1 - 6", "Expand / collapse Agent 1..6 panel full-screen"),
+                ("f / F", "Expand / collapse Final Answer & Outcome panel"),
+                ("0",     "Expand / collapse Console log panel"),
+                ("c / C", "Cycle Console filter (Key events / All / Prompts / Errors)"),
+                ("i / I", "Interrupt execution to queue a follow-up prompt"),
+                ("↑ / ↓", "Scroll expanded panel or Console log up / down"),
+                ("PgUp/PgDn", "Scroll expanded panel by page"),
+                ("Home/End", "Jump to top / bottom of expanded panel"),
+                ("Esc / q", "Collapse expanded panel or close Help overlay"),
+                ("? / h", "Toggle this Help overlay modal"),
+            ]
+
+        available_rows = modal_h - 4
+        label_width = 18 if self.touch_mode else 11
+        desc_x = left + 3 + label_width + 1
+        for i, (key_label, desc) in enumerate(shortcuts[:available_rows]):
+            y = top + 2 + i
+            self._put(y, left + 3, key_label.ljust(label_width), curses.color_pair(3) | curses.A_BOLD)
+            self._put(y, desc_x, textwrap.shorten(desc, width=max(10, modal_w - label_width - 7), placeholder="…"), curses.A_DIM)
+
+        footer = " Press any key or tap to close "
+        self._put(top + modal_h - 1, left + max(1, (modal_w - len(footer)) // 2), footer, curses.A_REVERSE | curses.A_DIM)
 
     def _draw_expanded(self, content_height: int, w: int) -> None:
         """Show one panel full-size with its complete content, in place of the normal dashboard."""
@@ -1952,10 +2287,12 @@ class Display:
             color = curses.color_pair(1)
             self._box(top, 1, height, w - 2, color)
             label, filtered = self._filtered_console()
-            exp_title = f" »  CONSOLE (expanded) · {label} "
-            self._put(top, 3, exp_title[:max(0, w - 6)], color | curses.A_BOLD)
             available = max(1, height - 3)
             offset = min(self.scroll.get("Console", 0), max(0, len(filtered) - available))
+            self.scroll["Console"] = offset
+            scroll_label = f" · ↑{offset}" if offset else ""
+            exp_title = f" »  CONSOLE (expanded) · {label}{scroll_label} "
+            self._put(top, 3, exp_title[:max(0, w - 6)], color | curses.A_BOLD)
             end = len(filtered) - offset if offset else len(filtered)
             for row, (kind, text) in enumerate(filtered[max(0, end - available):end]):
                 glyph = CONSOLE_KIND_GLYPH.get(kind, "·")
@@ -1965,21 +2302,21 @@ class Display:
         else:  # "Final"
             color = curses.color_pair(3)
             self._box(top, 1, height, w - 2, color)
-            self._put(top, 3, " ◆  TASK OUTCOME (expanded) ", color | curses.A_BOLD)
             content = (self.session.final or
                        "Completed and failed work will be summarized here after the task.")
             lines = self._wrapped(content, w - 6)
             available = max(1, height - 3)
             offset = min(self.scroll["Final"], max(0, len(lines) - available))
+            self.scroll["Final"] = offset
+            scroll_label = f" · ↑{offset}" if offset else ""
+            title = f" ◆  TASK OUTCOME (expanded){scroll_label} "
+            self._put(top, 3, title[:max(0, w - 6)], color | curses.A_BOLD)
             end = len(lines) - offset if offset else len(lines)
             for row, line in enumerate(lines[max(0, end - available):end]):
                 self._put(top + 2 + row, 3, line)
             self.hitboxes["final"] = (top, 1, top + height - 1, w - 2)
-        hint = ("tap panel to collapse" if self.touch_mode else
-               "same key or Esc/q collapses   ·   1-6/f/0 switch panels   ·   c cycles filter   ·   "
-               "wheel/click scrolls")
-        self._put(top + height, 2, textwrap.shorten(hint, width=max(10, w - 5), placeholder="…"),
-                 curses.A_DIM)
+        hint = expanded_hint(w - 5, self.touch_mode)
+        self._put(top + height, 2, hint, curses.A_DIM)
 
     def draw_followup(self, editor: LineEditor) -> None:
         """Draw a multiline editor while retaining the completed answer above."""
@@ -2034,23 +2371,57 @@ OPTION_TOGGLES: tuple[tuple[str, str], ...] = (
     ("debug", "Debug mode — enable verbose subprocess and diagnostic trace logging"),
 )
 
+# Trust/safety posture flags: highlighted more strongly when enabled on the options screen.
+DANGEROUS_OPTIONS = frozenset({"elevated"})
 
-def apply_option_key(values: dict[str, bool], key: object) -> tuple[dict[str, bool], bool]:
-    """Apply one keypress from the options screen. Returns (possibly updated values, done)."""
+
+def apply_option_key(values: dict[str, bool], key: object, cursor: int = 0) -> tuple[dict[str, bool], int, bool]:
+    """Apply one keypress from the options screen. Returns (possibly updated values, new_cursor, done)."""
     if key in ("\n", "\r", "\x1b", "q", "Q") or key in (curses.KEY_ENTER, 10, 13, 27):
-        return values, True
+        return values, cursor, True
+    if key in (curses.KEY_UP, "k", "K"):
+        return values, (cursor - 1) % len(OPTION_TOGGLES), False
+    if key in (curses.KEY_DOWN, "j", "J"):
+        return values, (cursor + 1) % len(OPTION_TOGGLES), False
+    if key in (" ", "\t"):
+        if 0 <= cursor < len(OPTION_TOGGLES):
+            name = OPTION_TOGGLES[cursor][0]
+            values = {**values, name: not values[name]}
+        return values, cursor, False
     if isinstance(key, str) and key.isdigit():
         index = int(key) - 1
         if 0 <= index < len(OPTION_TOGGLES):
             name = OPTION_TOGGLES[index][0]
             values = {**values, name: not values[name]}
-    return values, False
+            return values, index, False
+    return values, cursor, False
+
+
+def options_summary(values: dict[str, bool]) -> str:
+    """Short enabled-count label for the options header (``2 on`` / ``none on``)."""
+    enabled = sum(1 for name, _ in OPTION_TOGGLES if values.get(name))
+    return "none on" if enabled == 0 else f"{enabled} on"
+
+
+def objective_editor_stats(text: str) -> str:
+    """Compact ``N chars · M lines`` readout for the objective composer."""
+    chars = len(text)
+    if chars == 0:
+        return "empty"
+    lines = text.count("\n") + 1
+    unit = "char" if chars == 1 else "chars"
+    line_unit = "line" if lines == 1 else "lines"
+    return f"{chars} {unit} · {lines} {line_unit}"
 
 
 def read_options_ui(stdscr: curses.window, defaults: dict[str, bool]) -> dict[str, bool]:
     """A quick numbered-toggle screen for opt-in flags, shown right after startup so they can be
     switched on or off without remembering CLI flag names. CLI flags still set the starting values
-    shown here, and Enter/Esc/q all just continue with whatever is currently checked."""
+    shown here, and Enter/Esc/q all just continue with whatever is currently checked.
+
+    Supports ↑/↓ (or j/k) focus, Space/Tab to toggle the focused row, digit keys, and mouse clicks.
+    Enabled rows use checkbox glyphs; elevated (dangerous) is drawn bold/red when on.
+    """
     suppress_focus_reporting()
     try:
         curses.curs_set(0)
@@ -2061,21 +2432,58 @@ def read_options_ui(stdscr: curses.window, defaults: dict[str, bool]) -> dict[st
         curses.mouseinterval(0)
     except curses.error:
         pass
+    colors_ready = False
+    try:
+        if curses.has_colors():
+            curses.start_color()
+            curses.use_default_colors()
+            curses.init_pair(3, curses.COLOR_GREEN, -1)
+            curses.init_pair(4, curses.COLOR_RED, -1)
+            colors_ready = True
+    except curses.error:
+        colors_ready = False
     values = dict(defaults)
+    cursor = 0
     while True:
         stdscr.erase()
         h, w = stdscr.getmaxyx()
-        stdscr.addnstr(0, 0, " ◈  ROUNDTABLE — OPTIONS ".ljust(max(1, w - 1)), max(1, w - 1),
+        brand = " ◈  ROUNDTABLE — OPTIONS "
+        stdscr.addnstr(0, 0, brand.ljust(max(1, w - 1)), max(1, w - 1),
                       curses.A_REVERSE | curses.A_BOLD)
-        if h >= 5 + len(OPTION_TOGGLES) and w >= 40:
-            stdscr.addstr(2, 3, "Press a number to toggle, Enter to continue:", curses.A_BOLD)
+        summary = options_summary(values)
+        if w > len(brand) + len(summary) + 4:
+            stdscr.addnstr(0, w - len(summary) - 3, summary, len(summary),
+                           curses.A_REVERSE | curses.A_DIM)
+        min_h = 6 + len(OPTION_TOGGLES)
+        if h >= min_h and w >= 40:
+            stdscr.addstr(2, 3, "Opt-in flags for this run (CLI flags pre-check matching rows):",
+                          curses.A_BOLD)
+            stdscr.addnstr(3, 3, "↑/↓ or j/k move · Space/1-8 toggle · Enter continue",
+                           w - 6, curses.A_DIM)
             for i, (name, label) in enumerate(OPTION_TOGGLES):
-                mark = "x" if values[name] else " "
-                stdscr.addnstr(4 + i, 3, f"[{mark}] {i + 1}  {label}", w - 6)
-            stdscr.addnstr(5 + len(OPTION_TOGGLES), 3, "Enter / Esc / q continue", w - 6,
-                          curses.A_DIM)
+                on = values[name]
+                mark = "☑" if on else "☐"
+                line_str = f" {mark}  {i + 1}  {label}"
+                attr = 0
+                if i == cursor:
+                    attr |= curses.A_REVERSE | curses.A_BOLD
+                elif on:
+                    attr |= curses.A_BOLD
+                if on and colors_ready:
+                    try:
+                        attr |= curses.color_pair(4 if name in DANGEROUS_OPTIONS else 3)
+                    except curses.error:
+                        pass
+                # Pad the focused row so reverse video fills the option band.
+                padded = line_str.ljust(max(0, w - 5))[: max(0, w - 5)]
+                stdscr.addnstr(4 + i, 2, padded, w - 4, attr)
+            cont_y = 5 + len(OPTION_TOGGLES)
+            cont = "  Continue  "
+            stdscr.addnstr(cont_y, 3, cont, len(cont), curses.A_REVERSE | curses.A_BOLD)
+            stdscr.addnstr(cont_y, 3 + len(cont) + 1, "Enter / Esc / q",
+                           max(1, w - 6 - len(cont)), curses.A_DIM)
         else:
-            stdscr.addnstr(2, 1, "Resize terminal to at least 40 columns", max(1, w - 2))
+            stdscr.addnstr(2, 1, f"Resize terminal to at least 40 × {min_h}", max(1, w - 2))
         stdscr.refresh()
         try:
             key = stdscr.get_wch()
@@ -2090,13 +2498,13 @@ def read_options_ui(stdscr: curses.window, defaults: dict[str, bool]) -> dict[st
                 continue
             if state & (curses.BUTTON1_CLICKED | curses.BUTTON1_RELEASED):
                 if 4 <= y < 4 + len(OPTION_TOGGLES):
-                    idx = y - 4
-                    name = OPTION_TOGGLES[idx][0]
+                    cursor = y - 4
+                    name = OPTION_TOGGLES[cursor][0]
                     values[name] = not values[name]
                 elif y == 5 + len(OPTION_TOGGLES):
                     return values
             continue
-        values, done = apply_option_key(values, key)
+        values, cursor, done = apply_option_key(values, key, cursor)
         if done:
             return values
 
@@ -2124,8 +2532,12 @@ def read_objective_ui(stdscr: curses.window, workspace: Path, touch_mode: bool =
     while True:
         stdscr.erase()
         h, w = stdscr.getmaxyx()
-        stdscr.addnstr(0, 0, " ◈  ROUNDTABLE ".ljust(max(1, w - 1)), max(1, w - 1),
+        brand = " ◈  ROUNDTABLE — NEW TASK "
+        stdscr.addnstr(0, 0, brand.ljust(max(1, w - 1)), max(1, w - 1),
                       curses.A_REVERSE | curses.A_BOLD)
+        ws = textwrap.shorten(str(workspace), width=max(12, w - len(brand) - 4), placeholder="…")
+        if w > len(brand) + len(ws) + 4:
+            stdscr.addnstr(0, w - len(ws) - 3, ws, len(ws), curses.A_REVERSE | curses.A_DIM)
         buttons: dict[str, tuple[int, int, int, int]] = {}
         if h >= (16 if touch_mode else 14) and w >= 50:
             stdscr.addstr(2, 3, "What should the agents solve together?", curses.A_BOLD)
@@ -2136,12 +2548,18 @@ def read_objective_ui(stdscr: curses.window, workspace: Path, touch_mode: bool =
                 stdscr.addstr(row, w - 4, "│", curses.color_pair(1))
             stdscr.addstr(box_y + box_height - 1, 3,
                           "╰" + "─" * (box_width - 2) + "╯", curses.color_pair(1))
+            # Title on the top border matches dashboard panel chrome (Console / Outcome).
+            box_title = " ›  OBJECTIVE "
+            stdscr.addnstr(box_y, 5, box_title[: max(0, box_width - 4)],
+                           max(0, box_width - 4), curses.color_pair(1) | curses.A_BOLD)
             lines, cursor_y, cursor_x = editor_layout(editor, w - 12, box_height - 2)
             for row, line in enumerate(lines):
                 stdscr.addnstr(box_y + 1 + row, 6, line, w - 12)
             if not editor.text:
                 stdscr.addnstr(box_y + 1, 6, "Describe a bug, feature, or question…", w - 12,
                               curses.A_DIM)
+            stats = objective_editor_stats(editor.text)
+            stdscr.addnstr(box_y + box_height, 4, stats, w - 8, curses.A_DIM)
             if touch_mode:
                 bx = 3
                 for action, label, attr in [
@@ -2155,9 +2573,14 @@ def read_objective_ui(stdscr: curses.window, workspace: Path, touch_mode: bool =
                     bx += len(label) + 2
                 stdscr.addnstr(14, 3, f"☝ Touch mode · {workspace}", w - 6, curses.A_DIM)
             else:
-                stdscr.addnstr(12, 3,
-                              f"↳ {workspace}  ·  Enter start  ·  Ctrl+N new line  ·  Esc exit",
-                              w - 6, curses.A_DIM)
+                help_bits = (
+                    "Enter start · Ctrl+N newline · ↑/↓ lines · "
+                    "Ctrl+A/E/U/K/W edit · Esc exit"
+                )
+                stdscr.addnstr(12, 3, textwrap.shorten(help_bits, width=max(20, w - 6),
+                                                       placeholder="…"), w - 6, curses.A_DIM)
+                stdscr.addnstr(13, 3, textwrap.shorten(f"↳ {workspace}", width=max(20, w - 6),
+                                                       placeholder="…"), w - 6, curses.A_DIM)
             stdscr.move(box_y + 1 + cursor_y, min(w - 6, 6 + cursor_x))
         else:
             stdscr.addnstr(2, 1, "Resize terminal to at least 50 × 14", max(1, w - 2))
