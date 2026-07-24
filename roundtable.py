@@ -52,6 +52,10 @@ Append a new entry instead of editing or deleting an existing one:
 Use the same `DIBS:` and `TASK STATUS:` conventions as the main transcript when relevant. Keep
 entries dependency-free (standard library only) and verify changes with
 `python3 -m unittest test_roundtable` before marking anything complete.
+
+Never invent exact token usage, provider limits, completion percentages, or completion times.
+Report a metric only when a CLI or Roundtable measured it; otherwise say `unknown`. Treat old board
+entries and their test counts as historical notes that may be stale.
 """
 
 AGENT_PROMPT_HINT = (
@@ -247,12 +251,18 @@ class WorkspaceMonitor:
 
     def _snapshot(self) -> dict[str, tuple[int, int]]:
         # Keep each DirEntry through classification and metadata collection instead of discarding
-        # it in os.walk and looking the path up again. This can avoid a redundant stat on filesystems
-        # where classification needs one, and avoids a Path allocation in this frequently-run scan.
+        # it in os.walk and looking the path up again. Using string paths and early name filtering
+        # avoids Path object allocations and redundant stat calls in this frequently-run scan.
         files: dict[str, tuple[int, int]] = {}
-        stack = [self.root]
+        root_str = str(self.root)
+        root_prefix = root_str if root_str.endswith(os.sep) else root_str + os.sep
+        prefix_len = len(root_prefix)
+        stack = [root_str]
         while stack:
-            for entry in self._scan_dir(stack.pop()):
+            dir_path = stack.pop()
+            for entry in self._scan_dir(dir_path):
+                if entry.name in self.SKIP_DIRS:
+                    continue
                 try:
                     is_dir = entry.is_dir()
                     is_link = entry.is_symlink()
@@ -261,12 +271,16 @@ class WorkspaceMonitor:
                 if is_dir:
                     # Matches os.walk's default followlinks=False: a symlinked directory is
                     # neither recursed into nor stat'd as a file.
-                    if entry.name not in self.SKIP_DIRS and not is_link:
-                        stack.append(Path(entry.path))
+                    if not is_link:
+                        stack.append(entry.path)
                     continue
                 try:
                     stat = entry.stat()
-                    relative = str(Path(entry.path).relative_to(self.root))
+                    path_str = entry.path
+                    if path_str.startswith(root_prefix):
+                        relative = path_str[prefix_len:]
+                    else:
+                        relative = str(Path(path_str).relative_to(self.root))
                 except (OSError, ValueError):
                     continue
                 files[relative] = (stat.st_mtime_ns, stat.st_size)
@@ -275,7 +289,7 @@ class WorkspaceMonitor:
         return files
 
     @staticmethod
-    def _scan_dir(path: Path) -> list[os.DirEntry]:
+    def _scan_dir(path: str | Path) -> list[os.DirEntry]:
         try:
             with os.scandir(path) as it:
                 return list(it)
@@ -446,10 +460,14 @@ def transcript(turns: list[Turn], limit: int = 16_000) -> str:
     return "[Earlier content clipped]\n" + rendered if clipped else rendered
 
 
-# Printed by Qwen Code to stderr on every call once --safe-mode is passed (see Agent.command()).
-# Agent.run() merges stderr into the captured answer for all agents, so this fixed banner line is
-# stripped back out rather than leaking into every Qwen turn's content.
+# Printed by Qwen Code to stderr when --safe-mode or elevated --yolo mode is used (see
+# Agent.command()). Agent.run() merges stderr into the captured answer for all agents, so these
+# fixed warning lines are stripped rather than leaking into ticks and every Qwen turn's content.
 QWEN_SAFE_MODE_BANNER = re.compile(r"^⚠ SAFE MODE.*$\n?", re.MULTILINE)
+QWEN_YOLO_WARNING = re.compile(
+    r"^Warning: running headless with --yolo / approval-mode=yolo and no sandbox\..*$\n?",
+    re.MULTILINE,
+)
 
 
 class Agent:
@@ -460,16 +478,36 @@ class Agent:
         self.name = name
         self.workspace = workspace
         self.model = model
+        # Explicit user choices override phase hints. "auto" leaves ordinary working turns at the
+        # CLI default, while callers can cheaply hint low effort for preflight and medium effort
+        # for final synthesis without changing this class's public run() signature.
+        self.reasoning_effort = "auto"
+        self.suggested_effort: str | None = None
         self.elevated = elevated
         self.debug = debug
         self.cancel_event: threading.Event | None = None
 
+    def effective_effort(self) -> str | None:
+        """Return the effort flag this CLI should receive, if it has a portable equivalent."""
+        if self.name == "Qwen":
+            return None
+        if self.reasoning_effort != "auto":
+            return self.reasoning_effort
+        # Aider exposes the option, but whether the selected provider/model accepts it varies.
+        # In particular, do not inject it into Roundtable's default Codestral configuration.
+        if self.name == "Aider":
+            return None
+        return self.suggested_effort
+
     def command(self, prompt: str, output_file: Path | None = None, no_edit: bool = False) -> list[str]:
+        effort = self.effective_effort()
         if self.name == "Codex":
             cmd = ["codex", "exec", "--skip-git-repo-check", "--color", "never", "--ephemeral",
                    "-C", str(self.workspace)]
             cmd += (["--dangerously-bypass-approvals-and-sandbox"] if self.elevated
                     else ["--sandbox", "workspace-write"])
+            if effort:
+                cmd += ["-c", f'model_reasoning_effort="{effort}"']
             if self.model:
                 cmd += ["--model", self.model]
             if output_file:
@@ -479,12 +517,16 @@ class Agent:
             cmd = ["claude", "--print", "--no-session-persistence", "--output-format", "text"]
             cmd += (["--dangerously-skip-permissions"] if self.elevated
                     else ["--permission-mode", "acceptEdits"])
+            if effort:
+                cmd += ["--effort", effort]
             if self.model:
                 cmd += ["--model", self.model]
             return cmd + [prompt]
         if self.name == "Antigravity":
             cmd = ["agy", "--print", prompt, "--mode", "accept-edits"]
             cmd += ["--dangerously-skip-permissions"] if self.elevated else ["--sandbox"]
+            if effort:
+                cmd += ["--effort", effort]
             if self.model:
                 cmd += ["--model", self.model]
             return cmd
@@ -512,6 +554,8 @@ class Agent:
                 # to touch a file at all. --edit-format ask is Aider's own no-edit Q&A mode, which
                 # skips edit-parsing entirely and can't hit this failure mode.
                 cmd += ["--edit-format", "ask"]
+            if effort:
+                cmd += ["--reasoning-effort", effort]
             if self.model:
                 cmd += ["--model", self.model]
             return cmd
@@ -522,6 +566,8 @@ class Agent:
             cmd = ["grok", "-p", prompt, "--output-format", "plain"]
             cmd += (["--permission-mode", "bypassPermissions"] if self.elevated
                     else ["--permission-mode", "acceptEdits", "--sandbox", "workspace"])
+            if effort:
+                cmd += ["--reasoning-effort", effort]
             if self.model:
                 cmd += ["-m", self.model]
             return cmd
@@ -576,6 +622,10 @@ class Agent:
                 try:
                     assert proc.stdout is not None
                     for line in proc.stdout:
+                        if (self.name == "Qwen"
+                                and (QWEN_SAFE_MODE_BANNER.search(line)
+                                     or QWEN_YOLO_WARNING.search(line))):
+                            continue
                         captured.append(line)
                         events.put(line.rstrip())
                 except Exception:
@@ -636,7 +686,7 @@ class Agent:
                     break
             raw = "".join(captured).strip()
             if self.name == "Qwen":
-                raw = QWEN_SAFE_MODE_BANNER.sub("", raw).strip()
+                raw = QWEN_YOLO_WARNING.sub("", QWEN_SAFE_MODE_BANNER.sub("", raw)).strip()
             if output_file and output_file.exists():
                 answer = output_file.read_text(encoding="utf-8", errors="replace").strip()
             else:
@@ -677,8 +727,11 @@ TASK_STATUS_HINT = (
 
 def signals_task_complete(text: str) -> bool:
     """Whether an agent's response ends with a TASK STATUS: complete marker."""
-    lines = text.rstrip().splitlines()
-    return bool(lines and TASK_STATUS_COMPLETE.fullmatch(lines[-1].strip()))
+    stripped = text.rstrip()
+    if not stripped:
+        return False
+    last_line = stripped.rsplit("\n", 1)[-1].strip()
+    return bool(TASK_STATUS_COMPLETE.fullmatch(last_line))
 
 
 DIBS_PATTERN = re.compile(r"^\s*dibs:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
@@ -705,9 +758,29 @@ def extract_dibs(turns: list[Turn]) -> dict[str, str]:
     return claims
 
 
+@dataclass(frozen=True)
+class PromptContext:
+    """Phase-stable prompt material that parallel agents can safely share."""
+
+    history: str
+    role_hints: dict[str, str]
+    dibs_claims: dict[str, str]
+
+
+def prepare_prompt_context(objective: str, turns: list[Turn]) -> PromptContext:
+    """Render and inspect a transcript once for prompts built from the same session state."""
+    return PromptContext(
+        transcript(turns) or "(No contributions yet.)",
+        role_hints_for(objective),
+        extract_dibs(turns),
+    )
+
+
 def prompt_for(objective: str, turns: list[Turn], phase: str, speaker: str,
-              sequential: bool = False, scope: str = "", task_status_check: bool = False) -> str:
-    history = transcript(turns) or "(No contributions yet.)"
+              sequential: bool = False, scope: str = "", task_status_check: bool = False,
+              context: PromptContext | None = None) -> str:
+    context = context or prepare_prompt_context(objective, turns)
+    history = context.history
     collab_note = (
         "You are working in a live sequential relay: the shared transcript above already includes "
         "this round's most recent contribution from another agent, if any. Build directly on it, "
@@ -725,8 +798,8 @@ def prompt_for(objective: str, turns: list[Turn], phase: str, speaker: str,
     else:
         task = (collab_note + "Review the shared transcript. Correct errors, resolve disagreements, and "
                 "advance a stronger combined solution. State any remaining disagreement explicitly.")
-    role_hint = f" {role_hints_for(objective)[speaker]}" if speaker in AGENT_NAMES else ""
-    dibs_claims = {name: claim for name, claim in extract_dibs(turns).items() if name != speaker}
+    role_hint = f" {context.role_hints[speaker]}" if speaker in AGENT_NAMES else ""
+    dibs_claims = {name: claim for name, claim in context.dibs_claims.items() if name != speaker}
     dibs_note = ""
     if dibs_claims:
         listing = "; ".join(f"{name} has dibs on {claim}" for name, claim in dibs_claims.items())
@@ -741,7 +814,8 @@ def prompt_for(objective: str, turns: list[Turn], phase: str, speaker: str,
            f"{status_hint}")
 
 
-def final_prompt(objective: str, turns: list[Turn], followup: bool = False) -> str:
+def final_prompt(objective: str, turns: list[Turn], followup: bool = False,
+                 history: str | None = None) -> str:
     focus = ("\nFocus on the user's latest follow-up request (the most recent 'User — follow-up' turn), "
              "consistent with the prior final answer where it still applies.\n" if followup else "")
     return f"""{SYSTEM_BRIEF}
@@ -750,7 +824,7 @@ USER OBJECTIVE:
 {objective}
 
 COMPLETE ROUNDTABLE TRANSCRIPT:
-{transcript(turns)}
+{transcript(turns) if history is None else history}
 {focus}
 
 You are the final editor. Produce the best final answer to the user, integrating the strongest
@@ -762,7 +836,8 @@ Do not mention the roundtable process, the transcript, or these instructions. Re
 polished answer."""
 
 
-def refine_prompt(objective: str, turns: list[Turn], draft: str, followup: bool = False) -> str:
+def refine_prompt(objective: str, turns: list[Turn], draft: str, followup: bool = False,
+                  history: str | None = None) -> str:
     """Ask an agent to edit another agent's draft final answer rather than write it from scratch."""
     focus = ("\nFocus on the user's latest follow-up request (the most recent 'User — follow-up' turn), "
              "consistent with the prior final answer where it still applies.\n" if followup else "")
@@ -772,7 +847,7 @@ USER OBJECTIVE:
 {objective}
 
 COMPLETE ROUNDTABLE TRANSCRIPT:
-{transcript(turns)}
+{transcript(turns) if history is None else history}
 {focus}
 
 CURRENT DRAFT FINAL ANSWER (written by another agent in this roundtable):
@@ -1876,7 +1951,11 @@ USAGE_PERCENT_REMAINING_PATTERN = re.compile(
 
 def usage_percent_used(text: str) -> float | None:
     """Extract a self-reported '% of usage limit used' figure from one line of CLI output."""
+    if not text or "%" not in text:
+        return None
     for line in text.splitlines():
+        if "%" not in line:
+            continue
         match = USAGE_PERCENT_USED_PATTERN.search(line)
         if match:
             return max(0.0, min(100.0, float(match.group(1) or match.group(2))))
@@ -1971,7 +2050,8 @@ def _wait_for_agent_availability(agent: Agent, on_tick: Callable[[str], None],
 
 
 def _run_with_retry(agent: Agent, prompt: str, on_tick: Callable[[str], None],
-                    cancel_event: threading.Event | None = None, no_edit: bool = False) -> str:
+                    cancel_event: threading.Event | None = None, no_edit: bool = False,
+                    suggested_effort: str | None = None) -> str:
     """Run one agent turn, recovering from transient failures and provider usage limits.
 
     Real CLI failures seen in practice during a long run (a nonzero exit, an empty response) are
@@ -1995,24 +2075,29 @@ def _run_with_retry(agent: Agent, prompt: str, on_tick: Callable[[str], None],
     active_cancel = cancel_event or agent.cancel_event or threading.Event()
     transient_failures = 0
     current_prompt = prompt
-    while True:
-        try:
-            return agent.run(current_prompt, on_tick, active_cancel, no_edit)
-        except RuntimeError as exc:
-            if str(exc) == f"{agent.name} cancelled" or active_cancel.is_set():
-                raise RuntimeError(f"{agent.name} cancelled") from exc
-            detail = usage_limit_detail(str(exc))
-            if detail:
-                on_tick(f"temporarily unavailable: {detail}")
-                _wait_for_agent_availability(agent, on_tick, active_cancel, detail)
+    previous_effort = agent.suggested_effort
+    agent.suggested_effort = suggested_effort
+    try:
+        while True:
+            try:
+                return agent.run(current_prompt, on_tick, active_cancel, no_edit)
+            except RuntimeError as exc:
+                if str(exc) == f"{agent.name} cancelled" or active_cancel.is_set():
+                    raise RuntimeError(f"{agent.name} cancelled") from exc
+                detail = usage_limit_detail(str(exc))
+                if detail:
+                    on_tick(f"temporarily unavailable: {detail}")
+                    _wait_for_agent_availability(agent, on_tick, active_cancel, detail)
+                    current_prompt = f"{prompt}\n\n{RERUN_PROGRESS_NOTE}"
+                    continue
+                if transient_failures:
+                    raise
+                transient_failures += 1
+                on_tick(f"failed ({exc}) — retrying once after a short pause")
+                time.sleep(RETRY_BACKOFF_SECONDS)
                 current_prompt = f"{prompt}\n\n{RERUN_PROGRESS_NOTE}"
-                continue
-            if transient_failures:
-                raise
-            transient_failures += 1
-            on_tick(f"failed ({exc}) — retrying once after a short pause")
-            time.sleep(RETRY_BACKOFF_SECONDS)
-            current_prompt = f"{prompt}\n\n{RERUN_PROGRESS_NOTE}"
+    finally:
+        agent.suggested_effort = previous_effort
 
 
 def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase: str,
@@ -2034,20 +2119,25 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
     phase (typically a review round) to check and refine it instead.
 
     When reassign_idle is set, an agent that finishes its turn while others are still working (and
-    nobody has declared the whole task complete) gets one extra prompt asking it to pick up different
-    unclaimed work or help a still-running agent, instead of sitting idle for the rest of the round.
-    At most one extra attempt per agent per phase; it's cancelled if it's still going once the round
-    would otherwise be over, so it can't drag a phase out past its slowest primary agent.
+    nobody has declared the whole task complete) may get one extra prompt asking it to pick up
+    different unclaimed work or help a still-running agent, instead of sitting idle for the rest of
+    the round. At most one bonus attempt runs per phase (the first finisher that qualifies), and only
+    when at least two agents are still on their primary turn — a single remaining agent usually
+    finishes before a bonus can complete, so starting one would mostly burn tokens for a cancelled
+    call. The bonus is cancelled if it's still going once the round would otherwise be over, so it
+    can't drag a phase out past its slowest primary agent. Under --reasoning-effort auto, the bonus
+    turn is hinted at low effort: it is opportunistic extra work, not a primary contribution.
     """
     if stagger is None:
         stagger = AGENT_SPAWN_STAGGER_SECONDS
     names = [name for name, _ in agents]
     by_name = dict(agents)
     status(names, message)
+    context = prepare_prompt_context(session.objective, session.turns)
     prompts = {
         name: prompt_for(session.objective, session.turns, phase, name, sequential=False,
                          scope=scope_hint(name, agent_speed) if agent_speed is not None else "",
-                         task_status_check=task_status_check)
+                         task_status_check=task_status_check, context=context)
         for name, _ in agents
     }
     for name in names:
@@ -2081,7 +2171,11 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
                     tick("", "")
                 remaining = {name for name in names if not futures[name].done()}
                 if remaining != pending:
-                    just_finished = pending - remaining
+                    # Preserve configured order when several futures complete between polls.
+                    # Iterating the set directly makes the one permitted bonus recipient flaky.
+                    just_finished = [
+                        name for name in names if name in pending and name not in remaining
+                    ]
                     # Collect every newly finished primary result first so same-poll co-agents
                     # appear in reassignment transcripts (session.turns updates only at phase end).
                     for name in just_finished:
@@ -2113,8 +2207,12 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
                                 cancel_event.set()
                                 tick(name, f"marked the task complete — skipping "
                                             f"{', '.join(sorted(skipped))} this phase")
+                        # One concurrent bonus max, and only while ≥2 primaries remain: a lone
+                        # remaining agent is about to close the phase, so a bonus is almost always
+                        # cancelled mid-flight after paying full startup cost.
                         if (reassign_idle and not declared_complete and completed_by is None
-                                and remaining and name not in bonus_futures):
+                                and len(remaining) >= 2 and not bonus_futures
+                                and name not in bonus_futures):
                             partial_turns = list(session.turns)
                             partial_turns.extend(
                                 Turn(done_name, phase, content)
@@ -2125,9 +2223,20 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
                             log_prompt(name, bonus_prompt)
                             tick(name, f"picking up extra work while "
                                         f"{', '.join(sorted(remaining))} finish")
-                            bonus_futures[name] = pool.submit(
-                                by_name[name].run, bonus_prompt,
-                                lambda line, speaker=name: events.put((speaker, line)))
+                            bonus_agent = by_name[name]
+
+                            def _bonus_run(agent=bonus_agent, prompt=bonus_prompt,
+                                           speaker=name) -> str:
+                                previous_effort = agent.suggested_effort
+                                agent.suggested_effort = "low"
+                                try:
+                                    return agent.run(
+                                        prompt,
+                                        lambda line: events.put((speaker, line)))
+                                finally:
+                                    agent.suggested_effort = previous_effort
+
+                            bonus_futures[name] = pool.submit(_bonus_run)
                     pending = remaining
                     status([name for name in names if name in pending], message)
         except BaseException:
@@ -2210,6 +2319,84 @@ def _phase_runner(collab: str, round_no: int) -> Callable[..., None]:
     return _run_parallel_phase
 
 
+class CompletionEstimator:
+    """Estimate remaining wall time from work units actually completed in this run.
+
+    One concurrent phase is one unit, a six-agent sequential phase is six, and each sequential
+    synthesis pass is one. This deliberately waits for an observed unit before reporting anything:
+    model/provider latency is too variable for a made-up cold-start estimate to be useful.
+    """
+
+    def __init__(self, total_units: int, clock: Callable[[], float] = time.monotonic):
+        self.total_units = max(0, total_units)
+        self.clock = clock
+        self.segment_started = clock()
+        self.observed_seconds = 0.0
+        self.completed_units = 0
+        self.waiting_on_provider: set[str] = set()
+        self.provider_wait_started: float | None = None
+        self.excluded_wait_seconds = 0.0
+
+    def pause_for_provider(self, name: str) -> None:
+        """Exclude a provider-limit wait from the latency sample used for future work."""
+        if name in self.waiting_on_provider:
+            return
+        if not self.waiting_on_provider:
+            self.provider_wait_started = self.clock()
+        self.waiting_on_provider.add(name)
+
+    def resume_provider(self, name: str) -> None:
+        if name not in self.waiting_on_provider:
+            return
+        self.waiting_on_provider.remove(name)
+        if not self.waiting_on_provider and self.provider_wait_started is not None:
+            self.excluded_wait_seconds += max(0.0, self.clock() - self.provider_wait_started)
+            self.provider_wait_started = None
+
+    def _current_excluded_wait(self, now: float) -> float:
+        active = (max(0.0, now - self.provider_wait_started)
+                  if self.provider_wait_started is not None else 0.0)
+        return self.excluded_wait_seconds + active
+
+    def complete(self, units: int = 1) -> None:
+        now = self.clock()
+        elapsed = max(0.0, now - self.segment_started - self._current_excluded_wait(now))
+        self.observed_seconds += elapsed
+        self.completed_units = min(self.total_units, self.completed_units + max(0, units))
+        self.segment_started = now
+        self.waiting_on_provider.clear()
+        self.provider_wait_started = None
+        self.excluded_wait_seconds = 0.0
+
+    def remaining_seconds(self) -> float | None:
+        if not self.completed_units or self.observed_seconds <= 0:
+            return None
+        now = self.clock()
+        average = self.observed_seconds / self.completed_units
+        remaining = max(0, self.total_units - self.completed_units)
+        current_elapsed = max(
+            0.0, now - self.segment_started - self._current_excluded_wait(now))
+        return max(0.0, remaining * average - current_elapsed)
+
+
+def format_completion_estimate(seconds: float) -> str:
+    """Format an intentionally coarse ETA without implying unsupported precision."""
+    seconds = max(0.0, seconds)
+    if seconds < 60:
+        rounded = max(5, int(math.ceil(seconds / 5.0) * 5))
+        return f"est. ~{rounded}s left"
+    minutes = int(math.ceil(seconds / 60.0))
+    if minutes < 60:
+        return f"est. ~{minutes}m left"
+    hours, minutes = divmod(minutes, 60)
+    return f"est. ~{hours}h {minutes}m left" if minutes else f"est. ~{hours}h left"
+
+
+def phase_work_units(runner: Callable[..., None], agent_count: int = len(AGENT_NAMES)) -> int:
+    """Approximate wall-time units for a collaboration phase."""
+    return agent_count if runner is _run_sequential_phase else 1
+
+
 def pick_synthesizer(choice: str, session: Session, codex: Agent, claude: Agent, antigravity: Agent,
                      aider: Agent, grok: Agent, qwen: Agent) -> tuple[str, Agent]:
     """Choose who writes the final answer.
@@ -2248,15 +2435,17 @@ def synthesis_order(choice: str, session: Session, codex: Agent, claude: Agent, 
 def synthesize(session: Session, order: list[tuple[str, Agent]],
                tick: Callable[[str, str], None], status: Callable[[Iterable[str], str], None],
                log_prompt: Callable[[str, str], None] = lambda *_: None,
-               followup: bool = False) -> str:
+               followup: bool = False,
+               step_complete: Callable[[int], None] = lambda *_: None) -> str:
     """Produce the final answer as a relay: one agent drafts it, the rest refine it in turn,
     so the result is a merge shaped by all of them rather than the output of a single agent."""
     draft = ""
+    history = transcript(session.turns)
     for index, (name, agent) in enumerate(order):
         verb = "drafting" if index == 0 else "refining"
         status([name], f"{name} is {verb} the final answer")
-        prompt = (final_prompt(session.objective, session.turns, followup) if index == 0 else
-                 refine_prompt(session.objective, session.turns, draft, followup))
+        prompt = (final_prompt(session.objective, session.turns, followup, history) if index == 0 else
+                  refine_prompt(session.objective, session.turns, draft, followup, history))
         log_prompt(name, prompt)
         # Pass a fresh Event explicitly rather than relying on agent.cancel_event: a prior phase's
         # task_status_check cancellation could otherwise leave that attribute already set, which
@@ -2265,7 +2454,8 @@ def synthesize(session: Session, order: list[tuple[str, Agent]],
         # snippet in the draft/transcript for a malformed edit attempt and burning up to three
         # expensive retries (its own hard cap) trying to reconcile it against a real file.
         draft = _run_with_retry(agent, prompt, lambda line, speaker=name: tick(speaker, line),
-                                threading.Event(), no_edit=True)
+                                threading.Event(), no_edit=True, suggested_effort="medium")
+        step_complete(1)
     status([], "Final answer complete")
     return draft
 
@@ -2281,6 +2471,8 @@ def preflight_check(name: str, agent: Agent, tick: Callable[[str, str], None],
     timer = threading.Timer(timeout, cancel_event.set)
     timer.daemon = True
     timer.start()
+    previous_effort = agent.suggested_effort
+    agent.suggested_effort = "low"
     try:
         agent.run(PREFLIGHT_PROMPT, lambda line: tick(name, line), no_edit=True)
         return True, "ready"
@@ -2293,6 +2485,7 @@ def preflight_check(name: str, agent: Agent, tick: Callable[[str, str], None],
         message = str(exc).strip().splitlines()[0] if str(exc).strip() else "no response"
         return False, message
     finally:
+        agent.suggested_effort = previous_effort
         timer.cancel()
 
 
@@ -2350,12 +2543,12 @@ def run_preflight(agents: list[tuple[str, Agent]], tick: Callable[[str, str], No
 
 def drain_queued_prompts(session: Session) -> bool:
     """Pop queued prompts added during active interrupts into transcript user follow-up turns."""
-    drained = False
-    while getattr(session, "queued_prompts", None):
-        prompt = session.queued_prompts.pop(0)
-        session.turns.append(Turn("User", "follow-up", prompt))
-        drained = True
-    return drained
+    queued = getattr(session, "queued_prompts", None)
+    if not queued:
+        return False
+    session.turns.extend(Turn("User", "follow-up", prompt) for prompt in queued)
+    queued.clear()
+    return True
 
 
 def _run_phase(runner: Callable[..., None], session: Session, agents: list[tuple[str, Agent]],
@@ -2398,9 +2591,43 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
     message = (f"Agents are addressing the follow-up {style}" if followup else
                f"Agents are developing solutions {style}")
     completed_phases = completed_phases or set()
+    remaining_phase_units = (
+        phase_work_units(proposal_runner) if phase not in completed_phases else 0)
+    for planned_round in range(1, session.rounds + 1):
+        planned_phase = (f"followup-review {planned_round}" if followup
+                         else f"review {planned_round}")
+        if planned_phase not in completed_phases:
+            remaining_phase_units += phase_work_units(_phase_runner(collab, planned_round))
+    remaining_synthesis_units = (0 if "consensus" in completed_phases
+                                 else max(1, min(synthesis_passes, len(agents))))
+    estimator = CompletionEstimator(remaining_phase_units + remaining_synthesis_units)
+    cached_message = ""
+    cached_estimated_message = ""
+
+    def estimated_status(active: Iterable[str], phase_message: str) -> None:
+        nonlocal cached_message, cached_estimated_message
+        active_names = tuple(active)
+        if phase_message != cached_message:
+            cached_message = phase_message
+            cached_estimated_message = phase_message
+            remaining = estimator.remaining_seconds()
+            if active_names and remaining is not None:
+                cached_estimated_message = (
+                    f"{phase_message} · {format_completion_estimate(remaining)}")
+        status(active_names, cached_estimated_message)
+
+    def estimated_tick(name: str, line: str = "") -> None:
+        if name and line.startswith("temporarily unavailable:"):
+            estimator.pause_for_provider(name)
+        elif name and line.startswith("agent available again"):
+            estimator.resume_provider(name)
+        tick(name, line)
+
     if phase not in completed_phases:
-        _run_phase(proposal_runner, session, agents, phase, tick, status, message, log_prompt,
-                  agent_speed, task_status_check, reassign_idle, stagger)
+        _run_phase(
+            proposal_runner, session, agents, phase, estimated_tick, estimated_status, message,
+            log_prompt, agent_speed, task_status_check, reassign_idle, stagger)
+        estimator.complete(phase_work_units(proposal_runner))
         checkpoint()
     for round_no in range(1, session.rounds + 1):
         phase = f"followup-review {round_no}" if followup else f"review {round_no}"
@@ -2408,17 +2635,19 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
         round_style = "in sequence" if runner is _run_sequential_phase else "in parallel"
         if phase not in completed_phases:
             _run_phase(
-                runner, session, agents, phase, tick, status,
+                runner, session, agents, phase, estimated_tick, estimated_status,
                 f"Agents are reviewing {round_style} · round {round_no}/{session.rounds}",
                 log_prompt, agent_speed, task_status_check, reassign_idle, stagger,
             )
+            estimator.complete(phase_work_units(runner))
             checkpoint()
     if "consensus" in completed_phases:
         return
     drain_queued_prompts(session)
     order = synthesis_order(synthesizer, session, codex, claude, antigravity, aider, grok, qwen,
                             synthesis_passes)
-    session.final = synthesize(session, order, tick, status, log_prompt, followup)
+    session.final = synthesize(session, order, estimated_tick, estimated_status, log_prompt, followup,
+                               estimator.complete)
     session.turns.append(Turn("Final", "consensus", session.final))
     checkpoint()
 
@@ -2593,6 +2822,8 @@ def restart_arguments(args: argparse.Namespace, session_path: Path,
                           ("--qwen-model", args.qwen_model)):
         if value:
             command.extend((option, value))
+    if args.reasoning_effort != "auto":
+        command.extend(("--reasoning-effort", args.reasoning_effort))
     for value in args.elevated:
         command.extend(("--elevated", value))
     for option, enabled in (("--plain", args.plain), ("--mock", args.mock),
@@ -2642,6 +2873,13 @@ def build_parser() -> argparse.ArgumentParser:
                              "practice -- verified against the real CLI, Qwen Code silently fails "
                              "auth with a misleading 'Invalid API-key' error if no -m/--model is "
                              "passed, even with OPENAI_MODEL set in the environment")
+    parser.add_argument("--reasoning-effort", choices=("auto", "low", "medium", "high"),
+                        default="auto",
+                        help="reasoning depth for CLIs that support it (default: auto: low for "
+                             "preflight, each CLI's own default for working turns, and medium for "
+                             "final synthesis). An explicit level applies to every turn. Qwen has "
+                             "no equivalent option; Aider only receives explicit levels because "
+                             "support depends on its selected provider/model")
     parser.add_argument("--collab", choices=["parallel", "sequential", "mixed"], default="parallel",
                         help="how agents coordinate: independent parallel turns (default), a "
                              "strict relay through every agent, or a mix that alternates relay and "
@@ -2665,9 +2903,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "stops the others from redoing the same finished work, leaving them "
                              "to review and refine it in the next phase instead")
     parser.add_argument("--reassign-idle", action="store_true",
-                        help="in parallel phases, an agent that finishes while others are still "
-                             "working gets one extra prompt to pick up different unclaimed work or "
-                             "help a still-running agent, instead of sitting idle for the round")
+                        help="in parallel phases, the first agent that finishes while at least two "
+                             "others are still on their primary turn gets one extra prompt to pick "
+                             "up different unclaimed work or help a still-running agent, instead of "
+                             "sitting idle; later finishers stay idle (one concurrent bonus max)")
     parser.add_argument("--elevated",
                         choices=["codex", "claude", "antigravity", "aider", "grok", "qwen", "all"],
                         action="append", default=[], metavar="AGENT",
@@ -2805,6 +3044,8 @@ def main() -> int:
     aider = cls("Aider", workspace, args.aider_model, elevated=elevated["aider"], debug=args.debug)
     grok = cls("Grok", workspace, args.grok_model, elevated=elevated["grok"], debug=args.debug)
     qwen = cls("Qwen", workspace, args.qwen_model, elevated=elevated["qwen"], debug=args.debug)
+    for agent in (codex, claude, antigravity, aider, grok, qwen):
+        agent.reasoning_effort = args.reasoning_effort
     followup = (args.continue_after_restart == "followup" if continuing else resumed)
     current_turns = session.turns
     if continuing and followup:

@@ -165,6 +165,25 @@ class RoundtableTests(unittest.TestCase):
             changes = {(item.kind, item.path) for item in monitor.refresh(force=True)}
             self.assertIn(("deleted", "app.py"), changes)
 
+    def test_workspace_monitor_skips_ignored_directories(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            git_dir = root / ".git"
+            git_dir.mkdir()
+            (git_dir / "HEAD").write_text("ref: refs/heads/main")
+            pycache_dir = root / "__pycache__"
+            pycache_dir.mkdir()
+            (pycache_dir / "module.pyc").write_text("binary")
+            valid_file = root / "src" / "main.py"
+            valid_file.parent.mkdir(parents=True)
+            valid_file.write_text("print('hello')")
+
+            monitor = roundtable.WorkspaceMonitor(root)
+            snapshot = monitor.baseline
+            self.assertIn(str(Path("src") / "main.py"), snapshot)
+            self.assertNotIn(str(Path(".git") / "HEAD"), snapshot)
+            self.assertNotIn(str(Path("__pycache__") / "module.pyc"), snapshot)
+
     def test_touchscreen_detection_matches_yoga_digitizer(self):
         devices = 'N: Name="Atmel Atmel maXTouch Digitizer"\nH: Handlers=mouse1 event5\n'
         self.assertTrue(roundtable.has_touchscreen(devices))
@@ -566,6 +585,20 @@ class RoundtableTests(unittest.TestCase):
         self.assertIn("Use a queue", prompt)
         self.assertIn("Build a worker", prompt)
 
+    def test_parallel_phase_prepares_shared_prompt_context_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session(
+                "Build a worker", td, 0, "now",
+                [roundtable.Turn("User", "context", "Keep it small")])
+            agents = [(name, roundtable.MockAgent(name, Path(td)))
+                      for name in roundtable.AGENT_NAMES]
+            with mock.patch.object(
+                    roundtable, "prepare_prompt_context",
+                    wraps=roundtable.prepare_prompt_context) as prepare:
+                roundtable._run_parallel_phase(
+                    session, agents, "proposal", lambda *_: None, lambda *_: None, "Working")
+        self.assertEqual(prepare.call_count, 1)
+
     def test_save_both_formats(self):
         with tempfile.TemporaryDirectory() as td:
             session = roundtable.Session("Goal", td, 0, "now",
@@ -811,6 +844,79 @@ class RoundtableTests(unittest.TestCase):
         # A real answer that happens to start with a similar-looking word must survive untouched.
         self.assertEqual(roundtable.QWEN_SAFE_MODE_BANNER.sub("", "SAFE MODE is a design pattern"),
                          "SAFE MODE is a design pattern")
+
+    def test_qwen_yolo_warning_is_recognized_without_matching_real_answers(self):
+        warning = ("Warning: running headless with --yolo / approval-mode=yolo and no sandbox. "
+                   "All tool calls auto-execute. Enable a sandbox or silence this notice.")
+        self.assertEqual(roundtable.QWEN_YOLO_WARNING.sub("", f"{warning}\nOK").strip(), "OK")
+        self.assertEqual(roundtable.QWEN_YOLO_WARNING.sub("", f"OK\n{warning}").strip(), "OK")
+        self.assertEqual(roundtable.QWEN_YOLO_WARNING.sub("", "Warning: review this code"),
+                         "Warning: review this code")
+
+    def test_explicit_reasoning_effort_uses_each_supported_clis_native_flag(self):
+        expected = {
+            "Codex": ("-c", 'model_reasoning_effort="high"'),
+            "Claude": ("--effort", "high"),
+            "Antigravity": ("--effort", "high"),
+            "Aider": ("--reasoning-effort", "high"),
+            "Grok": ("--reasoning-effort", "high"),
+        }
+        for name, (flag, value) in expected.items():
+            with self.subTest(name=name):
+                agent = roundtable.Agent(name, Path("/tmp/work"))
+                agent.reasoning_effort = "high"
+                command = agent.command("Solve this")
+                self.assertIn(flag, command)
+                self.assertEqual(command[command.index(flag) + 1], value)
+
+        qwen = roundtable.Agent("Qwen", Path("/tmp/work"))
+        qwen.reasoning_effort = "high"
+        self.assertNotIn("--reasoning-effort", qwen.command("Solve this"))
+
+    def test_auto_reasoning_effort_uses_phase_hint_without_risky_aider_inference(self):
+        for name in ("Codex", "Claude", "Antigravity", "Grok"):
+            with self.subTest(name=name):
+                agent = roundtable.Agent(name, Path("/tmp/work"))
+                agent.suggested_effort = "medium"
+                self.assertTrue(any("medium" in argument for argument in agent.command("Solve this")))
+
+        aider = roundtable.Agent("Aider", Path("/tmp/work"), "mistral/codestral-latest")
+        aider.suggested_effort = "medium"
+        self.assertNotIn("--reasoning-effort", aider.command("Solve this"))
+
+    def test_preflight_auto_effort_is_low_and_restores_agent_state(self):
+        class RecordingAgent(roundtable.Agent):
+            def __init__(self):
+                super().__init__("Claude", Path("/tmp/work"))
+                self.commands = []
+
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                self.commands.append(self.command(prompt, no_edit=no_edit))
+                return "OK"
+
+        agent = RecordingAgent()
+        ready, _ = roundtable.preflight_check(
+            "Claude", agent, lambda *_: None, threading.Event(), 1.0)
+        self.assertTrue(ready)
+        self.assertEqual(agent.commands[0][agent.commands[0].index("--effort") + 1], "low")
+        self.assertIsNone(agent.suggested_effort)
+
+    def test_synthesis_auto_effort_is_medium_and_restores_agent_state(self):
+        class RecordingAgent(roundtable.Agent):
+            def __init__(self):
+                super().__init__("Grok", Path("/tmp/work"))
+                self.commands = []
+
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                self.commands.append(self.command(prompt, no_edit=no_edit))
+                return "Completed\n\nFailed / incomplete\n\nNone"
+
+        agent = RecordingAgent()
+        session = roundtable.Session("Solve it", "/tmp/work", 0, "now", [])
+        roundtable.synthesize(session, [("Grok", agent)], lambda *_: None, lambda *_: None)
+        command = agent.commands[0]
+        self.assertEqual(command[command.index("--reasoning-effort") + 1], "medium")
+        self.assertIsNone(agent.suggested_effort)
 
     def test_elevated_agents_swap_in_each_clis_permission_bypass_flag(self):
         codex = roundtable.Agent("Codex", Path("/tmp/work"), elevated=True)
@@ -1060,7 +1166,7 @@ class RoundtableTests(unittest.TestCase):
             "Goal", "--self", "--plain", "--mock", "-r", "2", "-C", "custom_ws", "--collab", "mixed",
             "--synthesizer", "claude", "--synthesis-passes", "1", "--balance-load",
             "--task-status-check", "--reassign-idle", "--elevated", "codex",
-            "--codex-model", "model-a", "--output-dir", "saved",
+            "--codex-model", "model-a", "--reasoning-effort", "high", "--output-dir", "saved",
         ])
         command = roundtable.restart_arguments(args, Path("saved/session.json"), True)
         self.assertEqual(command[:2], [sys.executable, str(Path(roundtable.__file__).resolve())])
@@ -1073,6 +1179,7 @@ class RoundtableTests(unittest.TestCase):
         self.assertEqual(command[command.index("--synthesizer") + 1], "claude")
         self.assertEqual(command[command.index("--synthesis-passes") + 1], "1")
         self.assertEqual(command[command.index("--codex-model") + 1], "model-a")
+        self.assertEqual(command[command.index("--reasoning-effort") + 1], "high")
         self.assertEqual(command[command.index("--elevated") + 1], "codex")
         self.assertEqual(command[command.index("--rounds") + 1], "2")
         self.assertEqual(command[command.index("--workspace") + 1], "custom_ws")
@@ -1296,6 +1403,45 @@ class RoundtableTests(unittest.TestCase):
         self.assertEqual(len(result), 4)
         self.assertEqual(result[-1], "█")
         self.assertEqual(roundtable.activity_sparkline([], 4, window=8.0, now=now), "▁▁▁▁")
+
+    def test_completion_estimator_waits_for_evidence_then_counts_down(self):
+        now = [0.0]
+        estimator = roundtable.CompletionEstimator(5, clock=lambda: now[0])
+        self.assertIsNone(estimator.remaining_seconds())
+
+        now[0] = 10.0
+        estimator.complete(1)
+        self.assertEqual(estimator.remaining_seconds(), 40.0)
+        now[0] = 13.0
+        self.assertEqual(estimator.remaining_seconds(), 37.0)
+
+    def test_completion_estimator_excludes_provider_limit_waits(self):
+        now = [0.0]
+        estimator = roundtable.CompletionEstimator(5, clock=lambda: now[0])
+        now[0] = 10.0
+        estimator.complete(1)
+
+        now[0] = 12.0
+        estimator.pause_for_provider("Claude")
+        now[0] = 1012.0
+        self.assertEqual(estimator.remaining_seconds(), 38.0)
+        estimator.resume_provider("Claude")
+        now[0] = 1020.0
+        estimator.complete(1)
+
+        # Two measured units took 10s each after the 1,000s provider pause was removed.
+        self.assertEqual(estimator.observed_seconds, 20.0)
+        self.assertEqual(estimator.remaining_seconds(), 30.0)
+
+    def test_completion_estimate_is_coarse_and_human_readable(self):
+        self.assertEqual(roundtable.format_completion_estimate(1), "est. ~5s left")
+        self.assertEqual(roundtable.format_completion_estimate(61), "est. ~2m left")
+        self.assertEqual(roundtable.format_completion_estimate(3601), "est. ~1h 1m left")
+
+    def test_phase_work_units_reflect_parallel_and_sequential_wall_time(self):
+        self.assertEqual(roundtable.phase_work_units(roundtable._run_parallel_phase), 1)
+        self.assertEqual(roundtable.phase_work_units(roundtable._run_sequential_phase),
+                         len(roundtable.AGENT_NAMES))
 
     def test_tick_records_usage_history_for_completed_turns(self):
         display = roundtable.Display.__new__(roundtable.Display)
@@ -1683,6 +1829,30 @@ class RoundtableTests(unittest.TestCase):
             self.assertEqual(review1_maxima, [1] * n)
             self.assertTrue(any(v > 1 for v in review2_maxima))
 
+    def test_conduct_reports_eta_only_after_observing_a_completed_phase(self):
+        class TimedAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                time.sleep(0.01)
+                return self.name
+
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session("Estimate this", td, 0, "now", [])
+            agents = [TimedAgent(name, Path(td)) for name in roundtable.AGENT_NAMES]
+            statuses = []
+            roundtable.conduct(
+                session, *agents, lambda *_: None,
+                lambda active, message: statuses.append((tuple(active), message)),
+                synthesis_passes=2)
+
+        proposal_messages = [message for active, message in statuses
+                             if active and "developing solutions" in message]
+        synthesis_messages = [message for active, message in statuses
+                              if active and "final answer" in message]
+        self.assertTrue(proposal_messages)
+        self.assertNotIn("est.", proposal_messages[0])
+        self.assertTrue(synthesis_messages)
+        self.assertTrue(all("est." in message for message in synthesis_messages))
+
     def test_pick_synthesizer_rotates_by_objective_and_honors_explicit_choice(self):
         with tempfile.TemporaryDirectory() as td:
             agents = {name: roundtable.MockAgent(name, Path(td)) for name in roundtable.AGENT_NAMES}
@@ -1753,6 +1923,23 @@ class RoundtableTests(unittest.TestCase):
             self.assertEqual(statuses[1], (("Codex",), "Codex is refining the final answer"))
             self.assertEqual(statuses[-1], ((), "Final answer complete"))
 
+    def test_synthesis_renders_unchanged_transcript_once_for_all_passes(self):
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            session = roundtable.Session(
+                "Solve it", td, 0, "now",
+                [roundtable.Turn("Codex", "proposal", "Initial idea")])
+            order = [
+                ("Claude", roundtable.MockAgent("Claude", workspace)),
+                ("Codex", roundtable.MockAgent("Codex", workspace)),
+                ("Grok", roundtable.MockAgent("Grok", workspace)),
+            ]
+            with mock.patch.object(
+                    roundtable, "transcript", wraps=roundtable.transcript) as render:
+                roundtable.synthesize(
+                    session, order, lambda *_: None, lambda *_: None)
+        self.assertEqual(render.call_count, 1)
+
     def test_prompt_for_includes_each_agents_role_hint(self):
         hints = roundtable.role_hints_for("Goal")
         codex_prompt = roundtable.prompt_for("Goal", [], "proposal", "Codex")
@@ -1782,6 +1969,16 @@ class RoundtableTests(unittest.TestCase):
         ]
         self.assertEqual(roundtable.extract_dibs(turns),
                          {"Codex": "the retry logic", "Claude": "the docs"})
+
+    def test_extract_dibs_does_not_allocate_a_lowercase_copy_before_regex_search(self):
+        class NoLowerCopy(str):
+            def lower(self):
+                raise AssertionError("extract_dibs should use its case-insensitive regex directly")
+
+        turns = [
+            roundtable.Turn("Codex", "proposal", NoLowerCopy("DIBS: the parser\nWorking")),
+        ]
+        self.assertEqual(roundtable.extract_dibs(turns), {"Codex": "the parser"})
 
     def test_prompt_for_tells_an_agent_what_others_have_already_claimed(self):
         turns = [roundtable.Turn("Codex", "proposal", "DIBS: the auth flow\nDid the work.")]
@@ -1872,6 +2069,7 @@ class RoundtableTests(unittest.TestCase):
             self.assertIn("waiting on nothing else", finished[-1][1])
 
     def test_signals_task_complete_matches_marker_near_end_of_text(self):
+        self.assertFalse(roundtable.signals_task_complete(""))
         self.assertTrue(roundtable.signals_task_complete("All done.\nTASK STATUS: complete"))
         self.assertTrue(roundtable.signals_task_complete("All done.\ntask status: COMPLETE  "))
         self.assertTrue(roundtable.signals_task_complete("All done.\nTASK STATUS: complete\n\n"))
@@ -1963,6 +2161,97 @@ class RoundtableTests(unittest.TestCase):
             self.assertEqual({t.phase for t in session.turns if t.speaker != "Codex"}, {"proposal"})
             self.assertEqual(calls["Codex"], 2)
             self.assertTrue(any("picking up extra work" in line for _, line in ticks))
+
+    def test_reassign_idle_starts_only_one_bonus_per_phase(self):
+        """Later finishers stay idle once the first bonus is underway — concurrent extras burn
+        tokens and risk colliding workspace edits without shortening wall-clock further."""
+        calls = {"Codex": 0, "Claude": 0}
+        bonus_speakers: list[str] = []
+
+        class StaggeredAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                if "pick up a different" in prompt or "· extra" in prompt:
+                    bonus_speakers.append(self.name)
+                    return f"{self.name} extra content"
+                if self.name == "Codex":
+                    calls["Codex"] += 1
+                    return "Codex proposal content"
+                if self.name == "Claude":
+                    time.sleep(0.05)
+                    calls["Claude"] += 1
+                    return "Claude proposal content"
+                time.sleep(0.25)
+                return f"{self.name} proposal content"
+
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            session = roundtable.Session("Goal", td, 0, "now", [])
+            agents = [(name, StaggeredAgent(name, workspace))
+                      for name in ("Codex", "Claude", "Antigravity", "Aider")]
+            roundtable._run_parallel_phase(
+                session, agents, "proposal", lambda *_: None, lambda *_: None, "Working",
+                reassign_idle=True, stagger=0,
+            )
+            extra_turns = [t for t in session.turns if t.phase.endswith("· extra")]
+            self.assertEqual(len(extra_turns), 1, session.turns)
+            # First finisher among the fast pair gets the sole bonus; set iteration order is
+            # not load-bearing — only that later finishers do not start a second one.
+            self.assertEqual(len(bonus_speakers), 1)
+            self.assertIn(bonus_speakers[0], ("Codex", "Claude"))
+            self.assertEqual(calls["Claude"] + calls["Codex"], 2)  # each primary once
+
+    def test_reassign_idle_skips_bonus_when_only_one_primary_remains(self):
+        """With only two agents, the first finisher always sees a single remaining primary — a
+        bonus would almost always be cancelled mid-flight after paying full startup cost."""
+        calls = {"Codex": 0}
+
+        class PairAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                if "pick up a different" in prompt or "· extra" in prompt:
+                    calls["Codex"] += 10  # should never happen
+                    return "unexpected bonus"
+                if self.name == "Codex":
+                    calls["Codex"] += 1
+                    return "Codex proposal content"
+                time.sleep(0.2)
+                return f"{self.name} proposal content"
+
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            session = roundtable.Session("Goal", td, 0, "now", [])
+            agents = [(name, PairAgent(name, workspace)) for name in ("Codex", "Claude")]
+            roundtable._run_parallel_phase(
+                session, agents, "proposal", lambda *_: None, lambda *_: None, "Working",
+                reassign_idle=True, stagger=0,
+            )
+            self.assertEqual(calls["Codex"], 1)  # primary only
+            self.assertEqual({t.phase for t in session.turns}, {"proposal"})
+            self.assertFalse(any("extra" in t.phase for t in session.turns))
+
+    def test_reassign_idle_bonus_uses_low_suggested_effort(self):
+        efforts: list[str | None] = []
+
+        class EffortProbeAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                if "pick up a different" in prompt or "· extra" in prompt:
+                    efforts.append(self.suggested_effort)
+                    return "bonus"
+                if self.name == "Codex":
+                    return "Codex primary"
+                time.sleep(0.2)
+                return f"{self.name} primary"
+
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            session = roundtable.Session("Goal", td, 0, "now", [])
+            agents = [(name, EffortProbeAgent(name, workspace))
+                      for name in ("Codex", "Claude", "Antigravity")]
+            roundtable._run_parallel_phase(
+                session, agents, "proposal", lambda *_: None, lambda *_: None, "Working",
+                reassign_idle=True, stagger=0,
+            )
+            self.assertEqual(efforts, ["low"])
+            self.assertIsNone(agents[0][1].suggested_effort)
 
     def test_reassign_idle_off_by_default_leaves_a_finished_agent_idle(self):
         calls = {"Codex": 0}
@@ -2536,13 +2825,19 @@ class RoundtableTests(unittest.TestCase):
 
     def test_drain_queued_prompts_appends_turns(self):
         session = roundtable.Session("test obj", "/tmp", 1, "now", [])
-        session.queued_prompts.append("Refactor authentication module")
+        session.queued_prompts.extend([
+            "Refactor authentication module",
+            "Then update its documentation",
+        ])
+        original_queue = session.queued_prompts
         drained = roundtable.drain_queued_prompts(session)
         self.assertTrue(drained)
-        self.assertEqual(len(session.turns), 1)
+        self.assertEqual(len(session.turns), 2)
         self.assertEqual(session.turns[0].speaker, "User")
         self.assertEqual(session.turns[0].phase, "follow-up")
         self.assertEqual(session.turns[0].content, "Refactor authentication module")
+        self.assertEqual(session.turns[1].content, "Then update its documentation")
+        self.assertIs(session.queued_prompts, original_queue)
         self.assertEqual(session.queued_prompts, [])
 
     def test_run_phase_drains_queued_prompt_before_dispatch(self):
@@ -2714,24 +3009,27 @@ class RoundtableTests(unittest.TestCase):
 
         session.turns is only updated after the phase ends, so without folding in-flight
         finished_results into the reassignment transcript, same-round DIBS claims are invisible.
+        Only one bonus runs per phase, so this uses two fast finishers in the same poll (so both
+        land in finished_results before the bonus is built) plus two slow agents to keep
+        remaining ≥ 2.
         """
         bonus_prompts: list[str] = []
-        claude_done = threading.Event()
+        # Synchronize the two fast primaries so they land in the same just_finished poll
+        # batch; finished_results is filled for the whole batch before any bonus is built.
+        fast_pair = threading.Barrier(2, timeout=2.0)
 
         class TrackingAgent(roundtable.Agent):
             def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                if "· extra" in prompt or "pick up a different" in prompt:
+                    bonus_prompts.append(prompt)
+                    return f"{self.name} extra content"
                 if self.name == "Claude":
-                    claude_done.set()
+                    fast_pair.wait()
                     return "DIBS: the frontend\nClaude proposal content"
                 if self.name == "Codex":
-                    # Wait until Claude's primary turn is done so finished_results has it.
-                    if not claude_done.wait(2.0):
-                        raise RuntimeError("Claude did not finish before Codex reassignment")
-                    if "· extra" in prompt or "pick up a different" in prompt:
-                        bonus_prompts.append(prompt)
-                        return "Codex extra content"
+                    fast_pair.wait()
                     return "Codex proposal content"
-                # Stay busy long enough for Codex's reassignment to run.
+                # Stay busy long enough for the reassignment to run.
                 deadline = time.monotonic() + 0.6
                 while time.monotonic() < deadline:
                     if cancel_event is not None and cancel_event.is_set():
@@ -2742,14 +3040,17 @@ class RoundtableTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             workspace = Path(td)
             session = roundtable.Session("Goal", td, 0, "now", [])
+            # Codex is first so the same-poll completion batch assigns it the bonus; Claude's
+            # co-agent result must still be present in that bonus prompt.
             agents = [(name, TrackingAgent(name, workspace))
-                      for name in ("Claude", "Codex", "Antigravity")]
+                      for name in ("Codex", "Claude", "Antigravity", "Aider")]
             roundtable._run_parallel_phase(
                 session, agents, "proposal", lambda *_: None, lambda *_: None, "Working",
                 reassign_idle=True, stagger=0,
             )
 
-        self.assertTrue(bonus_prompts, "Codex should have received a reassignment prompt")
+        self.assertTrue(bonus_prompts, "a reassignment prompt should have been issued")
+        self.assertEqual(len(bonus_prompts), 1)
         joined = "\n".join(bonus_prompts)
         self.assertIn("Claude has dibs on the frontend", joined)
         self.assertIn("Claude proposal content", joined)
@@ -2780,4 +3081,3 @@ class RoundtableTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

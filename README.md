@@ -64,6 +64,12 @@ Useful options:
                        distinct from the five lab-native agents below)
 --grok-model MODEL     Override the configured Grok model
 --qwen-model MODEL     Override the configured Qwen model
+--reasoning-effort LEVEL
+                       auto (default), low, medium, or high. Auto uses low effort for connectivity
+                       checks, each CLI's default for working turns, and medium for final synthesis.
+                       Explicit levels apply to all turns on Codex, Claude, Antigravity, Aider, and
+                       Grok; Qwen has no equivalent option. Auto leaves Aider at its model default
+                       because reasoning-effort support varies by provider/model.
 --collab MODE          parallel (default), sequential (strict relay through every agent), or mixed
                        (parallel proposal, then rounds alternate relay/parallel)
 --synthesizer WHO      codex, claude, antigravity, aider, grok, qwen, or rotate — who drafts the
@@ -75,9 +81,9 @@ Useful options:
                        prompt in later parallel phases, instead of the same full task
 --task-status-check    In parallel phases, stop agents still working once one marks the objective
                        fully done, instead of letting them redo the same finished work
---reassign-idle        In parallel phases, an agent that finishes while others are still working
-                       gets one extra prompt to pick up different unclaimed work or help a
-                       still-running agent, instead of sitting idle for the round
+--reassign-idle        In parallel phases, the first agent that finishes while ≥2 others are still
+                       on their primary turn gets one extra prompt to pick up unclaimed work or help
+                       a still-running agent; later finishers stay idle (one concurrent bonus max)
 --preflight-timeout S  Set the positive timeout in seconds for each startup connectivity check
                        (default: 90, or 25 with --no-extended-preflight)
 --skip-preflight       Skip startup connectivity checks
@@ -145,6 +151,15 @@ multiline task composer, and a task-outcome box summarizing completed, failed, a
 plus a live code monitor showing files changed during the session and a console panel round out the
 diagnostics. Expand an individual agent pane to inspect its full response.
 
+Once the first task phase completes, phase status lines also show a coarse completion estimate.
+It is derived only from wall time observed in the current run and the remaining scheduled work:
+a parallel phase counts as one wall-time unit, a sequential six-agent relay as six, and each final
+synthesis pass as one. No estimate is shown before there is real timing evidence, and bonus work,
+retries, or unusually different later phases can move it; treat it as an operational ETA, not a
+deadline. Time spent waiting for a provider usage limit to reset is excluded from later latency
+samples, so one blocked agent does not turn the rest of the run's estimates into hour-scale guesses.
+The same estimate appears in plain-mode phase output.
+
 While agents are working, press `i` (or click/tap the "ADD PROMPT [i]" control next to the status
 line) to interrupt and open the same follow-up box used between rounds, without stopping the run.
 Anything you send there is queued rather than applied immediately; it lands in the transcript, and
@@ -178,13 +193,16 @@ completed the task; will review it next phase instead` — rather than letting t
 work. They still get a full turn in the next phase (typically the following review round) to check
 and refine what was done, so nothing is lost, just not redone from scratch.
 
-`--reassign-idle` covers the ordinary case, without anyone declaring the whole thing done: an agent
-that just finishes faster than the other two. Rather than sit idle for the rest of the round, it gets
-one extra prompt — informed by what's already been claimed via `DIBS:` — to either pick up a different
-useful part of the objective or prepare something that helps whichever agents are still working. The
-result lands as its own turn (`proposal · extra`) alongside the normal one. At most one extra attempt
-per agent per phase, and it's cut short if it's still running once the round would otherwise be over,
-so it can add value without ever making the phase wait longer than its slowest primary agent.
+`--reassign-idle` covers the ordinary case, without anyone declaring the whole thing done: the first
+agent that finishes while at least two others are still on their primary turn gets one extra prompt —
+informed by what's already been claimed via `DIBS:` — to either pick up a different useful part of
+the objective or prepare something that helps whichever agents are still working. The result lands
+as its own turn (`proposal · extra`) alongside the normal one. Later finishers stay idle rather than
+starting concurrent bonus turns (which would burn tokens and risk colliding workspace edits), and a
+bonus is not started when only one primary remains (it would almost always be cancelled before
+finishing). The in-flight bonus is cut short if it's still running once the round would otherwise be
+over, so it can add value without ever making the phase wait longer than its slowest primary agent.
+Under `--reasoning-effort auto`, that opportunistic bonus turn is hinted at low effort.
 
 A CLI failure on a real, load-bearing turn (proposal, review, or the final synthesis relay) is
 retried once after a short pause before it's treated as fatal — real-world failures on a long run are
@@ -205,6 +223,11 @@ Final synthesis uses six sequential model calls by default: the chosen synthesiz
 other five agents refine in turn. For a faster, lower-cost run, `--synthesis-passes 1` returns the
 first draft directly; values up to `5` keep that many refinements. The selected `--synthesizer` is
 always the drafter, and the default of six preserves the full roundtable review.
+
+Prompt preparation avoids repeatedly rendering and scanning the same transcript: parallel agents
+share one phase-stable prompt context, and the synthesis relay reuses one transcript rendering
+across all passes. Sequential collaboration still rebuilds it after every turn because each agent
+must see the immediately preceding contribution.
 
 Any resend — after a transient-failure retry or a usage-limit wait — appends a note telling the
 agent to check current progress (`git status`/`git diff`, re-reading relevant files) before doing
