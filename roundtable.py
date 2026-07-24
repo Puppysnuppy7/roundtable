@@ -406,6 +406,12 @@ def transcript(turns: list[Turn], limit: int = 16_000) -> str:
     return "[Earlier content clipped]\n" + rendered if clipped else rendered
 
 
+# Printed by Qwen Code to stderr on every call once --safe-mode is passed (see Agent.command()).
+# Agent.run() merges stderr into the captured answer for all agents, so this fixed banner line is
+# stripped back out rather than leaking into every Qwen turn's content.
+QWEN_SAFE_MODE_BANNER = re.compile(r"^⚠ SAFE MODE.*$\n?", re.MULTILINE)
+
+
 class Agent:
     def __init__(self, name: str, workspace: Path, model: str | None = None,
                  elevated: bool = False, debug: bool = False):
@@ -481,7 +487,12 @@ class Agent:
             # still fails with a misleading "Invalid API-key provided" error. Qwen-oauth is not an
             # option here: it cannot be configured headlessly (confirmed via the CLI's own removal
             # notice for `qwen auth`), so this is the only viable non-interactive auth path.
-            cmd = ["qwen", "-p", prompt, "--output-format", "text", "--auth-type", "openai"]
+            # --safe-mode skips loading hooks/extensions/skills/MCP servers/QWEN.md -- none of
+            # which roundtable relies on or wants silently steering a turn -- and measured ~36%
+            # faster in practice (13.0s -> 8.4s for a trivial reply). It prints a fixed banner line
+            # to stderr, which Agent.run() strips back out (see QWEN_SAFE_MODE_BANNER below).
+            cmd = ["qwen", "-p", prompt, "--output-format", "text", "--auth-type", "openai",
+                   "--safe-mode"]
             cmd += ["--approval-mode", "yolo"] if self.elevated else ["--approval-mode", "auto-edit"]
             if self.model:
                 cmd += ["-m", self.model]
@@ -551,6 +562,8 @@ class Agent:
                 except queue.Empty:
                     break
             raw = "".join(captured).strip()
+            if self.name == "Qwen":
+                raw = QWEN_SAFE_MODE_BANNER.sub("", raw).strip()
             if output_file and output_file.exists():
                 answer = output_file.read_text(encoding="utf-8", errors="replace").strip()
             else:
@@ -2490,15 +2503,18 @@ def build_parser() -> argparse.ArgumentParser:
                         help="enable or disable touchscreen controls (auto-detected by default)")
     parser.add_argument("--preflight-timeout", type=positive_finite_float, default=None,
                         help=f"timeout in seconds for each agent's preflight connectivity check "
-                             f"(default: {DEFAULT_PREFLIGHT_TIMEOUT_SECONDS:g}, or "
-                             f"{EXTENDED_PREFLIGHT_TIMEOUT_SECONDS:g} with --extended-preflight)")
+                             f"(default: {EXTENDED_PREFLIGHT_TIMEOUT_SECONDS:g}, or "
+                             f"{DEFAULT_PREFLIGHT_TIMEOUT_SECONDS:g} with --no-extended-preflight)")
     parser.add_argument("--skip-preflight", action="store_true",
                         help="skip the preliminary system check entirely")
-    parser.add_argument("--extended-preflight", action="store_true",
+    parser.add_argument("--extended-preflight", action=argparse.BooleanOptionalAction, default=True,
                         help=f"use a {EXTENDED_PREFLIGHT_TIMEOUT_SECONDS:g}s preflight timeout "
-                             f"instead of the {DEFAULT_PREFLIGHT_TIMEOUT_SECONDS:g}s default, for "
-                             f"agents with slow but healthy startup (e.g. sandbox/container setup); "
-                             f"ignored if --preflight-timeout is set explicitly")
+                             f"(default: on) instead of the tighter {DEFAULT_PREFLIGHT_TIMEOUT_SECONDS:g}s "
+                             f"-- real agents with slow but healthy startup (e.g. sandbox/container "
+                             f"setup) have been observed exceeding {DEFAULT_PREFLIGHT_TIMEOUT_SECONDS:g}s "
+                             f"with nothing actually wrong. Pass --no-extended-preflight for the "
+                             f"tighter timeout; ignored either way if --preflight-timeout is set "
+                             f"explicitly")
     parser.add_argument("--debug", action="store_true",
                         help="enable verbose diagnostic logging of agent sub-processes, PIDs, exit codes, and tracebacks")
     parser.add_argument("--mock", action="store_true", help=argparse.SUPPRESS)

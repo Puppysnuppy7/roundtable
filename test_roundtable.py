@@ -787,7 +787,19 @@ class RoundtableTests(unittest.TestCase):
         # a valid key still fails with a misleading "Invalid API-key provided" error.
         self.assertIn("--auth-type", command)
         self.assertIn("openai", command)
+        # Measured ~36% faster in practice (13.0s -> 8.4s for a trivial reply); see
+        # QWEN_SAFE_MODE_BANNER for why this is safe to always pass.
+        self.assertIn("--safe-mode", command)
         self.assertEqual(command[-2:], ["-m", "qwen3-coder"])
+
+    def test_qwen_safe_mode_banner_is_stripped_from_the_captured_answer(self):
+        banner = ("⚠ SAFE MODE — all customizations disabled (hooks, extensions, skills, MCP "
+                  "servers, QWEN.md). Restart without --safe-mode to resume normal operation.")
+        self.assertEqual(roundtable.QWEN_SAFE_MODE_BANNER.sub("", f"{banner}\nOK").strip(), "OK")
+        self.assertEqual(roundtable.QWEN_SAFE_MODE_BANNER.sub("", f"OK\n{banner}").strip(), "OK")
+        # A real answer that happens to start with a similar-looking word must survive untouched.
+        self.assertEqual(roundtable.QWEN_SAFE_MODE_BANNER.sub("", "SAFE MODE is a design pattern"),
+                         "SAFE MODE is a design pattern")
 
     def test_elevated_agents_swap_in_each_clis_permission_bypass_flag(self):
         codex = roundtable.Agent("Codex", Path("/tmp/work"), elevated=True)
@@ -936,10 +948,23 @@ class RoundtableTests(unittest.TestCase):
                     roundtable.main()
                 self.assertEqual(raised.exception.code, 2)
 
-    def test_default_preflight_timeout_without_extended_flag(self):
+    def test_preflight_timeout_defaults_to_extended(self):
+        # --extended-preflight defaults on: real agents with healthy but slow startup have been
+        # observed exceeding the tighter 25s default with nothing actually wrong.
         with tempfile.TemporaryDirectory() as td:
             argv = ["roundtable", "Solve it", "--plain", "-r", "0", "--mock",
                     "-C", td, "--output-dir", str(Path(td) / "out")]
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(roundtable, "run_preflight") as mock_preflight, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(roundtable.main(), 0)
+                self.assertEqual(mock_preflight.call_args[1].get("timeout"),
+                                 roundtable.EXTENDED_PREFLIGHT_TIMEOUT_SECONDS)
+
+    def test_no_extended_preflight_flag_uses_the_tighter_timeout(self):
+        with tempfile.TemporaryDirectory() as td:
+            argv = ["roundtable", "Solve it", "--plain", "-r", "0", "--mock",
+                    "-C", td, "--output-dir", str(Path(td) / "out"), "--no-extended-preflight"]
             with mock.patch.object(sys, "argv", argv), \
                  mock.patch.object(roundtable, "run_preflight") as mock_preflight, \
                  contextlib.redirect_stdout(io.StringIO()):

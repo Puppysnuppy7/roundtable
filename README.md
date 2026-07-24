@@ -74,10 +74,12 @@ Useful options:
                        gets one extra prompt to pick up different unclaimed work or help a
                        still-running agent, instead of sitting idle for the round
 --preflight-timeout S  Set the positive timeout in seconds for each startup connectivity check
-                       (default: 25, or 90 with --extended-preflight)
+                       (default: 90, or 25 with --no-extended-preflight)
 --skip-preflight       Skip startup connectivity checks
---extended-preflight   Use a 90s preflight timeout instead of the 25s default, for agents with
-                       slow but healthy startup (e.g. sandbox/container setup); ignored if
+--extended-preflight   Use a 90s preflight timeout (default: on) instead of the tighter 25s;
+                       real agents with slow but healthy startup (e.g. sandbox/container setup)
+                       have been observed exceeding 25s with nothing actually wrong. Pass
+                       --no-extended-preflight for the tighter timeout; either way, ignored if
                        --preflight-timeout is set explicitly
 --debug                Enable verbose diagnostic logging of sub-process commands, PIDs, exit codes, and tracebacks
 --elevated AGENT       Run codex, claude, antigravity, aider, grok, qwen, or all with that CLI's
@@ -100,8 +102,8 @@ roundtable --resume .roundtable/roundtable-20260718-120000-000000.json \
 Without follow-up text, fullscreen mode opens the follow-up editor. Plain or piped mode requires the
 follow-up as an argument or on standard input.
 
-Before the real task starts, all six CLIs get a quick "reply OK" preflight check (25s timeout each
-by default, run in parallel). This exists so a hung or unauthenticated CLI fails fast with a named
+Before the real task starts, all six CLIs get a quick "reply OK" preflight check (90s timeout each
+by default, run concurrently). This exists so a hung or unauthenticated CLI fails fast with a named
 reason instead of leaving every panel stuck on "waiting for task" with no explanation. Override the
 per-agent timeout with `--preflight-timeout`, or skip the check entirely with `--skip-preflight` if
 you already know the CLIs are reachable. A provider session/usage-limit response is treated as
@@ -111,8 +113,14 @@ agent waits until it becomes available again.
 Some agents are just slow to answer even a trivial check without anything being wrong — sandboxed
 agents in particular can spend most of that time on their own startup overhead (e.g. Antigravity's
 sandbox, or Aider/Qwen against certain providers) rather than the model call itself. `--extended-preflight`
-swaps the default 25s timeout for a more generous 90s so a slow-but-healthy agent isn't misreported
-as failed; explicit `--preflight-timeout` still takes precedence if you set both.
+is on by default for exactly this reason; pass `--no-extended-preflight` for the tighter 25s if you'd
+rather fail fast. Explicit `--preflight-timeout` takes precedence over either.
+
+Launching all six agent subprocesses in the same instant can itself cause a real CPU/memory
+contention spike on modest hardware, pushing every agent's response past its timeout — including ones
+that are individually fast. To avoid that, agent subprocesses are staggered by a fraction of a second
+each rather than all spawned at once; they still all run concurrently overall, and each agent's own
+timeout clock only starts once its own call actually begins, so nobody's effective budget shrinks.
 
 The fullscreen view provides evenly spaced live Codex, Claude, Antigravity, Aider, Grok, and Qwen
 panes, independent working/waiting states, and agent-specific activity tickers next to agent names
