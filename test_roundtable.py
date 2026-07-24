@@ -452,6 +452,14 @@ class RoundtableTests(unittest.TestCase):
                     lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()),
                     lambda *_: None, "working")
             self.assertEqual(WaitingAgent.stopped, 3)
+            self.assertTrue(all(agent.cancel_event is None for _, agent in agents))
+
+    def test_phase_cancellation_does_not_clear_a_replacement_event(self):
+        agent = roundtable.MockAgent("Codex", Path("/tmp"))
+        replacement = threading.Event()
+        with roundtable._phase_cancellation([("Codex", agent)]):
+            agent.cancel_event = replacement
+        self.assertIs(agent.cancel_event, replacement)
 
     def test_run_preflight_staggers_agent_start_times(self):
         # Regression coverage for the actual mechanism (setUp patches AGENT_SPAWN_STAGGER_SECONDS
@@ -578,6 +586,10 @@ class RoundtableTests(unittest.TestCase):
             self.assertEqual([t.speaker for t in session.turns],
                              list(roundtable.AGENT_NAMES) + list(roundtable.AGENT_NAMES) + ["Final"])
             self.assertTrue(session.final)
+            for turn in session.turns[:-1]:
+                self.assertTrue(turn.content.endswith(f"Signed: {turn.speaker}"))
+            final_signers = session.final.rsplit("Signed by: ", 1)[-1].split(", ")
+            self.assertEqual(set(final_signers), set(roundtable.AGENT_NAMES))
 
     def test_prompt_contains_other_agent(self):
         turns = [roundtable.Turn("Claude", "proposal", "Use a queue")]
@@ -624,6 +636,59 @@ class RoundtableTests(unittest.TestCase):
         run_log = roundtable.RunLog(None)
         run_log.write("phase", "should not raise")
         run_log.close()
+
+    def test_run_context_logs_reproducibility_details_but_not_environment(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "activity.log"
+            run_log = roundtable.RunLog(path)
+            args = roundtable.argparse.Namespace(
+                output_dir=td, plain=True, mock=True, collab="parallel",
+                synthesizer="rotate", synthesis_passes=3, reasoning_effort="auto",
+                balance_load=True, task_status_check=False, reassign_idle=True,
+                skip_preflight=True, preflight_timeout=25, extended_preflight=False,
+                touch_mode=False, debug=False)
+            agent = roundtable.Agent("Codex", Path(td), "test-model")
+            session = roundtable.Session("Sensitive objective", td, 1, "now", [])
+            with mock.patch.dict(os.environ, {"ROUND_TABLE_TEST_SECRET": "must-not-appear"}):
+                roundtable.log_run_context(
+                    run_log, args, session, [agent], resumed=True,
+                    completed_phases={"proposal"})
+            run_log.close()
+            logged = path.read_text()
+        self.assertIn('"objective_sha256"', logged)
+        self.assertIn('"test-model"', logged)
+        self.assertIn('"completed_phases"', logged)
+        self.assertIn('"proposal"', logged)
+        self.assertIn('"roundtable_source"', logged)
+        self.assertIn('"workspace_git"', logged)
+        self.assertIn("environment variables and credentials intentionally omitted", logged)
+        self.assertNotIn("ROUND_TABLE_TEST_SECRET", logged)
+        self.assertNotIn("must-not-appear", logged)
+
+    def test_agent_streams_every_burst_output_line_and_logs_lifecycle(self):
+        class BurstAgent(roundtable.Agent):
+            def command(self, prompt, output_file=None, no_edit=False):
+                return [
+                    sys.executable, "-c",
+                    "print('alpha'); print('beta'); print('gamma')",
+                    prompt,
+                ]
+
+        with tempfile.TemporaryDirectory() as td:
+            agent = BurstAgent("Claude", Path(td))
+            ticks = []
+            diagnostics = []
+            agent.log_diagnostic = diagnostics.append
+            answer = agent.run("private prompt text", ticks.append)
+        self.assertEqual(answer.splitlines(), ["alpha", "beta", "gamma"])
+        self.assertTrue({"alpha", "beta", "gamma"}.issubset(set(ticks)))
+        joined = "\n".join(diagnostics)
+        self.assertIn("launch cwd=", joined)
+        self.assertIn("<prompt chars=19 sha256=", joined)
+        self.assertNotIn("private prompt text", joined)
+        self.assertIn("started pid=", joined)
+        self.assertIn("captured_lines=3", joined)
+        self.assertIn("completed successfully", joined)
 
     def test_log_path_for_pairs_with_transcript_stem(self):
         with tempfile.TemporaryDirectory() as td:
@@ -768,6 +833,9 @@ class RoundtableTests(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertIn("boom: simulated failure", stderr.getvalue())
             self.assertNotIn("Traceback", stderr.getvalue())
+            log = next((Path(td) / "out").glob("*.log")).read_text()
+            self.assertIn("Traceback (most recent call last)", log)
+            self.assertIn("boom: simulated failure", log)
 
     def test_antigravity_command_is_sandboxed_and_noninteractive(self):
         agent = roundtable.Agent("Antigravity", Path("/tmp/work"), "antigravity-model")
@@ -777,15 +845,27 @@ class RoundtableTests(unittest.TestCase):
         self.assertIn("--sandbox", command)
         self.assertEqual(command[-2:], ["--model", "antigravity-model"])
 
-    def test_aider_command_is_noninteractive_and_never_touches_git(self):
-        agent = roundtable.Agent("Aider", Path("/tmp/work"), "mistral/codestral-latest")
-        command = agent.command("Solve this")
+    def test_aider_command_uses_repo_context_without_automatic_commits(self):
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            (workspace / ".git").mkdir()
+            (workspace / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+            agent = roundtable.Agent("Aider", workspace, "mistral/codestral-latest")
+            command = agent.command("Solve this")
         self.assertEqual(command[:3], ["aider", "--message", "Solve this"])
         self.assertIn("--yes-always", command)
-        self.assertIn("--no-git", command)
+        self.assertNotIn("--no-git", command)
+        self.assertIn("--no-auto-commits", command)
+        self.assertIn("--no-dirty-commits", command)
+        self.assertIn("--no-gitignore", command)
         self.assertIn("--no-suggest-shell-commands", command)
         self.assertNotIn("--edit-format", command)
         self.assertEqual(command[-2:], ["--model", "mistral/codestral-latest"])
+
+    def test_aider_command_does_not_create_git_in_a_non_repository_workspace(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = roundtable.Agent("Aider", Path(td))
+            self.assertIn("--no-git", agent.command("Solve this"))
 
     def test_aider_command_bounds_each_api_call_with_a_timeout(self):
         # Observed in practice: Aider's own default (unbounded) hung 45+ minutes on a single API
@@ -900,6 +980,7 @@ class RoundtableTests(unittest.TestCase):
         self.assertTrue(ready)
         self.assertEqual(agent.commands[0][agent.commands[0].index("--effort") + 1], "low")
         self.assertIsNone(agent.suggested_effort)
+        self.assertIsNone(agent.cancel_event)
 
     def test_synthesis_auto_effort_is_medium_and_restores_agent_state(self):
         class RecordingAgent(roundtable.Agent):
@@ -1913,7 +1994,8 @@ class RoundtableTests(unittest.TestCase):
             statuses = []
             result = roundtable.synthesize(session, order, lambda *_: None,
                                            lambda active, message: statuses.append((tuple(active), message)))
-            self.assertEqual(result, "Antigravity's version")
+            self.assertEqual(
+                result, "Antigravity's version\n\nSigned by: Claude, Codex, Antigravity")
             self.assertEqual([name for name, _ in seen_prompts], ["Claude", "Codex", "Antigravity"])
             self.assertIn("final editor", seen_prompts[0][1].lower())
             self.assertIn("CURRENT DRAFT FINAL ANSWER", seen_prompts[1][1])
@@ -1922,6 +2004,70 @@ class RoundtableTests(unittest.TestCase):
             self.assertEqual(statuses[0], (("Claude",), "Claude is drafting the final answer"))
             self.assertEqual(statuses[1], (("Codex",), "Codex is refining the final answer"))
             self.assertEqual(statuses[-1], ((), "Final answer complete"))
+
+    def test_synthesize_keeps_last_good_draft_when_a_refiner_fails(self):
+        class RefiningAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                if self.name == "Antigravity":
+                    raise RuntimeError(
+                        "Antigravity exited with status 1\ntimeout waiting for response")
+                return f"{self.name}'s version"
+
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            session = roundtable.Session("Goal", td, 0, "now", [])
+            order = [
+                ("Claude", RefiningAgent("Claude", workspace)),
+                ("Antigravity", RefiningAgent("Antigravity", workspace)),
+                ("Codex", RefiningAgent("Codex", workspace)),
+            ]
+            ticks = []
+            completed = []
+            result = roundtable.synthesize(
+                session, order, lambda name, line: ticks.append((name, line)),
+                lambda *_: None, step_complete=completed.append)
+        self.assertEqual(result, "Codex's version\n\nSigned by: Claude, Codex")
+        self.assertIn(
+            ("Antigravity", "refinement skipped after failure: timeout waiting for response"),
+            ticks)
+        self.assertEqual(completed, [1, 1, 1])
+
+    def test_sign_agent_work_does_not_duplicate_an_existing_signature(self):
+        self.assertEqual(
+            roundtable.sign_agent_work("Codex", "Finished.\n\nSigned: Codex"),
+            "Finished.\n\nSigned: Codex")
+
+    def test_failed_refiner_is_absent_from_final_signature(self):
+        class Agent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                if self.name == "Aider":
+                    raise RuntimeError("Aider exited with status 1\nprovider failed")
+                return f"{self.name} result"
+
+        with tempfile.TemporaryDirectory() as td:
+            order = [(name, Agent(name, Path(td))) for name in ("Claude", "Aider")]
+            result = roundtable.synthesize(
+                roundtable.Session("Goal", td, 0, "now", []),
+                order, lambda *_: None, lambda *_: None)
+        self.assertTrue(result.endswith("Signed by: Claude"))
+        self.assertNotIn("Signed by: Claude, Aider", result)
+
+    def test_synthesize_still_retries_and_fails_when_the_initial_drafter_fails(self):
+        class FailingAgent(roundtable.Agent):
+            attempts = 0
+
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                type(self).attempts += 1
+                raise RuntimeError("Claude exited with status 1\ntimeout waiting for response")
+
+        with tempfile.TemporaryDirectory() as td:
+            agent = FailingAgent("Claude", Path(td))
+            with mock.patch.object(roundtable.time, "sleep"):
+                with self.assertRaisesRegex(RuntimeError, "timeout waiting for response"):
+                    roundtable.synthesize(
+                        roundtable.Session("Goal", td, 0, "now", []),
+                        [("Claude", agent)], lambda *_: None, lambda *_: None)
+        self.assertEqual(FailingAgent.attempts, 2)
 
     def test_synthesis_renders_unchanged_transcript_once_for_all_passes(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1969,6 +2115,14 @@ class RoundtableTests(unittest.TestCase):
         ]
         self.assertEqual(roundtable.extract_dibs(turns),
                          {"Codex": "the retry logic", "Claude": "the docs"})
+
+    def test_extract_dibs_handles_markdown_formatting(self):
+        turns = [
+            roundtable.Turn("Codex", "proposal", "**DIBS: the auth flow**\nDid the work."),
+            roundtable.Turn("Claude", "proposal", "`DIBS: the docs`\nWrote the docs."),
+        ]
+        self.assertEqual(roundtable.extract_dibs(turns),
+                         {"Codex": "the auth flow", "Claude": "the docs"})
 
     def test_extract_dibs_does_not_allocate_a_lowercase_copy_before_regex_search(self):
         class NoLowerCopy(str):
@@ -2073,6 +2227,9 @@ class RoundtableTests(unittest.TestCase):
         self.assertTrue(roundtable.signals_task_complete("All done.\nTASK STATUS: complete"))
         self.assertTrue(roundtable.signals_task_complete("All done.\ntask status: COMPLETE  "))
         self.assertTrue(roundtable.signals_task_complete("All done.\nTASK STATUS: complete\n\n"))
+        self.assertTrue(roundtable.signals_task_complete("All done.\n`TASK STATUS: complete`"))
+        self.assertTrue(roundtable.signals_task_complete("All done.\n**TASK STATUS: complete**"))
+        self.assertTrue(roundtable.signals_task_complete("All done.\nTASK STATUS: complete."))
         self.assertFalse(roundtable.signals_task_complete("All done.\nTASK STATUS: in-progress"))
         self.assertFalse(roundtable.signals_task_complete("Still working on it."))
         buried = "TASK STATUS: complete" + ("x" * 400)
@@ -2427,6 +2584,22 @@ class RoundtableTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "still broken"):
                 roundtable._run_with_retry(agent, "prompt", lambda _: None)
         self.assertEqual(AlwaysFailsAgent.attempts, 2)
+
+    def test_run_with_retry_can_disable_transient_retries(self):
+        class AlwaysFailsAgent(roundtable.Agent):
+            attempts = 0
+
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                type(self).attempts += 1
+                raise RuntimeError(f"{self.name} exited with status 1\nstill broken")
+
+        agent = AlwaysFailsAgent("Codex", Path("/tmp"))
+        with mock.patch.object(roundtable.time, "sleep") as sleep_mock:
+            with self.assertRaisesRegex(RuntimeError, "still broken"):
+                roundtable._run_with_retry(
+                    agent, "prompt", lambda _: None, transient_retries=0)
+        self.assertEqual(AlwaysFailsAgent.attempts, 1)
+        sleep_mock.assert_not_called()
 
     def test_run_with_retry_never_retries_a_deliberate_cancellation(self):
         class CancelledAgent(roundtable.Agent):
@@ -2903,6 +3076,7 @@ class RoundtableTests(unittest.TestCase):
              mock.patch("roundtable.conduct", side_effect=stub_conduct), \
              mock.patch("roundtable.read_followup_ui", return_value=""), \
              mock.patch("roundtable.save_session", return_value=("/tmp/s.json", "/tmp/s.md")), \
+             mock.patch("roundtable.finalize_agent_prompt_file") as finalize_board, \
              mock.patch("roundtable.suppress_focus_reporting"):
             ret = roundtable.run_tui(stdscr, args, session, None, None, None, None, None, None,
                                      resumed=False)
@@ -2910,6 +3084,7 @@ class RoundtableTests(unittest.TestCase):
         self.assertEqual(ret, 0)
         self.assertEqual(prompts_at_dispatch, [[], ["Post-synthesis request"]])
         self.assertEqual(session.queued_prompts, [])
+        finalize_board.assert_called_once()
 
     def test_run_tui_self_restart_preserves_active_followup_state(self):
         session = roundtable.Session("Task", "/tmp", 0, "now", [])
@@ -2937,6 +3112,7 @@ class RoundtableTests(unittest.TestCase):
              mock.patch("roundtable.save_session",
                         return_value=(session_path, Path("/tmp/session.md"))), \
              mock.patch("roundtable.restart_self") as mock_restart, \
+             mock.patch("roundtable.finalize_agent_prompt_file") as finalize_board, \
              mock.patch("roundtable.curses.endwin"), \
              mock.patch("roundtable.suppress_focus_reporting"):
             ret = roundtable.run_tui(
@@ -2946,6 +3122,7 @@ class RoundtableTests(unittest.TestCase):
         self.assertEqual(ret, 0)
         self.assertEqual(calls, 1)
         mock_restart.assert_called_once_with(args, session_path, False)
+        finalize_board.assert_not_called()
 
     def test_run_tui_restart_continuation_skips_the_followup_prompt(self):
         """Regression: main() passes resumed=True for a --continue-after-restart followup relaunch
@@ -3071,6 +3248,29 @@ class RoundtableTests(unittest.TestCase):
             path.write_text("existing peer note", encoding="utf-8")
             roundtable.ensure_agent_prompt_file(workspace)
             self.assertEqual(path.read_text(encoding="utf-8"), "existing peer note")
+
+    def test_finalize_agent_prompt_file_archives_then_resets_existing_board(self):
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            board = roundtable.ensure_agent_prompt_file(workspace)
+            board.write_text(
+                f"{roundtable.AGENT_PROMPT_TEMPLATE}\n## From Codex to all — result\nPassed.\n",
+                encoding="utf-8")
+            log_path = workspace / "run.log"
+            run_log = roundtable.RunLog(log_path)
+            roundtable.finalize_agent_prompt_file(workspace, run_log)
+            run_log.close()
+            self.assertEqual(board.read_text(encoding="utf-8"),
+                             roundtable.AGENT_PROMPT_TEMPLATE)
+            logged = log_path.read_text(encoding="utf-8")
+            self.assertIn("From Codex to all — result", logged)
+            self.assertIn("Reset", logged)
+
+    def test_reset_agent_prompt_file_does_not_create_a_missing_board(self):
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            self.assertFalse(roundtable.reset_agent_prompt_file(workspace))
+            self.assertFalse((workspace / roundtable.AGENT_PROMPT_FILE).exists())
 
     def test_prompt_for_includes_agent_prompt_board_hint_for_agents_only(self):
         prompt = roundtable.prompt_for("Objective", [], "proposal", "Codex")

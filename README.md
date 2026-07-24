@@ -169,6 +169,12 @@ Acknowledged queued task: …"), rotating through whichever agents are currently
 acknowledgment isn't always attributed to the same one. After an answer, a follow-up text box lets
 you keep the same roundtable conversation going. Complete transcripts are written to `.roundtable/`.
 
+Agents can also coordinate through the append-only `AGENT_PROMPTS.md` board in the workspace.
+It remains available through every phase, follow-up, and internal `--self` checkpoint restart in
+one logical run. On a terminal exit—successful, cancelled, or failed—Roundtable copies the complete
+board into the private activity log and resets the workspace file to its clean template, preventing
+stale claims, old test counts, or obsolete requests from steering the next run.
+
 The console opens on **key events** — phase changes, completed turns, and errors — instead of a
 firehose of every raw line each CLI prints, so the signal-dense view is the default. Press `c` to
 cycle it through **all activity** (adds raw per-line ticks), **prompts** (just what was sent to each
@@ -204,10 +210,12 @@ finishing). The in-flight bonus is cut short if it's still running once the roun
 over, so it can add value without ever making the phase wait longer than its slowest primary agent.
 Under `--reasoning-effort auto`, that opportunistic bonus turn is hinted at low effort.
 
-A CLI failure on a real, load-bearing turn (proposal, review, or the final synthesis relay) is
-retried once after a short pause before it's treated as fatal — real-world failures on a long run are
-often a transient rate limit or network timeout partway through a long chain of tool calls, not a
-broken prompt, and a short retry recovers most of them. A deliberate stop (Ctrl+C, or
+A CLI failure on a real, load-bearing proposal, review, or initial final-draft turn is retried once
+after a short pause before it's treated as fatal — real-world failures on a long run are often a
+transient rate limit or network timeout partway through a long chain of tool calls, not a broken
+prompt, and a short retry recovers most of them. Once final synthesis has a valid draft, a failed
+optional refiner is skipped without a second full-timeout attempt; later refiners continue from the
+last good draft, so one unavailable provider cannot discard the completed result. A deliberate stop (Ctrl+C, or
 `--task-status-check` cutting an agent off) is never retried, since that agent wasn't trying to finish
 in the first place. Provider usage/session limits have a separate recovery path: Roundtable keeps the
 agent's turn pending and, when the provider's own message names a reset time (e.g. "resets 5:30pm
@@ -222,7 +230,10 @@ and remains cancellable with Ctrl+C (or by `--task-status-check`).
 Final synthesis uses six sequential model calls by default: the chosen synthesizer drafts, then the
 other five agents refine in turn. For a faster, lower-cost run, `--synthesis-passes 1` returns the
 first draft directly; values up to `5` keep that many refinements. The selected `--synthesizer` is
-always the drafter, and the default of six preserves the full roundtable review.
+always the drafter, and the default of six preserves the full roundtable review. Every stored
+proposal, review, and extra contribution ends with `Signed: <agent>`. The final answer ends with
+`Signed by:` listing the successful synthesis participants in relay order; failed or skipped
+refiners are not credited.
 
 Prompt preparation avoids repeatedly rendering and scanning the same transcript: parallel agents
 share one phase-stable prompt context, and the synthesis relay reuses one transcript rendering
@@ -241,10 +252,16 @@ The same key, a click on the expanded panel, or `Esc`/`q` collapses it back to t
 shortcuts are only live while agents are working (not while typing a follow-up, so digits still type
 normally there); clicking a panel works in both.
 
-Every run also writes `.roundtable/roundtable-<stamp>.log` — the same activity the console panel
-shows, plus the **full prompt sent to each agent** (not just a truncated summary), so you can
-`tail -f` a live run or grep a completed one for detail `--mock` never produces: real exit codes,
-empty responses, auth failures, timeouts. It shares a filename stem with that session's `.json`/`.md`
+Every run also writes `.roundtable/roundtable-<stamp>.log`. It records the full prompt and every
+subprocess output line without the dashboard's truncation or sampling, plus reproducibility
+configuration, source-file hash and timestamp, Git HEAD and complete short worktree status,
+executable paths, models, reasoning settings, process IDs/groups, sanitized command arguments,
+start/exit timing, output and answer sizes, retry classification, cancellation signals, phase
+transitions, artifact paths, and full exception tracebacks. Environment variables, credentials,
+and authentication tokens are deliberately excluded; prompt arguments in command records are
+replaced by their length and SHA-256 fingerprint because the complete prompt already has its own
+record. You can `tail -f` a live run or grep a completed one for real exit codes, empty responses,
+auth failures, and timeouts. The log shares a filename stem with the session's `.json`/`.md`
 transcript and is created in both fullscreen and `--plain` modes.
 
 Text-box controls:
@@ -281,9 +298,11 @@ and may edit it, so use a version-controlled project and review the resulting di
 defaults ask the agent to confirm file edits, but they do stop it short of running arbitrary shell
 commands unsandboxed or unconfirmed — in headless mode that can surface as an agent silently
 declining a step it needed (for example Antigravity soft-denying a `Bash` tool call and returning a
-short explanation instead of real output). Aider is also always run with `--no-git`, so it never
-auto-creates a git repo or auto-commits in your workspace on your behalf, regardless of the
-`--elevated` setting below. Qwen is deliberately never run with its own `--sandbox` flag: verified
+short explanation instead of real output). Aider discovers an existing git repository so its model
+receives a repository map, but Roundtable disables Aider's automatic clean-tree and dirty-tree
+commits as well as its automatic `.gitignore` edits; in a non-repository workspace it retains
+`--no-git` so unattended operation cannot initialize one. Qwen is deliberately never run with its
+own `--sandbox` flag: verified
 against the real CLI, that flag launches a container-backed sandbox and hangs indefinitely rather
 than failing cleanly when no container runtime is reachable, so its approval mode is the only gate
 by default.
