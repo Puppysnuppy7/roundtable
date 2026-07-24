@@ -874,6 +874,26 @@ class RoundtableTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "turn 0"):
                 roundtable.load_session(path)
 
+    def test_load_session_rejects_malformed_queued_prompts_instead_of_losing_them(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = {"objective": "Goal", "workspace": td, "rounds": 1,
+                    "started_at": "now", "turns": []}
+            path = Path(td) / "bad.json"
+            for queued_prompts in ("retry this", ["valid", 3]):
+                with self.subTest(queued_prompts=queued_prompts):
+                    path.write_text(json.dumps({**base, "queued_prompts": queued_prompts}))
+                    with self.assertRaisesRegex(ValueError, "queued_prompts"):
+                        roundtable.load_session(path)
+
+    def test_load_session_keeps_compatibility_with_sessions_without_queued_prompts(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "old.json"
+            path.write_text(json.dumps({
+                "objective": "Goal", "workspace": td, "rounds": 1,
+                "started_at": "now", "turns": [],
+            }))
+            self.assertEqual(roundtable.load_session(path).queued_prompts, [])
+
     def test_plain_mode_reports_agent_failure_without_traceback(self):
         with tempfile.TemporaryDirectory() as td:
             argv = ["roundtable", "Solve it", "--plain", "-r", "0",
@@ -2486,6 +2506,66 @@ class RoundtableTests(unittest.TestCase):
                                            lambda *_: None, "Working")
             self.assertEqual({turn.speaker for turn in session.turns}, {"Codex", "Claude", "Antigravity"})
 
+    def test_run_parallel_phase_records_completion_from_the_last_finisher(self):
+        """Regression: remaining==empty must not prevent completed_by from being returned.
+
+        The last agent to finish has no peers left to cancel, but conduct still needs the
+        completer's name so it can skip further reviews and prefer that agent as drafter.
+        """
+        others_finished = threading.Event()
+        finished_count = [0]
+        finished_lock = threading.Lock()
+
+        class SlowDoneAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                if self.name == "Claude":
+                    # Wait for both peers instead of racing a sleep duration against theirs, so
+                    # this test can't flip under system load (e.g. a busy CI box or, as here, other
+                    # agents' CLI processes sharing the machine).
+                    others_finished.wait(timeout=5)
+                    return "Claude finished last.\nTASK STATUS: complete"
+                with finished_lock:
+                    finished_count[0] += 1
+                    if finished_count[0] == 2:
+                        others_finished.set()
+                return f"{self.name} still working — not done yet."
+
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            session = roundtable.Session("Last finisher", td, 0, "now", [])
+            agents = [(name, SlowDoneAgent(name, workspace))
+                      for name in ("Codex", "Claude", "Antigravity")]
+            ticks = []
+            completed_by = roundtable._run_parallel_phase(
+                session, agents, "proposal",
+                lambda speaker, line: ticks.append((speaker, line)),
+                lambda *_: None, "Working", task_status_check=True, stagger=0,
+            )
+            self.assertEqual(completed_by, "Claude")
+            self.assertEqual({turn.speaker for turn in session.turns},
+                             {"Codex", "Claude", "Antigravity"})
+            self.assertTrue(any(speaker == "Claude" and "marked the task complete" in line
+                                for speaker, line in ticks))
+
+    def test_run_parallel_phase_records_completion_when_every_agent_finishes_together(self):
+        """Same-poll finish of all agents used to leave remaining empty before any check ran."""
+        class InstantDoneAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                return f"{self.name} done.\nTASK STATUS: complete"
+
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            session = roundtable.Session("All at once", td, 0, "now", [])
+            agents = [(name, InstantDoneAgent(name, workspace))
+                      for name in ("Codex", "Claude", "Antigravity")]
+            completed_by = roundtable._run_parallel_phase(
+                session, agents, "proposal", lambda *_: None, lambda *_: None, "Working",
+                task_status_check=True, stagger=0,
+            )
+            self.assertEqual(completed_by, "Codex")
+            self.assertEqual({turn.speaker for turn in session.turns},
+                             {"Codex", "Claude", "Antigravity"})
+
     def test_reassign_idle_gives_a_finished_agent_extra_work_while_others_run(self):
         calls = {"Codex": 0}
 
@@ -3123,6 +3203,32 @@ class RoundtableTests(unittest.TestCase):
             self.assertEqual({t.speaker: t.content for t in session.turns}["Antigravity"],
                              roundtable.sign_agent_work("Antigravity", "Antigravity content after retry"))
 
+    def test_run_parallel_phase_drops_an_agent_that_fails_after_retries_instead_of_crashing(self):
+        # Regression test: a single agent exhausting its retry budget (e.g. a persistent CLI
+        # timeout) must not crash the whole phase and discard peers that already finished —
+        # this is what happened to a real run when Antigravity failed twice near the end of a
+        # phase after Codex, Claude, and Qwen had already completed successfully.
+        class PersistentlyFlakyAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                if self.name == "Antigravity":
+                    raise RuntimeError("Antigravity exited with status 1\ntimeout waiting for response")
+                return f"{self.name} content"
+
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            session = roundtable.Session("Goal", td, 0, "now", [])
+            agents = [(name, PersistentlyFlakyAgent(name, workspace))
+                     for name in ("Codex", "Claude", "Antigravity")]
+            with mock.patch.object(roundtable.time, "sleep"):
+                roundtable._run_parallel_phase(session, agents, "proposal", lambda *_: None,
+                                               lambda *_: None, "Working")
+            turns_by_speaker = {t.speaker: t.content for t in session.turns}
+            self.assertNotIn("Antigravity", turns_by_speaker)
+            self.assertEqual(turns_by_speaker["Codex"],
+                             roundtable.sign_agent_work("Codex", "Codex content"))
+            self.assertEqual(turns_by_speaker["Claude"],
+                             roundtable.sign_agent_work("Claude", "Claude content"))
+
     def test_save_stems_include_microseconds(self):
         with tempfile.TemporaryDirectory() as td:
             one = roundtable.Session("Goal", td, 0, "2026-01-01T00:00:00.000001+00:00", [])
@@ -3600,7 +3706,7 @@ class RoundtableTests(unittest.TestCase):
             roundtable.ensure_agent_prompt_file(workspace)
             self.assertEqual(path.read_text(encoding="utf-8"), "existing peer note")
 
-    def test_finalize_agent_prompt_file_archives_then_resets_existing_board(self):
+    def test_finalize_agent_prompt_file_archives_without_resetting_the_board(self):
         with tempfile.TemporaryDirectory() as td:
             workspace = Path(td)
             board = roundtable.ensure_agent_prompt_file(workspace)
@@ -3611,17 +3717,76 @@ class RoundtableTests(unittest.TestCase):
             run_log = roundtable.RunLog(log_path)
             roundtable.finalize_agent_prompt_file(workspace, run_log)
             run_log.close()
-            self.assertEqual(board.read_text(encoding="utf-8"),
-                             roundtable.AGENT_PROMPT_TEMPLATE)
+            # Archiving is diagnostic-only now; the reset happens when the next fresh run starts
+            # (start_agent_prompt_file), not here, so a hard kill that skips this function can't
+            # leave the next run's reset undone.
+            self.assertIn("## From Codex to all — result", board.read_text(encoding="utf-8"))
             logged = log_path.read_text(encoding="utf-8")
             self.assertIn("From Codex to all — result", logged)
-            self.assertIn("Reset", logged)
 
     def test_reset_agent_prompt_file_does_not_create_a_missing_board(self):
         with tempfile.TemporaryDirectory() as td:
             workspace = Path(td)
             self.assertFalse(roundtable.reset_agent_prompt_file(workspace))
             self.assertFalse((workspace / roundtable.AGENT_PROMPT_FILE).exists())
+
+    def test_start_agent_prompt_file_fresh_resets_existing_content(self):
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            path = workspace / roundtable.AGENT_PROMPT_FILE
+            path.write_text("stale content from a hard-killed earlier run", encoding="utf-8")
+            roundtable.start_agent_prompt_file(workspace, fresh=True)
+            self.assertEqual(path.read_text(encoding="utf-8"), roundtable.AGENT_PROMPT_TEMPLATE)
+
+    def test_start_agent_prompt_file_fresh_creates_missing_board(self):
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            roundtable.start_agent_prompt_file(workspace, fresh=True)
+            path = workspace / roundtable.AGENT_PROMPT_FILE
+            self.assertEqual(path.read_text(encoding="utf-8"), roundtable.AGENT_PROMPT_TEMPLATE)
+
+    def test_start_agent_prompt_file_not_fresh_preserves_existing_content(self):
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            path = workspace / roundtable.AGENT_PROMPT_FILE
+            path.write_text("peer notes from before this --self restart", encoding="utf-8")
+            roundtable.start_agent_prompt_file(workspace, fresh=False)
+            self.assertEqual(path.read_text(encoding="utf-8"),
+                             "peer notes from before this --self restart")
+
+    def test_start_agent_prompt_file_not_fresh_creates_missing_board(self):
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            roundtable.start_agent_prompt_file(workspace, fresh=False)
+            path = workspace / roundtable.AGENT_PROMPT_FILE
+            self.assertEqual(path.read_text(encoding="utf-8"), roundtable.AGENT_PROMPT_TEMPLATE)
+
+    def test_conduct_resets_the_board_for_a_fresh_run_but_not_a_restart(self):
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            path = workspace / roundtable.AGENT_PROMPT_FILE
+            path.write_text("leftover board content", encoding="utf-8")
+
+            # completed_phases set: a --self restart continuing an in-progress run must not
+            # touch peer notes already left on the board.
+            session = roundtable.Session(
+                "Goal", td, 0, "now",
+                [roundtable.Turn("Codex", "proposal", "done"),
+                 roundtable.Turn("Final", "consensus", "Completed\n\nDone")],
+                "Completed\n\nDone")
+            agents = [roundtable.MockAgent(name, workspace) for name in roundtable.AGENT_NAMES]
+            roundtable.conduct(session, *agents, lambda *_: None, lambda *_: None,
+                               completed_phases={"proposal", "consensus"})
+            self.assertEqual(path.read_text(encoding="utf-8"), "leftover board content")
+
+            # completed_phases=None: a brand-new run (or a plain --resume) must start clean, in
+            # case the previous run was killed before it could archive/reset anything itself.
+            path.write_text("leftover board content", encoding="utf-8")
+            session = roundtable.Session("Goal", td, 0, "now", [])
+            agents = [roundtable.MockAgent(name, workspace) for name in roundtable.AGENT_NAMES]
+            roundtable.conduct(session, *agents, lambda *_: None, lambda *_: None,
+                               completed_phases=None)
+            self.assertEqual(path.read_text(encoding="utf-8"), roundtable.AGENT_PROMPT_TEMPLATE)
 
     def test_prompt_for_includes_agent_prompt_board_hint_for_agents_only(self):
         prompt = roundtable.prompt_for("Objective", [], "proposal", "Codex")

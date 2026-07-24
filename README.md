@@ -177,8 +177,11 @@ you keep the same roundtable conversation going. Complete transcripts are writte
 Agents can also coordinate through the append-only `AGENT_PROMPTS.md` board in the workspace.
 It remains available through every phase, follow-up, and internal `--self` checkpoint restart in
 one logical run. On a terminal exit—successful, cancelled, or failed—Roundtable copies the complete
-board into the private activity log and resets the workspace file to its clean template, preventing
-stale claims, old test counts, or obsolete requests from steering the next run.
+board into the private activity log, but leaves the workspace file as-is. The reset instead happens
+when the next fresh run starts (a brand-new objective, or a plain `--resume` of a run that already
+exited) — not a `--self` restart continuing the same run, which keeps the board intact. Resetting at
+the start rather than only at a clean exit means even a hard kill can't leave stale claims, old test
+counts, or obsolete requests to steer an unrelated later run.
 
 The console opens on **key events** — phase changes, completed turns, and errors — instead of a
 firehose of every raw line each CLI prints, so the signal-dense view is the default. Press `c` to
