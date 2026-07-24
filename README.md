@@ -220,9 +220,10 @@ last good draft, so one unavailable provider cannot discard the completed result
 in the first place. Provider usage/session limits have a separate recovery path: Roundtable keeps the
 agent's turn pending and, when the provider's own message names a reset time (e.g. "resets 5:30pm
 (America/Chicago)"), sleeps until just past that moment instead of polling — there's no point checking
-early when the limit is known not to have cleared yet. Without a recognizable reset time it falls back
-to checking availability every 30 seconds with the lightweight preflight prompt. Either way, the
-console only shows which method is being used, announced once, and a final line once the agent
+early when the limit is known not to have cleared yet. Without a recognizable reset time or
+timezone it falls back to checking availability every 30 seconds with the lightweight preflight
+prompt. Either way, the console only shows which method is being used, announced once, and a final
+line once the agent
 responds — the repeated 30-second rechecks stay silent instead of flooding the console, and the
 original task is resent once the agent responds. The wait continues only while Roundtable is running
 and remains cancellable with Ctrl+C (or by `--task-status-check`).
@@ -298,11 +299,14 @@ and may edit it, so use a version-controlled project and review the resulting di
 defaults ask the agent to confirm file edits, but they do stop it short of running arbitrary shell
 commands unsandboxed or unconfirmed — in headless mode that can surface as an agent silently
 declining a step it needed (for example Antigravity soft-denying a `Bash` tool call and returning a
-short explanation instead of real output). Aider discovers an existing git repository so its model
-receives a repository map, but Roundtable disables Aider's automatic clean-tree and dirty-tree
-commits as well as its automatic `.gitignore` edits; in a non-repository workspace it retains
-`--no-git` so unattended operation cannot initialize one. Qwen is deliberately never run with its
-own `--sandbox` flag: verified
+short explanation instead of real output). On editing turns, Aider discovers an existing git
+repository so its model receives a repository map, but Roundtable disables Aider's automatic
+clean-tree and dirty-tree commits, automatic `.gitignore` edits, and Playwright installation.
+Read-only Aider turns (preflight and synthesis) use `--no-git`: their complete context is already in
+the prompt, and this prevents Aider from auto-adding mentioned source files to what can otherwise
+become a very large request. A non-repository workspace also retains `--no-git` so unattended
+operation cannot initialize one. Qwen is deliberately never run with its own `--sandbox` flag:
+verified
 against the real CLI, that flag launches a container-backed sandbox and hangs indefinitely rather
 than failing cleanly when no container runtime is reachable, so its approval mode is the only gate
 by default.

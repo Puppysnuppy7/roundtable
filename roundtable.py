@@ -563,11 +563,11 @@ class Agent:
         if self.name == "Aider":
             # --message runs one instruction non-interactively then exits; --yes-always is required
             # for that to run unattended at all (it covers the same "auto-accept edits" ground as
-            # Claude's --permission-mode acceptEdits). Keep git repository discovery enabled so
-            # Aider can build its repo map: without it, a prompt that names no files gives the model
-            # no project context and it can invent unrelated files. Disable every automatic commit
-            # path and .gitignore mutation instead, so repository awareness remains read-only while
-            # file edits still behave like the other agents' edits.
+            # Claude's --permission-mode acceptEdits). Keep git repository discovery enabled for
+            # editing turns so Aider can build its repo map: without it, a prompt that names no
+            # files gives the model no project context and it can invent unrelated files. Disable
+            # every automatic commit path and .gitignore mutation instead, so repository awareness
+            # remains read-only while file edits still behave like the other agents' edits.
             # --timeout bounds each individual API call. Its default is None (unbounded) --
             # observed in practice hanging 45+ minutes on a single call after a malformed
             # response from the provider (a LiteLLM/Mistral response-parsing compatibility issue,
@@ -576,12 +576,17 @@ class Agent:
             # _run_with_retry can retry it -- which resolves in seconds, not tens of minutes.
             cmd = ["aider", "--message", prompt, "--yes-always", "--no-pretty",
                    "--no-check-update", "--no-analytics", "--no-auto-commits",
-                   "--no-dirty-commits", "--no-gitignore", "--timeout", "180"]
+                   "--no-dirty-commits", "--no-gitignore", "--disable-playwright",
+                   "--timeout", "180"]
             # In a non-repository workspace, --yes-always would accept Aider's offer to initialize
-            # git. Retain --no-git there; existing repositories keep discovery enabled for context.
+            # git. Read-only turns also need no repository context: the complete material they need
+            # is already in the prompt, and Aider otherwise auto-adds every mentioned source file.
+            # In a real run that expanded a 16K-character synthesis prompt into an 88K-token request.
             directories = (self.workspace, *self.workspace.parents)
             git_metadata = (directory / ".git" for directory in directories)
-            if not any(path.is_file() or (path / "HEAD").is_file() for path in git_metadata):
+            has_git_repo = any(path.is_file() or (path / "HEAD").is_file()
+                               for path in git_metadata)
+            if no_edit or not has_git_repo:
                 cmd += ["--no-git"]
             cmd += ["--suggest-shell-commands"] if self.elevated else ["--no-suggest-shell-commands"]
             if no_edit:
@@ -2205,7 +2210,9 @@ def parse_reset_time(text: str, now: datetime) -> datetime | None:
         try:
             tz = ZoneInfo(tz_name.strip())
         except (ZoneInfoNotFoundError, ValueError):
-            tz = None
+            # Do not reinterpret a provider timestamp in the machine's local timezone. That can
+            # turn a short limit wait into a delay of many hours; None selects safe polling.
+            return None
     reference = now.astimezone(tz)
     candidate = reference.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if candidate <= reference:
@@ -3029,22 +3036,38 @@ def positive_finite_float(value: str) -> float:
 
 
 def source_fingerprint(path: Path | None = None) -> str:
-    """Hash the loaded program so --self detects edits that require a restart."""
+    """Hash the loaded program so --self detects edits that require a restart.
+
+    Only the running module matters: test_roundtable.py / README.md changes do not need a process
+    replace (restart re-execs Path(__file__), not auxiliary docs/tests). Missing or unreadable
+    source is treated as a distinct fingerprint so a checkpoint can still fire SelfRestartRequired
+    instead of crashing with OSError mid-run.
+    """
     source = path or Path(__file__).resolve()
-    return hashlib.sha256(source.read_bytes()).hexdigest()
+    try:
+        return hashlib.sha256(source.read_bytes()).hexdigest()
+    except OSError:
+        return ""
 
 
 def create_self_test_sandbox(workspace: Path, output_dir: Path) -> Path:
-    """Copy the current roundtable.py/test_roundtable.py into a throwaway directory so a --self
-    agent can smoke-test a real invocation of its edited file without running inside the live
+    """Copy the current roundtable.py/test_roundtable.py/README.md into a throwaway directory so a
+    --self agent can smoke-test a real invocation of its edited file without running inside the live
     shared workspace other agents may be concurrently editing, or interfering with this run's own
     process. Called again on every restart, so its contents track the workspace at each restart."""
-    sandbox = output_dir / "self-test-sandbox"
+    # Agents run with workspace as their cwd, which need not be the cwd where Roundtable resolved a
+    # relative --output-dir. Give their prompt an absolute path so the advertised command works.
+    base = output_dir if output_dir.is_absolute() else Path.cwd() / output_dir
+    sandbox = base / "self-test-sandbox"
     sandbox.mkdir(parents=True, exist_ok=True)
-    for name in ("roundtable.py", "test_roundtable.py"):
+    for name in ("roundtable.py", "test_roundtable.py", "README.md"):
         source = workspace / name
+        dest = sandbox / name
         if source.is_file():
-            shutil.copy2(source, sandbox / name)
+            shutil.copy2(source, dest)
+        elif dest.is_file():
+            # Drop stale copies so a refresh matches the workspace (missing source stays missing).
+            dest.unlink()
     return sandbox
 
 
@@ -3076,10 +3099,12 @@ def restart_arguments(args: argparse.Namespace, session_path: Path,
     """Build the equivalent invocation used after a checkpointed self-edit."""
     output_dir = str(args.output_dir or ".roundtable")
     command = [sys.executable, str(Path(__file__).resolve()), "--resume", str(session_path),
-               "--continue-after-restart", "followup" if followup else "initial", "--self",
-               "--output-dir", output_dir, "--collab", args.collab,
-               "--synthesizer", args.synthesizer, "--synthesis-passes",
-               str(args.synthesis_passes), "--skip-preflight"]
+               "--continue-after-restart", "followup" if followup else "initial"]
+    if getattr(args, "self", False):
+        command.append("--self")
+    command.extend(("--output-dir", output_dir, "--collab", args.collab,
+                    "--synthesizer", args.synthesizer, "--synthesis-passes",
+                    str(args.synthesis_passes), "--skip-preflight"))
     if getattr(args, "rounds", None) is not None:
         command.extend(("--rounds", str(args.rounds)))
     if getattr(args, "workspace", None):
@@ -3099,11 +3124,20 @@ def restart_arguments(args: argparse.Namespace, session_path: Path,
     for option, enabled in (("--plain", args.plain), ("--mock", args.mock),
                             ("--balance-load", args.balance_load),
                             ("--task-status-check", args.task_status_check),
-                            ("--extended-preflight", getattr(args, "extended_preflight", False)),
                             ("--reassign-idle", args.reassign_idle),
                             ("--debug", getattr(args, "debug", False))):
         if enabled:
             command.append(option)
+    # BooleanOptionalAction defaults on; an explicit false must survive restart as --no-*.
+    if getattr(args, "extended_preflight", True):
+        command.append("--extended-preflight")
+    else:
+        command.append("--no-extended-preflight")
+    # main() resolves None to a numeric default before conduct; pass it through so a custom
+    # --preflight-timeout (or the resolved default) is not lost after a self-edit restart.
+    preflight_timeout = getattr(args, "preflight_timeout", None)
+    if preflight_timeout is not None:
+        command.extend(("--preflight-timeout", str(preflight_timeout)))
     if args.touch is not None:
         command.append("--touch" if args.touch else "--no-touch")
     return command

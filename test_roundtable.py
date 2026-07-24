@@ -877,15 +877,24 @@ class RoundtableTests(unittest.TestCase):
         self.assertIn("--timeout", command)
         self.assertEqual(command[command.index("--timeout") + 1], "180")
 
+    def test_aider_command_disables_playwright_side_trips(self):
+        agent = roundtable.Agent("Aider", Path("/tmp/work"))
+        self.assertIn("--disable-playwright", agent.command("Solve this"))
+
     def test_aider_no_edit_uses_ask_mode_to_avoid_the_edit_reflection_loop(self):
         # Verified in practice: without --edit-format ask, a synthesis-phase prompt (prose only,
         # but often quoting code from another agent's proposal) can make Aider mistake that quote
         # for a malformed edit attempt, burning up to 3 retries (its own hard cap) re-sending the
         # full transcript to the model each time -- 900+ seconds observed against a slow provider.
-        agent = roundtable.Agent("Aider", Path("/tmp/work"), "mistral/codestral-latest")
-        command = agent.command("Write a summary", no_edit=True)
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            (workspace / ".git").mkdir()
+            (workspace / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+            agent = roundtable.Agent("Aider", workspace, "mistral/codestral-latest")
+            command = agent.command("Write a summary", no_edit=True)
         self.assertIn("--edit-format", command)
         self.assertEqual(command[command.index("--edit-format") + 1], "ask")
+        self.assertIn("--no-git", command)
 
     def test_other_agents_ignore_no_edit_since_they_have_no_edit_reflection_loop(self):
         for name in ("Codex", "Claude", "Antigravity", "Grok", "Qwen"):
@@ -1112,10 +1121,12 @@ class RoundtableTests(unittest.TestCase):
             workspace = Path(workspace_dir)
             (workspace / "roundtable.py").write_text("print('rt')")
             (workspace / "test_roundtable.py").write_text("print('tests')")
+            (workspace / "README.md").write_text("# Readme")
             sandbox = roundtable.create_self_test_sandbox(workspace, Path(output_dir))
             self.assertEqual(sandbox, Path(output_dir) / "self-test-sandbox")
             self.assertEqual((sandbox / "roundtable.py").read_text(), "print('rt')")
             self.assertEqual((sandbox / "test_roundtable.py").read_text(), "print('tests')")
+            self.assertEqual((sandbox / "README.md").read_text(), "# Readme")
 
     def test_create_self_test_sandbox_refreshes_on_repeat_calls(self):
         with tempfile.TemporaryDirectory() as workspace_dir, \
@@ -1127,12 +1138,41 @@ class RoundtableTests(unittest.TestCase):
             sandbox = roundtable.create_self_test_sandbox(workspace, Path(output_dir))
             self.assertEqual((sandbox / "roundtable.py").read_text(), "version 2")
 
+    def test_create_self_test_sandbox_resolves_relative_output_from_launcher_cwd(self):
+        with tempfile.TemporaryDirectory() as launcher_dir, \
+             tempfile.TemporaryDirectory() as workspace_dir:
+            workspace = Path(workspace_dir)
+            (workspace / "roundtable.py").write_text("print('rt')")
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(launcher_dir)
+                sandbox = roundtable.create_self_test_sandbox(workspace, Path(".roundtable"))
+            finally:
+                os.chdir(original_cwd)
+            self.assertTrue(sandbox.is_absolute())
+            self.assertEqual(sandbox, Path(launcher_dir) / ".roundtable" / "self-test-sandbox")
+            self.assertEqual((sandbox / "roundtable.py").read_text(), "print('rt')")
+
     def test_create_self_test_sandbox_skips_missing_source_files(self):
         with tempfile.TemporaryDirectory() as workspace_dir, \
              tempfile.TemporaryDirectory() as output_dir:
             sandbox = roundtable.create_self_test_sandbox(Path(workspace_dir), Path(output_dir))
             self.assertTrue(sandbox.is_dir())
             self.assertFalse((sandbox / "roundtable.py").exists())
+
+    def test_create_self_test_sandbox_removes_stale_files_when_source_missing(self):
+        with tempfile.TemporaryDirectory() as workspace_dir, \
+             tempfile.TemporaryDirectory() as output_dir:
+            workspace = Path(workspace_dir)
+            (workspace / "roundtable.py").write_text("print('rt')")
+            (workspace / "README.md").write_text("# Keep then drop")
+            sandbox = roundtable.create_self_test_sandbox(workspace, Path(output_dir))
+            self.assertTrue((sandbox / "README.md").is_file())
+            (workspace / "README.md").unlink()
+            (workspace / "roundtable.py").write_text("print('rt2')")
+            sandbox = roundtable.create_self_test_sandbox(workspace, Path(output_dir))
+            self.assertEqual((sandbox / "roundtable.py").read_text(), "print('rt2')")
+            self.assertFalse((sandbox / "README.md").exists())
 
     def test_self_flag_note_points_agents_at_a_real_sandbox_copy(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1147,6 +1187,7 @@ class RoundtableTests(unittest.TestCase):
             self.assertIn(str(sandbox), session.objective)
             self.assertTrue((sandbox / "roundtable.py").is_file())
             self.assertTrue((sandbox / "test_roundtable.py").is_file())
+            self.assertTrue((sandbox / "README.md").is_file())
 
     def test_explicit_workspace_flag_overrides_self(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1241,6 +1282,25 @@ class RoundtableTests(unittest.TestCase):
         ])
         command = roundtable.restart_arguments(args, Path("saved/session.json"), True)
         self.assertIn("--extended-preflight", command)
+        self.assertNotIn("--no-extended-preflight", command)
+
+    def test_no_extended_preflight_survives_restart_arguments(self):
+        args = roundtable.build_parser().parse_args([
+            "Goal", "--self", "--plain", "--mock", "-r", "0", "--no-extended-preflight",
+            "--output-dir", "saved",
+        ])
+        command = roundtable.restart_arguments(args, Path("saved/session.json"), True)
+        self.assertIn("--no-extended-preflight", command)
+        self.assertNotIn("--extended-preflight", command)
+
+    def test_preflight_timeout_survives_restart_arguments(self):
+        args = roundtable.build_parser().parse_args([
+            "Goal", "--self", "--plain", "--mock", "-r", "0", "--preflight-timeout", "12.5",
+            "--output-dir", "saved",
+        ])
+        command = roundtable.restart_arguments(args, Path("saved/session.json"), False)
+        self.assertIn("--preflight-timeout", command)
+        self.assertEqual(command[command.index("--preflight-timeout") + 1], "12.5")
 
     def test_restart_arguments_preserve_run_configuration(self):
         args = roundtable.build_parser().parse_args([
@@ -1254,7 +1314,7 @@ class RoundtableTests(unittest.TestCase):
         self.assertIn("--continue-after-restart", command)
         self.assertIn("followup", command)
         for option in ("--plain", "--mock", "--balance-load", "--task-status-check",
-                       "--reassign-idle", "--skip-preflight"):
+                       "--reassign-idle", "--skip-preflight", "--extended-preflight"):
             self.assertIn(option, command)
         self.assertEqual(command[command.index("--collab") + 1], "mixed")
         self.assertEqual(command[command.index("--synthesizer") + 1], "claude")
@@ -1264,6 +1324,14 @@ class RoundtableTests(unittest.TestCase):
         self.assertEqual(command[command.index("--elevated") + 1], "codex")
         self.assertEqual(command[command.index("--rounds") + 1], "2")
         self.assertEqual(command[command.index("--workspace") + 1], "custom_ws")
+        self.assertIn("--self", command)
+
+    def test_restart_arguments_omits_self_flag_when_self_is_false(self):
+        args = roundtable.build_parser().parse_args([
+            "Goal", "--plain", "--mock", "-r", "0", "--output-dir", "saved",
+        ])
+        command = roundtable.restart_arguments(args, Path("saved/session.json"), False)
+        self.assertNotIn("--self", command)
 
     def test_source_fingerprint_changes_when_file_content_changes(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1273,6 +1341,11 @@ class RoundtableTests(unittest.TestCase):
             self.assertEqual(first, roundtable.source_fingerprint(path))
             path.write_text("a = 2\n")
             self.assertNotEqual(first, roundtable.source_fingerprint(path))
+
+    def test_source_fingerprint_missing_file_returns_empty_digest(self):
+        missing = Path(tempfile.gettempdir()) / "roundtable-missing-source-does-not-exist.py"
+        self.assertFalse(missing.exists())
+        self.assertEqual(roundtable.source_fingerprint(missing), "")
 
     def test_self_checkpoint_disabled_never_raises(self):
         check = roundtable.self_checkpoint(False)
@@ -1286,6 +1359,17 @@ class RoundtableTests(unittest.TestCase):
                 check = roundtable.self_checkpoint(True)
                 check()  # unchanged: no raise
                 fake_source.write_text("a = 2\n")
+                with self.assertRaises(roundtable.SelfRestartRequired):
+                    check()
+
+    def test_self_checkpoint_raises_when_source_becomes_unreadable(self):
+        with tempfile.TemporaryDirectory() as td:
+            fake_source = Path(td) / "roundtable.py"
+            fake_source.write_text("a = 1\n")
+            with mock.patch.object(roundtable.Path, "resolve", return_value=fake_source):
+                check = roundtable.self_checkpoint(True)
+                check()
+                fake_source.unlink()
                 with self.assertRaises(roundtable.SelfRestartRequired):
                     check()
 
@@ -2219,7 +2303,10 @@ class RoundtableTests(unittest.TestCase):
             )
             finished = [(speaker, line) for speaker, line in ticks if "finished this phase" in line]
             self.assertEqual([speaker for speaker, _ in finished], ["Codex", "Claude", "Antigravity"])
-            self.assertIn("waiting on Antigravity, Claude", finished[0][1])
+            # Claude normally remains pending when Codex's completion is observed, but a busy test
+            # runner may deliver both completed futures in one polling cycle. Antigravity's wider
+            # delay is the stable contract this assertion needs to cover.
+            self.assertIn("waiting on Antigravity", finished[0][1])
             self.assertIn("waiting on nothing else", finished[-1][1])
 
     def test_signals_task_complete_matches_marker_near_end_of_text(self):
@@ -2699,6 +2786,8 @@ class RoundtableTests(unittest.TestCase):
         now = datetime(2026, 7, 20, 17, 0)
         self.assertIsNone(roundtable.parse_reset_time("rate limit exceeded, please retry", now))
         self.assertIsNone(roundtable.parse_reset_time("resets 25:99pm", now))
+        self.assertIsNone(roundtable.parse_reset_time(
+            "resets 5:30pm (Not/A_Real_Timezone)", now))
 
     def test_wait_for_agent_availability_sleeps_until_reset_time_instead_of_polling(self):
         class ReadyAgent(roundtable.Agent):
@@ -2770,7 +2859,7 @@ class RoundtableTests(unittest.TestCase):
                 roundtable._run_parallel_phase(session, agents, "proposal", lambda *_: None,
                                                lambda *_: None, "Working")
             self.assertEqual({t.speaker: t.content for t in session.turns}["Antigravity"],
-                             "Antigravity content after retry")
+                             roundtable.sign_agent_work("Antigravity", "Antigravity content after retry"))
 
     def test_save_stems_include_microseconds(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3277,6 +3366,25 @@ class RoundtableTests(unittest.TestCase):
         self.assertIn(roundtable.AGENT_PROMPT_FILE, prompt)
         user_prompt = roundtable.prompt_for("Objective", [], "proposal", "User")
         self.assertNotIn(roundtable.AGENT_PROMPT_FILE, user_prompt)
+
+    def test_self_checkpoint_ignores_sibling_files_next_to_loaded_program(self):
+        """Restart only tracks Path(__file__); tests/docs next to it must not force execv."""
+        with tempfile.TemporaryDirectory() as td:
+            fake_source = Path(td) / "roundtable.py"
+            sibling_test = Path(td) / "test_roundtable.py"
+            sibling_readme = Path(td) / "README.md"
+            fake_source.write_text("a = 1\n")
+            sibling_test.write_text("def test_x(): pass\n")
+            sibling_readme.write_text("# Doc\n")
+            with mock.patch.object(roundtable.Path, "resolve", return_value=fake_source):
+                check = roundtable.self_checkpoint(True)
+                check()
+                sibling_test.write_text("def test_x(): assert True\n")
+                sibling_readme.write_text("# Changed\n")
+                check()  # auxiliary edits alone must not restart
+                fake_source.write_text("a = 2\n")
+                with self.assertRaises(roundtable.SelfRestartRequired):
+                    check()
 
 
 if __name__ == "__main__":
