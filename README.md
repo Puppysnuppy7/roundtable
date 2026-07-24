@@ -137,6 +137,11 @@ contention spike on modest hardware, pushing every agent's response past its tim
 that are individually fast. To avoid that, agent subprocesses are staggered by a fraction of a second
 each rather than all spawned at once; they still all run concurrently overall, and each agent's own
 timeout clock only starts once its own call actually begins, so nobody's effective budget shrinks.
+The coordinator remains responsive during that launch window: it processes early results immediately,
+and with `--task-status-check` it can cancel agents that are still waiting to launch once another
+agent has already completed and verified the objective. Load-balancing timings likewise measure only
+an agent's actual turn, not its intentional stagger delay. Checkpoint resumes preserve that verified
+completion state, so restarting a run does not restore review rounds that were already made redundant.
 
 The fullscreen view provides evenly spaced live Codex, Claude, Antigravity, Aider, Grok, and Qwen
 panes, independent working/waiting states, and agent-specific activity tickers next to agent names
@@ -196,8 +201,9 @@ the others are still independently working on the same thing. With it on, each a
 its turn with `TASK STATUS: complete` once the objective is fully done and verified. The first agent
 to say so stops the other agents still running that phase — `[Claude] stopped early — Codex already
 completed the task; will review it next phase instead` — rather than letting them duplicate finished
-work. They still get a full turn in the next phase (typically the following review round) to check
-and refine what was done, so nothing is lost, just not redone from scratch.
+work. They still get one verification review phase to check and refine what was done; any further
+configured review rounds are skipped, and final synthesis is shortened (draft + one refine) so the
+run does not keep spending full multi-agent phases after the objective is already done.
 
 `--reassign-idle` covers the ordinary case, without anyone declaring the whole thing done: the first
 agent that finishes while at least two others are still on their primary turn gets one extra prompt —
@@ -231,7 +237,11 @@ and remains cancellable with Ctrl+C (or by `--task-status-check`).
 Final synthesis uses six sequential model calls by default: the chosen synthesizer drafts, then the
 other five agents refine in turn. For a faster, lower-cost run, `--synthesis-passes 1` returns the
 first draft directly; values up to `5` keep that many refinements. The selected `--synthesizer` is
-always the drafter, and the default of six preserves the full roundtable review. Every stored
+normally the drafter, and the default of six preserves the full roundtable review. With
+`--task-status-check`, once an agent has marked the objective complete (and at most one verification
+review has run), synthesis is automatically capped at draft + one refine so the final answer does
+not spend five more full CLI turns on polish; under `--synthesizer rotate`, the agent that declared
+completion drafts first. An explicit `--synthesizer` name still drafts when set. Every stored
 proposal, review, and extra contribution ends with `Signed: <agent>`. The final answer ends with
 `Signed by:` listing the successful synthesis participants in relay order; failed or skipped
 refiners are not credited.
@@ -334,9 +344,10 @@ from the saved progress rather than starting over or synthesizing the same answe
 
 Every `--self` run is also told about a throwaway copy of the source kept at
 `<output-dir>/self-test-sandbox`, refreshed at the start of the run and again on every restart. An
-agent can copy its edited `roundtable.py` there and run it directly (e.g. `--mock` a real invocation)
-to smoke-test a change without running inside the live shared workspace other agents may be
-concurrently editing, or interfering with this run's own in-memory process.
+agent can copy its edited `roundtable.py` there and run it directly with `--mock --plain
+--skip-preflight --synthesis-passes 1 -r 0` to smoke-test a change without running inside the live
+shared workspace other agents may be concurrently editing, waiting for interactive follow-up input,
+or interfering with this run's own in-memory process.
 
 ## Smoke test
 

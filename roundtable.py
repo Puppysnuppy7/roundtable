@@ -8,6 +8,7 @@ import contextlib
 import curses
 import concurrent.futures
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -836,6 +837,15 @@ def sign_agent_work(name: str, content: str) -> str:
     return f"{content}\n\n{signature}" if content else signature
 
 
+def turn_signals_task_complete(turn: Turn) -> bool:
+    """Recognize a completion marker in a stored turn despite its attribution footer."""
+    content = turn.content.rstrip()
+    signature = f"Signed: {turn.speaker}"
+    if content and content.rsplit("\n", 1)[-1].strip().casefold() == signature.casefold():
+        content = content.rsplit("\n", 1)[0].rstrip()
+    return signals_task_complete(content)
+
+
 def sign_final_work(content: str, contributors: list[str]) -> str:
     """Identify every agent whose successful synthesis pass shaped the returned final answer."""
     content = content.rstrip()
@@ -845,7 +855,26 @@ def sign_final_work(content: str, contributors: list[str]) -> str:
     return f"{content}\n\n{signature}" if content else signature
 
 
-DIBS_PATTERN = re.compile(r"^\s*`?\*?\*?dibs:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+FINAL_COMPLETED_HEADING = re.compile(
+    r"(?im)^[ \t]{0,3}#{1,6}[ \t]+completed[ \t]*$")
+
+
+def normalize_final_answer(content: str) -> str:
+    """Keep the latest structured answer when a CLI prints a complete final response twice.
+
+    Some noninteractive CLIs occasionally repeat their answer while shutting down. The copies may
+    differ in a timing value, so whole-string deduplication is not enough. Final prompts require one
+    markdown Completed section; when more than one is present, the last starts the model's latest
+    complete version.
+    """
+    content = content.strip()
+    headings = list(FINAL_COMPLETED_HEADING.finditer(content))
+    if len(headings) > 1:
+        return content[headings[-1].start():].strip()
+    return content
+
+
+DIBS_PATTERN = re.compile(r"^\s*(?:[#\-*]+\s*)?`?\*?\*?dibs:\s*\**`*\s*(.+)$", re.IGNORECASE | re.MULTILINE)
 DIBS_HINT = (
     "\n\nStart your response with a line reading `DIBS: <short claim>` naming the specific part of "
     "the objective you're taking ownership of this round (e.g. `DIBS: the retry/backoff logic`), "
@@ -2074,6 +2103,7 @@ def read_followup_ui(stdscr: curses.window, ui: Display) -> str:
 
 
 SCOPE_HINT_THRESHOLD = 1.5  # an agent must be at least this many times slower than the fastest to get scoped down
+SCOPE_HINT_MIN_DIFF_SECONDS = 0.15  # and at least 150ms slower, avoiding false triggers from GIL/scheduling jitter
 
 
 def scope_hint(name: str, agent_speed: dict[str, list[float]]) -> str:
@@ -2088,7 +2118,9 @@ def scope_hint(name: str, agent_speed: dict[str, list[float]]) -> str:
         return ""
     averages = {n: sum(d) / len(d) for n, d in agent_speed.items()}
     fastest = min(averages.values())
-    if fastest <= 0 or name not in averages or averages[name] < fastest * SCOPE_HINT_THRESHOLD:
+    if (fastest <= 0 or name not in averages or
+            averages[name] < fastest * SCOPE_HINT_THRESHOLD or
+            (averages[name] - fastest) < SCOPE_HINT_MIN_DIFF_SECONDS):
         return ""
     return (
         "\n\nYou have been slower than the other agents so far this run. Keep this contribution "
@@ -2325,7 +2357,9 @@ def _run_with_retry(agent: Agent, prompt: str, on_tick: Callable[[str], None],
                     f"failure classified as transient; retrying after "
                     f"{RETRY_BACKOFF_SECONDS:g}s")
                 on_tick(f"failed ({exc}) — retrying once after a short pause")
-                time.sleep(RETRY_BACKOFF_SECONDS)
+                if active_cancel.wait(RETRY_BACKOFF_SECONDS):
+                    agent.log_diagnostic("transient retry aborted by cancellation during backoff")
+                    raise RuntimeError(f"{agent.name} cancelled")
                 current_prompt = f"{prompt}\n\n{RERUN_PROGRESS_NOTE}"
     finally:
         agent.suggested_effort = previous_effort
@@ -2351,7 +2385,7 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
                         log_prompt: Callable[[str, str], None] = lambda *_: None,
                         agent_speed: dict[str, list[float]] | None = None,
                         task_status_check: bool = False, reassign_idle: bool = False,
-                        stagger: float | None = None) -> None:
+                        stagger: float | None = None) -> str | None:
     """Run one collaboration phase concurrently and record results deterministically.
 
     When agent_speed is provided, an agent running notably slower than the others (based on
@@ -2361,7 +2395,9 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
     When task_status_check is set, agents are asked to mark their turn TASK STATUS: complete once
     the objective is fully done. The first agent to do so stops the other still-running agents in
     this phase rather than letting them duplicate finished work — they get a turn again in the next
-    phase (typically a review round) to check and refine it instead.
+    phase (typically a review round) to check and refine it instead. Returns that agent's name so
+    conduct can skip further review rounds after one verification pass; returns None when nobody
+    declared completion.
 
     When reassign_idle is set, an agent that finishes its turn while others are still working (and
     nobody has declared the whole task complete) may get one extra prompt asking it to pick up
@@ -2389,6 +2425,7 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
         log_prompt(name, prompts[name])
     events: queue.SimpleQueue[tuple[str, str]] = queue.SimpleQueue()
     phase_start = time.monotonic()
+    agent_started: dict[str, float] = {}
     completed_by: str | None = None
     skipped: set[str] = set()
     bonus_futures: dict[str, concurrent.futures.Future] = {}
@@ -2399,16 +2436,27 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
             max_workers=len(agents), thread_name_prefix="roundtable") as pool:
         futures: dict[str, concurrent.futures.Future] = {}
         for index, (name, agent) in enumerate(agents):
-            if index and stagger:
-                time.sleep(stagger)
-            futures[name] = pool.submit(_run_with_retry, agent, prompts[name],
-                                        lambda line, speaker=name: events.put((speaker, line)))
+            def _primary_run(agent=agent, prompt=prompts[name], speaker=name,
+                             delay=index * stagger) -> str:
+                # Wait inside the worker so the coordinator can process an early completion while
+                # later launches are still staggered. In particular, --task-status-check can then
+                # cancel delayed agents before their CLI subprocesses are started at all.
+                if delay and cancel_event.wait(delay):
+                    raise RuntimeError(f"{speaker} cancelled")
+                agent_started[speaker] = time.monotonic()
+                return _run_with_retry(
+                    agent, prompt, lambda line: events.put((speaker, line)), cancel_event)
+
+            futures[name] = pool.submit(_primary_run)
         pending = set(names)
         try:
             while not all(future.done() for future in futures.values()):
                 try:
-                    speaker, line = events.get(timeout=0.1)
+                    speaker, line = events.get(timeout=0.05)
                     tick(speaker, line)
+                    while True:
+                        speaker, line = events.get_nowait()
+                        tick(speaker, line)
                 except queue.Empty:
                     tick("", "")
                 remaining = {name for name in names if not futures[name].done()}
@@ -2434,7 +2482,8 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
                                         f"completed the task; will review it next phase instead")
                             continue
                         if agent_speed is not None:
-                            agent_speed.setdefault(name, []).append(elapsed)
+                            started = agent_started.get(name, phase_start)
+                            agent_speed.setdefault(name, []).append(time.monotonic() - started)
                         tick(name, f"finished this phase ({elapsed:.1f}s) — waiting on "
                                     f"{', '.join(sorted(remaining)) or 'nothing else'}")
                         declared_complete = False
@@ -2494,7 +2543,8 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
                                 f"the task; will review it next phase instead")
                     continue
                 if agent_speed is not None:
-                    agent_speed.setdefault(name, []).append(elapsed)
+                    started = agent_started.get(name, phase_start)
+                    agent_speed.setdefault(name, []).append(time.monotonic() - started)
                 tick(name, f"finished this phase ({elapsed:.1f}s)")
             status([], message)
         while True:
@@ -2526,29 +2576,56 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
         session.turns.append(Turn(name, f"{phase} · extra", sign_agent_work(name, content)))
     for name in names:
         tick(name, "")
+    return completed_by
 
 
 def _run_sequential_phase(session: Session, agents: list[tuple[str, Agent]], phase: str,
                           tick: Callable[[str, str], None],
                           status: Callable[[Iterable[str], str], None], message: str,
-                          log_prompt: Callable[[str, str], None] = lambda *_: None) -> None:
+                          log_prompt: Callable[[str, str], None] = lambda *_: None,
+                          task_status_check: bool = False) -> str | None:
     """Run one collaboration phase as a live relay: each agent reads and builds on the one before it.
 
     Unlike the parallel phase, each agent's prompt is built right before it runs, after the previous
     agent's turn has already been appended to the transcript — so it sees fresh, same-round context
     rather than only what existed before the phase started.
+
+    When task_status_check is set, an agent that marks TASK STATUS: complete ends the relay early
+    so later agents do not re-solve finished work (they still get a later review/synthesis turn if
+    one is scheduled). Returns the completing agent's name, or None.
     """
     for name, agent in agents:
         status([name], message)
-        prompt = prompt_for(session.objective, session.turns, phase, name, sequential=True)
+        prompt = prompt_for(session.objective, session.turns, phase, name, sequential=True,
+                            task_status_check=task_status_check)
         log_prompt(name, prompt)
         content = _run_with_retry(agent, prompt, lambda line, speaker=name: tick(speaker, line))
         session.turns.append(Turn(name, phase, sign_agent_work(name, content)))
+        if task_status_check and signals_task_complete(content):
+            # Agents already finished stay in the transcript; later names in the configured order
+            # never start this phase so they do not re-solve finished work.
+            seen = False
+            not_yet_run: list[str] = []
+            for other, _ in agents:
+                if other == name:
+                    seen = True
+                    continue
+                if seen:
+                    not_yet_run.append(other)
+            if not_yet_run:
+                tick(name, f"marked the task complete — skipping "
+                            f"{', '.join(not_yet_run)} this phase")
+            else:
+                tick(name, "marked the task complete")
+            tick(name, "")
+            status([], message)
+            return name
         tick(name, "")
     status([], message)
+    return None
 
 
-def _phase_runner(collab: str, round_no: int) -> Callable[..., None]:
+def _phase_runner(collab: str, round_no: int) -> Callable[..., str | None]:
     """Pick a phase strategy: 'mixed' alternates relay and independent rounds."""
     if collab == "sequential":
         return _run_sequential_phase
@@ -2606,6 +2683,15 @@ class CompletionEstimator:
         self.provider_wait_started = None
         self.excluded_wait_seconds = 0.0
 
+    def abandon(self, units: int) -> None:
+        """Drop planned work that will not run without polluting the observed latency average.
+
+        Used when --task-status-check lets conduct skip remaining review rounds after the
+        objective is already done: those units were budgeted at start but never execute.
+        """
+        units = max(0, units)
+        self.total_units = max(self.completed_units, self.total_units - units)
+
     def remaining_seconds(self) -> float | None:
         if not self.completed_units or self.observed_seconds <= 0:
             return None
@@ -2651,18 +2737,32 @@ def pick_synthesizer(choice: str, session: Session, codex: Agent, claude: Agent,
     return options[index]
 
 
+# After --task-status-check marks the objective done (and at most one verification review), a full
+# six-agent synthesis relay is mostly polish. Draft + one refine is enough to shape a merge-style
+# final answer without spending five more full CLI turns.
+EARLY_COMPLETE_SYNTHESIS_PASSES = 2
+
+
 def synthesis_order(choice: str, session: Session, codex: Agent, claude: Agent, antigravity: Agent,
-                    aider: Agent, grok: Agent, qwen: Agent, passes: int = 6) -> list[tuple[str, Agent]]:
+                    aider: Agent, grok: Agent, qwen: Agent, passes: int = 6,
+                    *, preferred_first: str | None = None) -> list[tuple[str, Agent]]:
     """Full relay order for the final answer: who drafts it, then who refines it, in turn.
 
     Reuses pick_synthesizer for the drafting agent (so --synthesizer keeps its meaning), then
     rotates the rest by a second objective-derived hash, so the refining order also varies across
     sessions instead of always following the same fixed agent order.
+
+    preferred_first, when it names a live agent, overrides the drafter — used after an agent marks
+    TASK STATUS: complete so the agent that finished the work writes the first draft.
     """
     options = [("Codex", codex), ("Claude", claude), ("Antigravity", antigravity), ("Aider", aider),
               ("Grok", grok), ("Qwen", qwen)]
-    first_name, first_agent = pick_synthesizer(choice, session, codex, claude, antigravity, aider,
-                                               grok, qwen)
+    by_name = {name: agent for name, agent in options}
+    if preferred_first and preferred_first in by_name:
+        first_name, first_agent = preferred_first, by_name[preferred_first]
+    else:
+        first_name, first_agent = pick_synthesizer(choice, session, codex, claude, antigravity, aider,
+                                                   grok, qwen)
     rest = [pair for pair in options if pair[0] != first_name]
     index = int(hashlib.sha256((session.objective + first_name).encode()).hexdigest(), 16) % len(rest)
     rest = rest[index:] + rest[:index]
@@ -2705,7 +2805,9 @@ def synthesize(session: Session, order: list[tuple[str, Agent]],
             detail = str(exc).strip().splitlines()[-1] if str(exc).strip() else "no response"
             tick(name, f"refinement skipped after failure: {detail}")
         else:
-            draft = candidate
+            draft = normalize_final_answer(candidate)
+            if draft != candidate.strip():
+                tick(name, "discarded an earlier duplicated final-answer block")
             contributors.append(name)
         step_complete(1)
     status([], "Final answer complete")
@@ -2761,17 +2863,24 @@ def run_preflight(agents: list[tuple[str, Agent]], tick: Callable[[str, str], No
                                                thread_name_prefix="preflight") as pool:
         futures: dict[str, concurrent.futures.Future] = {}
         for index, (name, agent) in enumerate(agents):
-            if index and stagger:
-                time.sleep(stagger)
-            futures[name] = pool.submit(preflight_check, name, agent,
-                                        lambda speaker, line: events.put((speaker, line)),
-                                        cancel_events[name], timeout)
+            def _preflight_run(speaker=name, agent_obj=agent, cancel_evt=cancel_events[name],
+                               delay=index * stagger if stagger else 0.0):
+                if delay and cancel_evt.wait(delay):
+                    return False, f"timed out after {timeout:.0f}s"
+                return preflight_check(speaker, agent_obj,
+                                       lambda spk, line: events.put((spk, line)),
+                                       cancel_evt, timeout)
+
+            futures[name] = pool.submit(_preflight_run)
         pending = set(names)
         try:
             while not all(future.done() for future in futures.values()):
                 try:
-                    speaker, line = events.get(timeout=0.1)
+                    speaker, line = events.get(timeout=0.05)
                     tick(speaker, line)
+                    while True:
+                        speaker, line = events.get_nowait()
+                        tick(speaker, line)
                 except queue.Empty:
                     tick("", "")
                 remaining = {name for name in names if not futures[name].done()}
@@ -2805,23 +2914,36 @@ def drain_queued_prompts(session: Session) -> bool:
     return True
 
 
-def _run_phase(runner: Callable[..., None], session: Session, agents: list[tuple[str, Agent]],
+def _run_phase(runner: Callable[..., str | None], session: Session, agents: list[tuple[str, Agent]],
               phase: str, tick: Callable[[str, str], None],
               status: Callable[[Iterable[str], str], None], message: str,
               log_prompt: Callable[[str, str], None],
               agent_speed: dict[str, list[float]] | None,
               task_status_check: bool = False, reassign_idle: bool = False,
-              stagger: float | None = None) -> None:
-    """Dispatch to a phase runner, passing agent_speed/task_status_check/reassign_idle/stagger only
-    to the parallel runner that uses them."""
+              stagger: float | None = None) -> str | None:
+    """Dispatch to a phase runner, passing parallel-only knobs only to the parallel runner.
+
+    Returns the name of an agent that marked TASK STATUS: complete this phase, if any — used by
+    conduct to drop redundant later review rounds after one verification pass.
+    """
     drained = drain_queued_prompts(session)
     if drained and not phase.startswith("followup-"):
         phase = f"followup-{phase}"
     if runner is _run_parallel_phase:
-        runner(session, agents, phase, tick, status, message, log_prompt, agent_speed,
-              task_status_check, reassign_idle, stagger)
-    else:
-        runner(session, agents, phase, tick, status, message, log_prompt)
+        return runner(session, agents, phase, tick, status, message, log_prompt, agent_speed,
+                      task_status_check, reassign_idle, stagger)
+    if runner is _run_sequential_phase:
+        return runner(session, agents, phase, tick, status, message, log_prompt,
+                      task_status_check=task_status_check)
+    try:
+        sig = inspect.signature(runner)
+        if ("task_status_check" in sig.parameters or
+                any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())):
+            return runner(session, agents, phase, tick, status, message, log_prompt,
+                          task_status_check=task_status_check)
+    except (ValueError, TypeError):
+        pass
+    return runner(session, agents, phase, tick, status, message, log_prompt)
 
 
 def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, aider: Agent,
@@ -2877,29 +2999,100 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
             estimator.resume_provider(name)
         tick(name, line)
 
+    # After an agent marks TASK STATUS: complete, allow at most one more review phase so skipped
+    # agents can verify/refine, then skip any further configured reviews and go to synthesis.
+    # None = no completion yet; int = remaining review budget after a completion signal.
+    reviews_after_complete: int | None = None
+    # Most recent agent that marked TASK STATUS: complete (live or reconstructed from a resume).
+    last_completed_by: str | None = None
+
+    def note_phase_completion(completed_by: str | None) -> None:
+        nonlocal reviews_after_complete, last_completed_by
+        if not task_status_check or not completed_by:
+            return
+        if completed_by in AGENT_NAMES:
+            last_completed_by = completed_by
+        # First completion: keep one verification review. A later completion (or any signal during
+        # that verification review) means no further reviews are useful.
+        reviews_after_complete = 0 if reviews_after_complete is not None else 1
+
+    # A resumed run must retain the efficiency decision made before its last checkpoint. Rebuild
+    # the small completion state machine from completed turns so a restart does not repeat every
+    # configured review after an agent had already declared and verified the objective complete.
+    if task_status_check and completed_phases:
+        prior_phases = [phase]
+        prior_phases.extend(
+            f"followup-review {round_no}" if followup else f"review {round_no}"
+            for round_no in range(1, session.rounds + 1)
+        )
+        for index, prior_phase in enumerate(prior_phases):
+            if prior_phase not in completed_phases:
+                continue
+            completer = next(
+                (turn.speaker for turn in session.turns
+                 if turn.phase == prior_phase and turn_signals_task_complete(turn)),
+                None,
+            )
+            if completer:
+                note_phase_completion(completer)
+            elif index and reviews_after_complete is not None:
+                reviews_after_complete -= 1
+
     if phase not in completed_phases:
-        _run_phase(
+        completed_by = _run_phase(
             proposal_runner, session, agents, phase, estimated_tick, estimated_status, message,
             log_prompt, agent_speed, task_status_check, reassign_idle, stagger)
         estimator.complete(phase_work_units(proposal_runner))
+        note_phase_completion(completed_by)
         checkpoint()
     for round_no in range(1, session.rounds + 1):
+        if reviews_after_complete is not None and reviews_after_complete <= 0:
+            abandoned = 0
+            for later in range(round_no, session.rounds + 1):
+                later_phase = (f"followup-review {later}" if followup else f"review {later}")
+                if later_phase not in completed_phases:
+                    abandoned += phase_work_units(_phase_runner(collab, later))
+            if abandoned:
+                estimator.abandon(abandoned)
+                estimated_status(
+                    [], "Objective marked complete — skipping remaining review rounds")
+            break
         phase = f"followup-review {round_no}" if followup else f"review {round_no}"
         runner = _phase_runner(collab, round_no)
         round_style = "in sequence" if runner is _run_sequential_phase else "in parallel"
         if phase not in completed_phases:
-            _run_phase(
+            completed_by = _run_phase(
                 runner, session, agents, phase, estimated_tick, estimated_status,
                 f"Agents are reviewing {round_style} · round {round_no}/{session.rounds}",
                 log_prompt, agent_speed, task_status_check, reassign_idle, stagger,
             )
             estimator.complete(phase_work_units(runner))
+            if task_status_check and completed_by:
+                note_phase_completion(completed_by)
+            elif reviews_after_complete is not None:
+                reviews_after_complete -= 1
             checkpoint()
     if "consensus" in completed_phases:
         return
     drain_queued_prompts(session)
+    # When the objective is already marked complete, a full synthesis relay is mostly polish.
+    # Prefer the agent that finished the work as drafter (under rotate) and cap the relay length
+    # so wall time is spent on the answer, not six sequential CLI turns of rephrasing.
+    effective_passes = synthesis_passes
+    preferred_drafter: str | None = None
+    if task_status_check and reviews_after_complete is not None:
+        if synthesizer == "rotate" and last_completed_by:
+            preferred_drafter = last_completed_by
+        effective_passes = min(synthesis_passes, EARLY_COMPLETE_SYNTHESIS_PASSES)
+        planned_synth = max(1, min(synthesis_passes, len(agents)))
+        used_synth = max(1, min(effective_passes, len(agents)))
+        abandoned_synth = planned_synth - used_synth
+        if abandoned_synth:
+            estimator.abandon(abandoned_synth)
+            estimated_status(
+                [], "Objective marked complete — using a shorter final synthesis")
     order = synthesis_order(synthesizer, session, codex, claude, antigravity, aider, grok, qwen,
-                            synthesis_passes)
+                            effective_passes, preferred_first=preferred_drafter)
     session.final = synthesize(session, order, estimated_tick, estimated_status, log_prompt, followup,
                                estimator.complete)
     session.turns.append(Turn("Final", "consensus", session.final))
@@ -3075,7 +3268,8 @@ def self_test_sandbox_note(sandbox: Path) -> str:
     return (
         f"A throwaway copy of the current source is kept at `{sandbox}`, refreshed each time this "
         "run (re)starts. Copy your edited roundtable.py there to smoke-test a real invocation (e.g. "
-        f"`python3 {sandbox}/roundtable.py --mock \"...\"`) without touching the shared workspace or "
+        f"`python3 {sandbox}/roundtable.py --mock --plain --skip-preflight "
+        f"--synthesis-passes 1 -r 0 \"...\"`) without touching the shared workspace or "
         "interfering with this run's own process. The required `python3 -m unittest test_roundtable` "
         "check above still runs against the real workspace files, not this copy."
     )

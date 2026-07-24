@@ -500,6 +500,59 @@ class RoundtableTests(unittest.TestCase):
             self.assertGreaterEqual(ordered[1] - ordered[0], 0.15)
             self.assertGreaterEqual(ordered[2] - ordered[1], 0.15)
 
+    def test_staggered_parallel_phase_can_cancel_agents_before_they_launch(self):
+        calls: list[str] = []
+
+        class DoneAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                calls.append(self.name)
+                return "Implemented and tested.\nTASK STATUS: complete"
+
+        class DelayedAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                calls.append(self.name)
+                return "This delayed CLI should never start"
+
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            session = roundtable.Session("Finish quickly", td, 0, "now", [])
+            agents = [("Codex", DoneAgent("Codex", workspace)),
+                      ("Claude", DelayedAgent("Claude", workspace)),
+                      ("Antigravity", DelayedAgent("Antigravity", workspace))]
+            roundtable._run_parallel_phase(
+                session, agents, "proposal", lambda *_: None, lambda *_: None, "Working",
+                task_status_check=True, stagger=0.5,
+            )
+            self.assertEqual(calls, ["Codex"])
+            self.assertEqual([turn.speaker for turn in session.turns], ["Codex"])
+
+    def test_parallel_speed_samples_exclude_stagger_wait(self):
+        observed: dict[str, float] = {}
+
+        class EqualSpeedAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                started = time.monotonic()
+                time.sleep(0.02)
+                observed[self.name] = time.monotonic() - started
+                return self.name
+
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            session = roundtable.Session("Measure fairly", td, 0, "now", [])
+            agents = [(name, EqualSpeedAgent(name, workspace))
+                      for name in ("Codex", "Claude", "Antigravity")]
+            speeds: dict[str, list[float]] = {}
+            roundtable._run_parallel_phase(
+                session, agents, "proposal", lambda *_: None, lambda *_: None, "Working",
+                agent_speed=speeds, stagger=0.2,
+            )
+            self.assertEqual(set(speeds), {"Codex", "Claude", "Antigravity"})
+            # Compare the recorded sample with the time actually spent inside run(), rather than
+            # assuming a sleeping thread always gets rescheduled within a fixed wall-time ceiling.
+            # If stagger wait leaked into the samples, later agents would differ by 0.2/0.4s.
+            for name, samples in speeds.items():
+                self.assertAlmostEqual(samples[0], observed[name], delta=0.05)
+
     def test_zero_stagger_still_runs_concurrently(self):
         # stagger=0 (what setUp uses for every other test) must not become sequential -- it should
         # just skip the extra sleep, not stop agents from genuinely overlapping.
@@ -1185,6 +1238,8 @@ class RoundtableTests(unittest.TestCase):
             session = roundtable.load_session(saved)
             sandbox = output_dir / "self-test-sandbox"
             self.assertIn(str(sandbox), session.objective)
+            self.assertIn("--mock --plain --skip-preflight", session.objective)
+            self.assertIn("--synthesis-passes 1 -r 0", session.objective)
             self.assertTrue((sandbox / "roundtable.py").is_file())
             self.assertTrue((sandbox / "test_roundtable.py").is_file())
             self.assertTrue((sandbox / "README.md").is_file())
@@ -1838,6 +1893,9 @@ class RoundtableTests(unittest.TestCase):
         self.assertEqual(roundtable.scope_hint("Codex", speeds), "")
         self.assertEqual(roundtable.scope_hint("Claude", speeds), "")
         self.assertIn("tightly scoped", roundtable.scope_hint("Antigravity", speeds))
+        # Sub-150ms difference should be ignored to prevent false triggers from GIL/scheduling jitter
+        jitter_speeds = {"Codex": [0.02], "Claude": [0.05]}
+        self.assertEqual(roundtable.scope_hint("Claude", jitter_speeds), "")
 
     def test_run_parallel_phase_scopes_the_agent_slow_in_an_earlier_phase(self):
         delays = {"Codex": 0.02, "Claude": 0.02, "Antigravity": 0.32}
@@ -2060,6 +2118,19 @@ class RoundtableTests(unittest.TestCase):
                 len(roundtable.synthesis_order("claude", session, *agents.values(), 10)),
                 len(roundtable.AGENT_NAMES))
 
+    def test_synthesis_order_preferred_first_overrides_chosen_drafter(self):
+        with tempfile.TemporaryDirectory() as td:
+            agents = {name: roundtable.MockAgent(name, Path(td)) for name in roundtable.AGENT_NAMES}
+            session = roundtable.Session("Objective", td, 0, "now", [])
+            order = roundtable.synthesis_order(
+                "claude", session, *agents.values(), preferred_first="Grok")
+            self.assertEqual(order[0][0], "Grok")
+            self.assertEqual({name for name, _ in order}, set(roundtable.AGENT_NAMES))
+            # Unknown or empty preferred names fall back to --synthesizer selection.
+            fallback = roundtable.synthesis_order(
+                "claude", session, *agents.values(), preferred_first="NotAnAgent")
+            self.assertEqual(fallback[0][0], "Claude")
+
     def test_synthesize_relays_a_draft_through_every_agent_in_order(self):
         seen_prompts: list[tuple[str, str]] = []
 
@@ -2088,6 +2159,28 @@ class RoundtableTests(unittest.TestCase):
             self.assertEqual(statuses[0], (("Claude",), "Claude is drafting the final answer"))
             self.assertEqual(statuses[1], (("Codex",), "Codex is refining the final answer"))
             self.assertEqual(statuses[-1], ((), "Final answer complete"))
+
+    def test_synthesize_keeps_latest_when_refiner_repeats_structured_answer(self):
+        class RepeatingAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                return (
+                    "## Completed\n\n- 10 tests passed.\n\n## Failed / incomplete\n\nNone.\n\n"
+                    "## Completed\n\n- 11 tests passed.\n\n## Failed / incomplete\n\nNone."
+                )
+
+        with tempfile.TemporaryDirectory() as td:
+            agent = RepeatingAgent("Claude", Path(td))
+            session = roundtable.Session("Goal", td, 0, "now", [])
+            ticks = []
+            result = roundtable.synthesize(
+                session, [("Claude", agent)],
+                lambda name, line: ticks.append((name, line)), lambda *_: None)
+
+        self.assertEqual(result.count("## Completed"), 1)
+        self.assertNotIn("10 tests passed", result)
+        self.assertIn("11 tests passed", result)
+        self.assertIn(
+            ("Claude", "discarded an earlier duplicated final-answer block"), ticks)
 
     def test_synthesize_keeps_last_good_draft_when_a_refiner_fails(self):
         class RefiningAgent(roundtable.Agent):
@@ -2204,9 +2297,12 @@ class RoundtableTests(unittest.TestCase):
         turns = [
             roundtable.Turn("Codex", "proposal", "**DIBS: the auth flow**\nDid the work."),
             roundtable.Turn("Claude", "proposal", "`DIBS: the docs`\nWrote the docs."),
+            roundtable.Turn("Antigravity", "proposal", "### DIBS: the UI widgets\nDrafted widgets."),
+            roundtable.Turn("Aider", "proposal", "- DIBS: the backoff logic\nImplemented backoff."),
         ]
         self.assertEqual(roundtable.extract_dibs(turns),
-                         {"Codex": "the auth flow", "Claude": "the docs"})
+                         {"Codex": "the auth flow", "Claude": "the docs",
+                          "Antigravity": "the UI widgets", "Aider": "the backoff logic"})
 
     def test_extract_dibs_does_not_allocate_a_lowercase_copy_before_regex_search(self):
         class NoLowerCopy(str):
@@ -2330,6 +2426,17 @@ class RoundtableTests(unittest.TestCase):
         self.assertFalse(roundtable.signals_task_complete(
             "TASK STATUS: complete\nVerification still pending."
         ))
+
+    def test_stored_signed_turn_preserves_task_complete_signal(self):
+        turn = roundtable.Turn(
+            "Codex", "proposal",
+            roundtable.sign_agent_work("Codex", "Done and verified.\nTASK STATUS: complete"),
+        )
+        self.assertTrue(roundtable.turn_signals_task_complete(turn))
+        self.assertFalse(roundtable.turn_signals_task_complete(roundtable.Turn(
+            "Codex", "proposal",
+            roundtable.sign_agent_work("Codex", "Still working.\nTASK STATUS: in-progress"),
+        )))
 
     def test_prompt_for_includes_task_status_hint_only_when_requested(self):
         plain = roundtable.prompt_for("Goal", [], "proposal", "Codex")
@@ -2594,6 +2701,81 @@ class RoundtableTests(unittest.TestCase):
             self.assertEqual(proposal_speakers, ["Codex"])
             self.assertEqual(set(review_speakers), set(roundtable.AGENT_NAMES))
 
+    def test_resumed_conduct_does_not_repeat_reviews_after_checkpointed_completion(self):
+        class RecordingAgent(roundtable.Agent):
+            review_phases: list[str] = []
+
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                for phase in ("review 1", "review 2", "review 3"):
+                    if f", {phase})" in prompt:
+                        type(self).review_phases.append(phase)
+                        break
+                return f"{self.name} contribution"
+
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            completed = roundtable.Turn(
+                "Codex", "proposal",
+                roundtable.sign_agent_work(
+                    "Codex", "Implemented and verified.\nTASK STATUS: complete"),
+            )
+            session = roundtable.Session("Goal", td, 3, "now", [completed])
+            agents = [RecordingAgent(name, workspace) for name in roundtable.AGENT_NAMES]
+            RecordingAgent.review_phases = []
+            roundtable.conduct(
+                session, *agents, lambda *_: None, lambda *_: None,
+                synthesizer="codex", synthesis_passes=1, task_status_check=True,
+                completed_phases={"proposal"}, stagger=0,
+            )
+            self.assertEqual(set(RecordingAgent.review_phases), {"review 1"})
+            self.assertEqual(len(RecordingAgent.review_phases), len(roundtable.AGENT_NAMES))
+            self.assertFalse(any(turn.phase in {"review 2", "review 3"}
+                                 for turn in session.turns))
+
+    def test_resumed_conduct_still_runs_one_verification_review_after_a_mid_review_completion(self):
+        """Regression: the checkpointed-completion reconstruction in conduct() must count phases
+        that ran *before* the completing phase (no decrement) separately from phases after it
+        (each one spends one unit of the one-verification-review budget). A completion recorded on
+        "review 1" rather than "proposal" exercises that ordering: proposal must not consume the
+        budget (it precedes the completion), review 2 is the one allowed verification round, and
+        review 3 must still be skipped."""
+        class RecordingAgent(roundtable.Agent):
+            review_phases: list[str] = []
+
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                for phase in ("review 1", "review 2", "review 3"):
+                    if f", {phase})" in prompt:
+                        type(self).review_phases.append(phase)
+                        break
+                return f"{self.name} contribution"
+
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            proposal_turns = [
+                roundtable.Turn(name, "proposal", roundtable.sign_agent_work(name, "Proposed."))
+                for name in roundtable.AGENT_NAMES
+            ]
+            review_turns = [
+                roundtable.Turn(
+                    name, "review 1",
+                    roundtable.sign_agent_work(
+                        name, "Implemented and verified.\nTASK STATUS: complete"
+                        if name == "Codex" else "Reviewed."))
+                for name in roundtable.AGENT_NAMES
+            ]
+            session = roundtable.Session(
+                "Goal", td, 3, "now", proposal_turns + review_turns)
+            agents = [RecordingAgent(name, workspace) for name in roundtable.AGENT_NAMES]
+            RecordingAgent.review_phases = []
+            roundtable.conduct(
+                session, *agents, lambda *_: None, lambda *_: None,
+                synthesizer="codex", synthesis_passes=1, task_status_check=True,
+                completed_phases={"proposal", "review 1"}, stagger=0,
+            )
+            self.assertEqual(set(RecordingAgent.review_phases), {"review 2"})
+            self.assertEqual(len(RecordingAgent.review_phases), len(roundtable.AGENT_NAMES))
+            self.assertFalse(any(turn.phase == "review 3" for turn in session.turns))
+
     def test_conduct_synthesis_survives_a_task_status_check_cancellation_earlier_in_the_run(self):
         """Regression: a task_status_check completion sets a shared cancel_event on every agent to
         stop the round. Real Agent.run() falls back to self.cancel_event when no override is passed
@@ -2622,6 +2804,68 @@ class RoundtableTests(unittest.TestCase):
             self.assertTrue(session.final)
             self.assertEqual([t.phase for t in session.turns], ["proposal", "consensus"])
 
+    def test_conduct_skips_remaining_reviews_after_verified_completion(self):
+        """After TASK STATUS: complete + one verification review, later configured reviews are cut."""
+        class DoneAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                if f"YOUR TURN ({self.name}, proposal)" in prompt:
+                    if self.name == "Codex":
+                        return "Implemented and verified.\nTASK STATUS: complete"
+                    while not self.cancel_event.is_set():
+                        time.sleep(0.01)
+                    raise RuntimeError(f"{self.name} cancelled")
+                return f"{self.name} review contribution"
+
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            session = roundtable.Session("Multi-review goal", td, 3, "now", [])
+            agents = [DoneAgent(name, workspace) for name in roundtable.AGENT_NAMES]
+            statuses: list[str] = []
+            roundtable.conduct(
+                session, *agents, lambda *_: None,
+                lambda _active, message: statuses.append(message),
+                synthesizer="codex", synthesis_passes=1, task_status_check=True, stagger=0,
+            )
+            phases = {turn.phase for turn in session.turns}
+            self.assertIn("proposal", phases)
+            self.assertIn("review 1", phases)
+            self.assertNotIn("review 2", phases)
+            self.assertNotIn("review 3", phases)
+            self.assertTrue(any("skipping remaining review" in message for message in statuses))
+
+    def test_conduct_trims_synthesis_and_prefers_completer_after_early_complete(self):
+        """When the objective is already done, synthesis is draft+one-refine and the completer drafts."""
+        synthesis_speakers: list[str] = []
+
+        class DoneAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                if "CURRENT DRAFT FINAL ANSWER" in prompt or "You are the final editor" in prompt:
+                    synthesis_speakers.append(self.name)
+                    return f"{self.name} final"
+                if f"YOUR TURN ({self.name}, proposal)" in prompt:
+                    if self.name == "Claude":
+                        return "Claude finished the work.\nTASK STATUS: complete"
+                    while not self.cancel_event.is_set():
+                        time.sleep(0.01)
+                    raise RuntimeError(f"{self.name} cancelled")
+                return f"{self.name} contribution"
+
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            session = roundtable.Session("Early complete synth", td, 0, "now", [])
+            agents = [DoneAgent(name, workspace) for name in roundtable.AGENT_NAMES]
+            statuses: list[str] = []
+            roundtable.conduct(
+                session, *agents, lambda *_: None,
+                lambda _active, message: statuses.append(message),
+                synthesizer="rotate", synthesis_passes=6, task_status_check=True, stagger=0,
+            )
+            self.assertEqual(synthesis_speakers[0], "Claude")
+            self.assertEqual(len(synthesis_speakers),
+                             roundtable.EARLY_COMPLETE_SYNTHESIS_PASSES)
+            self.assertTrue(any("shorter final synthesis" in message for message in statuses))
+            self.assertIn("Claude", session.final)
+
     def test_run_with_retry_recovers_from_a_transient_failure(self):
         class FlakyAgent(roundtable.Agent):
             attempts = 0
@@ -2634,11 +2878,11 @@ class RoundtableTests(unittest.TestCase):
 
         agent = FlakyAgent("Codex", Path("/tmp"))
         ticks = []
-        with mock.patch.object(roundtable.time, "sleep") as sleep_mock:
+        with mock.patch.object(threading.Event, "wait", return_value=False) as wait_mock:
             result = roundtable._run_with_retry(agent, "prompt", ticks.append)
         self.assertEqual(result, "recovered on retry")
         self.assertEqual(FlakyAgent.attempts, 2)
-        sleep_mock.assert_called_once_with(roundtable.RETRY_BACKOFF_SECONDS)
+        wait_mock.assert_called_with(roundtable.RETRY_BACKOFF_SECONDS)
         self.assertTrue(any("retrying once" in t for t in ticks))
 
     def test_run_with_retry_tells_agent_to_check_progress_before_a_transient_retry(self):
@@ -2652,7 +2896,9 @@ class RoundtableTests(unittest.TestCase):
                 return "recovered"
 
         agent = FlakyAgent("Codex", Path("/tmp"))
-        with mock.patch.object(roundtable.time, "sleep"):
+        # Backoff uses cancel_event.wait so a task_status_check cancel can interrupt it; patch that
+        # path rather than time.sleep, which is no longer the wait mechanism.
+        with mock.patch.object(threading.Event, "wait", return_value=False):
             roundtable._run_with_retry(agent, "original prompt", lambda _: None)
         self.assertEqual(FlakyAgent.prompts[0], "original prompt")
         self.assertIn(roundtable.RERUN_PROGRESS_NOTE, FlakyAgent.prompts[1])
@@ -2744,6 +2990,22 @@ class RoundtableTests(unittest.TestCase):
         cancel_event.set()
         with self.assertRaisesRegex(RuntimeError, "Codex cancelled"):
             roundtable._run_with_retry(agent, "original task", lambda _: None, cancel_event)
+
+    def test_retry_backoff_aborts_immediately_on_cancellation(self):
+        class TransientFailAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                raise RuntimeError("transient connection error")
+
+        agent = TransientFailAgent("Codex", Path("/tmp"))
+        cancel_event = threading.Event()
+
+        def _cancel_later():
+            time.sleep(0.01)
+            cancel_event.set()
+
+        threading.Thread(target=_cancel_later).start()
+        with self.assertRaisesRegex(RuntimeError, "Codex cancelled"):
+            roundtable._run_with_retry(agent, "task", lambda _: None, cancel_event)
 
     def test_usage_limit_detector_matches_provider_message_without_generic_limit_word(self):
         self.assertIn("session limit", roundtable.usage_limit_detail(
