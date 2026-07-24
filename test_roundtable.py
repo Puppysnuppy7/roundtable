@@ -72,6 +72,7 @@ def make_test_display(h=48, w=160, turns=None):
     display.work_reads = {name: 0 for name in display.usage_names}
     display.work_execs = {name: 0 for name in display.usage_names}
     display.work_writes = {name: 0 for name in display.usage_names}
+    display.usage_percent = {}
     display.turn_start = {}
     display._known_turn_count = len(display.session.turns)
     display.console = roundtable.deque(maxlen=300)
@@ -1326,6 +1327,61 @@ class RoundtableTests(unittest.TestCase):
         self.assertEqual(display.console[-1][0], "turn")
         self.assertIn("Codex · proposal", display.console[-1][1])
 
+    def _make_tick_only_display(self):
+        """A Display wired up just enough to call tick() without touching real curses draw/input."""
+        display = roundtable.Display.__new__(roundtable.Display)
+        display.session = roundtable.Session("Goal", "/tmp", 0, "now", [])
+        display.usage_names = ("Codex", "Claude", "Antigravity", "Aider", "Grok", "Qwen")
+        display.turn_times = {name: [] for name in display.usage_names}
+        display.turn_outputs = {name: [] for name in display.usage_names}
+        display.activity_pulses = {name: roundtable.deque(maxlen=200) for name in display.usage_names}
+        display.work_activity = {name: roundtable.deque(maxlen=200) for name in display.usage_names}
+        display.work_reads = {name: 0 for name in display.usage_names}
+        display.work_execs = {name: 0 for name in display.usage_names}
+        display.work_writes = {name: 0 for name in display.usage_names}
+        display.usage_percent = {}
+        display.turn_start = {}
+        display._known_turn_count = 0
+        display.frame = 0
+        display.activity = {}
+        display.started = time.monotonic()
+        display.console = roundtable.deque(maxlen=300)
+        display.run_log = roundtable.RunLog(None)
+        display.expanded = None
+        display.monitor = mock.Mock(refresh=lambda: None)
+        display.draw = lambda: None
+        display.poll_input = lambda: None
+        return display
+
+    def test_parse_usage_gauge_picks_up_a_self_reported_percentage(self):
+        display = self._make_tick_only_display()
+        display.tick("Codex", "You've used 93% of your usage limit")
+        self.assertEqual(display.usage_percent["Codex"], 93.0)
+        display.tick("Codex", "still working on it")  # a non-matching line must not clear it
+        self.assertEqual(display.usage_percent["Codex"], 93.0)
+
+    def test_parse_usage_gauge_pins_100_on_hit_and_clears_on_recovery(self):
+        display = self._make_tick_only_display()
+        display.tick("Claude", "temporarily unavailable: You've hit your session limit")
+        self.assertEqual(display.usage_percent["Claude"], 100.0)
+        display.tick("Claude", "agent available again — retrying the original task")
+        self.assertNotIn("Claude", display.usage_percent)
+
+    def test_agent_panel_shows_the_usage_gauge_when_known(self):
+        display = make_test_display()
+        display.usage_percent["Antigravity"] = 93.0
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False):
+            display.draw()
+        self.assertIn("93% used", display.s.text())
+
+    def test_agent_panel_omits_the_gauge_when_no_signal_has_been_seen(self):
+        display = make_test_display()
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False):
+            display.draw()
+        self.assertNotIn("% used", display.s.text())
+
     def test_update_status_logs_phase_message_changes_once(self):
         display = roundtable.Display.__new__(roundtable.Display)
         display.active = set()
@@ -2145,6 +2201,19 @@ class RoundtableTests(unittest.TestCase):
             "You've hit your session limit · resets 5:30pm (America/Chicago)"))
         self.assertIsNone(roundtable.usage_limit_detail(
             "Please limit this implementation to the requested scope."))
+
+    def test_usage_percent_used_parses_used_and_remaining_phrasings(self):
+        self.assertEqual(roundtable.usage_percent_used(
+            "You've used 93% of your usage limit"), 93.0)
+        self.assertEqual(roundtable.usage_percent_used("used 42%"), 42.0)
+        self.assertEqual(roundtable.usage_percent_used(
+            "7% remaining until your session limit resets"), 93.0)
+        self.assertEqual(roundtable.usage_percent_used("20% left"), 80.0)
+        self.assertIsNone(roundtable.usage_percent_used("Reading app.py"))
+
+    def test_usage_percent_used_clamps_to_the_valid_range(self):
+        self.assertEqual(roundtable.usage_percent_used("used 150%"), 100.0)
+        self.assertEqual(roundtable.usage_percent_used("150% remaining"), 0.0)
 
     def test_parse_reset_time_returns_todays_time_when_still_upcoming(self):
         now = datetime(2026, 7, 20, 17, 0)

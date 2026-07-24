@@ -115,6 +115,11 @@ you already know the CLIs are reachable. A provider session/usage-limit response
 temporary rather than a failed preflight: the run starts, the other agents can work, and the limited
 agent waits until it becomes available again.
 
+Each agent's panel shows a "used N% of usage limit" gauge (yellow at 80%, red at 95%+) whenever a
+figure is actually known: hitting the limit above pins it at 100% until the agent answers again, and
+a CLI's own self-reported percentage (when one prints it) is picked up opportunistically in between.
+No CLI is guessed at or estimated — an agent with no such signal simply shows no gauge at all.
+
 Some agents are just slow to answer even a trivial check without anything being wrong — sandboxed
 agents in particular can spend most of that time on their own startup overhead (e.g. Antigravity's
 sandbox, or Aider/Qwen against certain providers) rather than the model call itself. `--extended-preflight`
