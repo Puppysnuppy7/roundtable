@@ -2512,5 +2512,23 @@ class RoundtableTests(unittest.TestCase):
         self.assertEqual(calls, 1)
         mock_restart.assert_called_once_with(args, session_path, False)
 
+    @unittest.skipUnless(os.name == "posix", "process-group cancellation is POSIX-specific")
+    def test_agent_cancellation_stops_the_whole_subprocess_group(self):
+        agent = roundtable.Agent("Claude", Path("/tmp"))
+        cancelled = threading.Event()
+        cancelled.set()
+        proc = mock.Mock(pid=4321, stdout=[])
+        proc.poll.return_value = None
+        proc.wait.return_value = 0
+
+        with mock.patch.object(roundtable.subprocess, "Popen", return_value=proc) as popen, \
+             mock.patch.object(roundtable.os, "killpg") as killpg:
+            with self.assertRaisesRegex(RuntimeError, "Claude cancelled"):
+                agent.run("task", lambda _line: None, cancelled)
+
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        killpg.assert_called_once_with(proc.pid, roundtable.signal.SIGTERM)
+        proc.terminate.assert_not_called()
+
 if __name__ == "__main__":
     unittest.main()

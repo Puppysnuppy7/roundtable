@@ -13,6 +13,7 @@ import os
 import queue
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -413,6 +414,8 @@ QWEN_SAFE_MODE_BANNER = re.compile(r"^⚠ SAFE MODE.*$\n?", re.MULTILINE)
 
 
 class Agent:
+    """One coding-agent CLI (Codex, Claude, Antigravity, Aider, Grok, or Qwen) and how to run it."""
+
     def __init__(self, name: str, workspace: Path, model: str | None = None,
                  elevated: bool = False, debug: bool = False):
         self.name = name
@@ -507,6 +510,7 @@ class Agent:
 
     def run(self, prompt: str, on_tick: Callable[[str], None],
             cancel_event: threading.Event | None = None, no_edit: bool = False) -> str:
+        """Run the agent on prompt to completion, streaming lines to on_tick as they arrive."""
         cancel_event = cancel_event or self.cancel_event
         with tempfile.TemporaryDirectory(prefix="roundtable-") as td:
             output_file = Path(td) / "last.txt" if self.name == "Codex" else None
@@ -514,10 +518,15 @@ class Agent:
             if self.debug:
                 sys.stderr.write(f"[debug] [{self.name}] exec cmd: {' '.join(cmd)} (cwd={self.workspace})\n")
                 sys.stderr.flush()
-            proc = subprocess.Popen(
-                cmd, cwd=self.workspace, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1, encoding="utf-8", errors="replace",
-            )
+            try:
+                proc = subprocess.Popen(
+                    cmd, cwd=self.workspace, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1, encoding="utf-8", errors="replace",
+                    # Own session so cancel can signal the whole process group (CLI + tools).
+                    start_new_session=os.name == "posix",
+                )
+            except OSError as exc:
+                raise RuntimeError(f"{self.name} failed to start process: {exc}") from exc
             if self.debug:
                 sys.stderr.write(f"[debug] [{self.name}] started PID={proc.pid}\n")
                 sys.stderr.flush()
@@ -525,21 +534,40 @@ class Agent:
             events: queue.SimpleQueue[str] = queue.SimpleQueue()
 
             def read_output() -> None:
-                assert proc.stdout is not None
-                for line in proc.stdout:
-                    captured.append(line)
-                    events.put(line.rstrip())
+                try:
+                    assert proc.stdout is not None
+                    for line in proc.stdout:
+                        captured.append(line)
+                        events.put(line.rstrip())
+                except Exception:
+                    # Pipe closes when the process is stopped; ignore reader teardown noise.
+                    return
 
             reader = threading.Thread(target=read_output, daemon=True)
             reader.start()
+
+            def send_signal(sig: int) -> None:
+                """Signal the CLI and any tool subprocesses it started."""
+                try:
+                    if os.name == "posix":
+                        os.killpg(proc.pid, sig)
+                    else:
+                        proc.send_signal(sig)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+
             def stop_process() -> None:
                 if proc.poll() is not None:
                     return
-                proc.terminate()
+                send_signal(signal.SIGTERM)
                 try:
                     proc.wait(timeout=3)
                 except subprocess.TimeoutExpired:
-                    proc.kill()
+                    send_signal(signal.SIGKILL)
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        pass
 
             try:
                 while proc.poll() is None:
