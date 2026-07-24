@@ -753,6 +753,16 @@ class RoundtableTests(unittest.TestCase):
         self.assertNotIn("--edit-format", command)
         self.assertEqual(command[-2:], ["--model", "mistral/codestral-latest"])
 
+    def test_aider_command_bounds_each_api_call_with_a_timeout(self):
+        # Observed in practice: Aider's own default (unbounded) hung 45+ minutes on a single API
+        # call after a malformed provider response, even with --edit-format ask already active --
+        # this is a separate failure mode from the edit-reflection loop, one level lower (LiteLLM's
+        # own response parsing), so it needs its own fix regardless of no_edit.
+        agent = roundtable.Agent("Aider", Path("/tmp/work"))
+        command = agent.command("Solve this")
+        self.assertIn("--timeout", command)
+        self.assertEqual(command[command.index("--timeout") + 1], "180")
+
     def test_aider_no_edit_uses_ask_mode_to_avoid_the_edit_reflection_loop(self):
         # Verified in practice: without --edit-format ask, a synthesis-phase prompt (prose only,
         # but often quoting code from another agent's proposal) can make Aider mistake that quote

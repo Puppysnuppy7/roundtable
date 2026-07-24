@@ -452,8 +452,14 @@ class Agent:
             # Claude's --permission-mode acceptEdits). --no-git keeps Aider from ever auto-creating a
             # repo or auto-committing in a workspace that doesn't already use git -- matching the
             # other agents and this harness, none of which commit on the user's behalf unasked.
+            # --timeout bounds each individual API call. Its default is None (unbounded) --
+            # observed in practice hanging 45+ minutes on a single call after a malformed
+            # response from the provider (a LiteLLM/Mistral response-parsing compatibility issue,
+            # not an edit-format problem: it happened even with --edit-format ask active). A
+            # bounded timeout makes Aider fail that one call fast instead, so this harness's own
+            # _run_with_retry can retry it -- which resolves in seconds, not tens of minutes.
             cmd = ["aider", "--message", prompt, "--yes-always", "--no-pretty",
-                   "--no-check-update", "--no-analytics", "--no-git"]
+                   "--no-check-update", "--no-analytics", "--no-git", "--timeout", "180"]
             cmd += ["--suggest-shell-commands"] if self.elevated else ["--no-suggest-shell-commands"]
             if no_edit:
                 # Verified in practice: without this, synthesis-phase prompts (which ask for prose,
