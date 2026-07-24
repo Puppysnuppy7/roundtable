@@ -2383,9 +2383,13 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
         ui.busy = False
         ui.status = "Ready"
         followup = resumed
+        # completed_phases is only set for a --self checkpoint restart continuing a run already in
+        # progress: the follow-up (or objective) that drives it is already in session.turns, so
+        # unlike a genuine --resume with no follow-up text, there's nothing left to prompt for here.
+        restarting = completed_phases is not None
         if resumed and not session.turns[-1:]:
             raise ValueError("a resumed session has no transcript")
-        if resumed and session.turns[-1].speaker != "User":
+        if resumed and not restarting and session.turns[-1].speaker != "User":
             drain_queued_prompts(session)
             if session.turns[-1].speaker != "User":
                 request = read_followup_ui(stdscr, ui)
@@ -2622,7 +2626,11 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     args.touch_mode = has_touchscreen() if args.touch is None else args.touch
-    if not args.plain and sys.stdin.isatty() and sys.stdout.isatty():
+    # A --self restart already carries the flags the user chose before the edit (restart_arguments
+    # rebuilds the full invocation from args), so re-showing the toggle screen here would just be an
+    # unwanted prompt in the middle of an unattended run.
+    if (not args.plain and args.continue_after_restart is None
+            and sys.stdin.isatty() and sys.stdout.isatty()):
         started_elevated = bool(args.elevated)
         toggled = curses.wrapper(read_options_ui, {
             "elevated": started_elevated,

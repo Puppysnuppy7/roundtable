@@ -41,7 +41,9 @@ roundtable
 
 In a real terminal (not `--plain` or piped), startup shows a quick numbered toggle screen for the
 opt-in options below before anything else — press the number shown next to an option to flip it,
-then Enter (or Esc/`q`) to continue. Any matching CLI flag you already passed sets that toggle's
+then Enter (or Esc/`q`) to continue (skipped on a `--self` restart, which carries forward the
+choices already made before the source changed, so it can relaunch unattended). Any matching CLI
+flag you already passed sets that toggle's
 starting state; leaving a toggle untouched keeps whatever the flag specified (so a specific
 `--elevated codex` survives even if you don't touch that option).
 

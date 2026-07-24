@@ -1165,6 +1165,35 @@ class RoundtableTests(unittest.TestCase):
             self.assertFalse(result_args.self)  # left untouched
             self.assertFalse(result_args.task_status_check)
 
+    def test_main_skips_the_options_toggle_screen_on_a_self_restart_continuation(self):
+        """restart_arguments() already rebuilds the full invocation from the flags the user chose
+        before the source changed, so re-showing the interactive toggle screen on the resulting
+        --continue-after-restart relaunch would stop an otherwise-unattended --self restart on
+        input the user has no way to know it's waiting for."""
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session("Task", td, 1, "now",
+                                         [roundtable.Turn("Codex", "proposal", "Partial work")])
+            session_path, _ = roundtable.save_session(session, Path(td))
+            argv = ["roundtable", "--resume", str(session_path),
+                    "--continue-after-restart", "initial", "--self", "--mock",
+                    "--skip-preflight"]
+            captured = {}
+
+            def fake_wrapper(func, *wrapper_args, **_):
+                if func is roundtable.read_options_ui:
+                    raise AssertionError("toggle screen must not run on a --self restart")
+                if func is roundtable.run_tui:
+                    captured["args"] = wrapper_args[0]
+                    return 0
+                raise AssertionError(f"unexpected curses.wrapper target: {func}")
+
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(sys.stdin, "isatty", return_value=True), \
+                 mock.patch.object(sys.stdout, "isatty", return_value=True), \
+                 mock.patch.object(roundtable.curses, "wrapper", side_effect=fake_wrapper):
+                self.assertEqual(roundtable.main(), 0)
+            self.assertTrue(captured["args"].self)
+
     def test_every_store_true_opt_in_flag_has_a_matching_options_screen_toggle(self):
         """Guards against parser flags added to the parser without a matching entry in OPTION_TOGGLES,
         so the interactive menu silently falls behind."""
@@ -2511,6 +2540,45 @@ class RoundtableTests(unittest.TestCase):
         self.assertEqual(ret, 0)
         self.assertEqual(calls, 1)
         mock_restart.assert_called_once_with(args, session_path, False)
+
+    def test_run_tui_restart_continuation_skips_the_followup_prompt(self):
+        """Regression: main() passes resumed=True for a --continue-after-restart followup relaunch
+        (it reuses the followup flag for both), and the last turn before such a restart is always
+        an agent's, not the user's -- so without gating on completed_phases too, this looked
+        exactly like a genuine --resume missing its follow-up text and blocked on read_followup_ui
+        before conduct() ever ran, silently hanging an unattended --self restart."""
+        session = roundtable.Session("Task", "/tmp", 1, "now", [
+            roundtable.Turn("User", "follow-up", "Do the thing"),
+            roundtable.Turn("Codex", "followup-proposal", "Partial work"),
+        ])
+        args = roundtable.argparse.Namespace(
+            output_dir="/tmp", skip_preflight=True, preflight_timeout=5,
+            touch_mode=False, collab="parallel", synthesizer="rotate",
+            balance_load=False, task_status_check=False, reassign_idle=False,
+            synthesis_passes=3)
+        captured = {}
+
+        def stub_conduct(active_session, *_args, **kwargs):
+            captured["completed_phases"] = kwargs.get("completed_phases")
+            active_session.turns.append(roundtable.Turn("Final", "consensus", "done"))
+
+        test_display = make_test_display()
+        test_display.session = session
+        stdscr = mock.MagicMock()
+        with mock.patch("roundtable.Display", return_value=test_display), \
+             mock.patch("roundtable.conduct", side_effect=stub_conduct), \
+             mock.patch("roundtable.read_followup_ui", return_value="") as mock_followup_ui, \
+             mock.patch("roundtable.save_session", return_value=("/tmp/s.json", "/tmp/s.md")), \
+             mock.patch("roundtable.suppress_focus_reporting"):
+            ret = roundtable.run_tui(
+                stdscr, args, session, None, None, None, None, None, None, resumed=True,
+                completed_phases={"followup-proposal"})
+
+        self.assertEqual(ret, 0)
+        self.assertEqual(captured.get("completed_phases"), {"followup-proposal"})
+        # The only call is the legitimate post-completion "what's next" prompt, not a blocking
+        # one before conduct() ran.
+        mock_followup_ui.assert_called_once()
 
     @unittest.skipUnless(os.name == "posix", "process-group cancellation is POSIX-specific")
     def test_agent_cancellation_stops_the_whole_subprocess_group(self):
