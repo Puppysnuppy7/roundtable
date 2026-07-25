@@ -213,6 +213,10 @@ when the next fresh run starts (a brand-new objective, or a plain `--resume` of 
 exited) — not a `--self` restart continuing the same run, which keeps the board intact. Resetting at
 the start rather than only at a clean exit means even a hard kill can't leave stale claims, old test
 counts, or obsolete requests to steer an unrelated later run.
+Active board entries are included directly in each agent prompt. To keep an accidentally large
+board from crowding out the objective and transcript, this prompt excerpt is capped at 12,000
+characters and favors the newest content; the complete board remains available in the workspace
+and activity log.
 
 The console opens on **key events** — phase changes, completed turns, and errors — instead of a
 firehose of every raw line each CLI prints, so the signal-dense view is the default. Press `c` to
@@ -274,10 +278,15 @@ and not another agent's opinion — runs `python3 -m unittest test_roundtable` a
 workspace and reports the real pass/fail result (`independent verification: PASS — Ran 333 tests in
 45.0s · OK`, or the equivalent `FAIL` line). An agent's own claim of "233 tests passed" is never
 taken at face value; ground truth is checked after every single turn that could have changed the
-code. This adds real wall-clock time to a `--self` run (one full test-suite invocation per agent per
-phase) but catches an overclaiming or hallucinating agent immediately, rather than after the fact.
-It costs nothing outside `--self` (there is no known test command for an arbitrary workspace) and
-nothing during `--mock` (a MockAgent's simulated output has no real code change behind it to check).
+code. Concurrent post-turn checks in a parallel phase are serialized, and a workspace whose
+`roundtable.py` / `test_roundtable.py` / `README.md` content matches the last verification reuses
+that result instead of spawning another full suite (so six agents finishing over unchanged source
+pay for one suite, not six). Changing any of those files invalidates the cache for that workspace;
+timeouts and launch failures are not cached. This still adds real wall-clock time to a `--self` run
+when source actually changes, but catches an overclaiming or hallucinating agent immediately rather
+than after the fact. It costs nothing outside `--self` (there is no known test command for an
+arbitrary workspace) and nothing during `--mock` (a MockAgent's simulated output has no real code
+change behind it to check).
 
 A CLI failure on a real, load-bearing proposal, review, or initial final-draft turn is retried once
 after a short pause before it's treated as fatal — real-world failures on a long run are often a

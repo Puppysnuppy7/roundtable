@@ -37,6 +37,7 @@ solution. Do not merely agree. Your response becomes part of a shared transcript
 self-contained and concise. Do not address the user until asked for the final answer."""
 
 AGENT_PROMPT_FILE = "AGENT_PROMPTS.md"
+AGENT_PROMPT_CONTEXT_CHARS = 12_000
 AGENT_PROMPT_TEMPLATE = """# Agent prompt board
 
 This per-run append-only board lets agents leave focused questions, requests, and candidate
@@ -124,6 +125,26 @@ def finalize_agent_prompt_file(workspace: Path, run_log: RunLog) -> None:
         run_log.write("error", f"Could not archive {path}: {type(exc).__name__}: {exc}")
 
 
+def extract_agent_prompt_entries(workspace: Path | str) -> str:
+    """Extract recent entries appended beyond the template, capped for prompt safety."""
+    path = Path(workspace) / AGENT_PROMPT_FILE
+    if not path.is_file():
+        return ""
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    template_stripped = AGENT_PROMPT_TEMPLATE.rstrip()
+    entries = (content[len(template_stripped):] if content.startswith(template_stripped)
+               else content).strip()
+    if len(entries) <= AGENT_PROMPT_CONTEXT_CHARS:
+        return entries
+    omitted = len(entries) - AGENT_PROMPT_CONTEXT_CHARS
+    return (f"[... {omitted} older characters omitted; read {AGENT_PROMPT_FILE} for the full board ...]\n"
+            f"{entries[-AGENT_PROMPT_CONTEXT_CHARS:]}")
+
+
+
 # Prefixed onto the objective for --self runs, so it's part of every prompt for the whole session
 # (including follow-ups) without threading a new parameter through prompt_for/final_prompt/conduct.
 SELF_EDIT_NOTE = (
@@ -166,6 +187,46 @@ def self_sandbox_path(session: "Session") -> str | None:
 
 SELF_VERIFICATION_TIMEOUT_SECONDS = 300.0
 
+# Files whose content determines whether a --self workspace's tests still need re-running.
+# Matches the files agents are told they may edit in SELF_EDIT_NOTE.
+SELF_SOURCE_FILES: tuple[str, ...] = ("roundtable.py", "test_roundtable.py", "README.md")
+
+# Serialize concurrent post-turn verifications in a parallel --self phase, and reuse the last
+# result when the source fingerprint is unchanged. Without this, six agents finishing together
+# each spawn a full unittest suite against identical files (~minute each, thrashing the machine).
+_SELF_VERIFICATION_LOCK = threading.Lock()
+# resolved workspace path -> (fingerprint, passed, detail)
+_SELF_VERIFICATION_CACHE: dict[str, tuple[str, bool, str]] = {}
+
+
+def clear_self_verification_cache() -> None:
+    """Drop cached --self verification results (tests call this between cases)."""
+    with _SELF_VERIFICATION_LOCK:
+        _SELF_VERIFICATION_CACHE.clear()
+
+
+def self_source_fingerprint(workspace: Path | str) -> str:
+    """Stable hash of the files that define roundtable's own source in this workspace.
+
+    Missing files are treated as empty so a partial sandbox still fingerprints deterministically.
+    Content is hashed rather than mtime so a rewrite that restores identical bytes still hits cache.
+    """
+    root = Path(workspace)
+    digest = hashlib.sha256()
+    for name in SELF_SOURCE_FILES:
+        digest.update(name.encode())
+        digest.update(b"\0")
+        path = root / name
+        try:
+            if path.is_file():
+                digest.update(path.read_bytes())
+        except OSError:
+            # Unreadable path contributes only its name; the subsequent suite run will surface the
+            # real failure if verification actually needs that file.
+            pass
+        digest.update(b"\0")
+    return digest.hexdigest()
+
 
 def self_verification_command(workspace: Path | str) -> list[str] | None:
     """The deterministic check for a --self session, if this workspace is roundtable's own source.
@@ -185,20 +246,34 @@ def run_self_verification(
     claimed about it -- the same discipline as re-running a test suite yourself rather than taking a
     self-report at face value. Returns (passed, one-line detail), or None when this workspace has
     nothing to verify this way (not a --self session).
+
+    Concurrent callers (a parallel phase's post-turn checks) are serialized, and a workspace whose
+    SELF_SOURCE_FILES fingerprint matches the last successful/failed run reuses that result without
+    spawning another suite. Changing any of those files invalidates the cache for that workspace.
     """
     command = self_verification_command(workspace)
     if command is None:
         return None
-    try:
-        result = subprocess.run(
-            command, cwd=workspace, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return False, f"verification timed out after {timeout:.0f}s"
-    except OSError as exc:
-        return False, f"could not run verification: {type(exc).__name__}: {exc}"
-    lines = [line for line in (result.stdout + "\n" + result.stderr).splitlines() if line.strip()]
-    detail = " · ".join(lines[-2:]) if len(lines) >= 2 else (lines[-1] if lines else "no output")
-    return result.returncode == 0, detail
+    root = str(Path(workspace).resolve())
+    fingerprint = self_source_fingerprint(workspace)
+    with _SELF_VERIFICATION_LOCK:
+        cached = _SELF_VERIFICATION_CACHE.get(root)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1], cached[2]
+        try:
+            result = subprocess.run(
+                command, cwd=workspace, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return False, f"verification timed out after {timeout:.0f}s"
+        except OSError as exc:
+            return False, f"could not run verification: {type(exc).__name__}: {exc}"
+        lines = [line for line in (result.stdout + "\n" + result.stderr).splitlines() if line.strip()]
+        detail = " · ".join(lines[-2:]) if len(lines) >= 2 else (lines[-1] if lines else "no output")
+        passed = result.returncode == 0
+        # Cache only real suite outcomes (pass or fail). Timeouts and launch failures return above
+        # without caching: they often reflect transient load, not the source under test.
+        _SELF_VERIFICATION_CACHE[root] = (fingerprint, passed, detail)
+        return passed, detail
 
 
 def verify_self_edit_turn(session: "Session", agent: "Agent", tick: Callable[[str], None]) -> None:
@@ -928,9 +1003,16 @@ class Agent:
         """Run the agent on prompt to completion, streaming lines to on_tick as they arrive."""
         cancel_event = cancel_event or self.cancel_event
         started = time.monotonic()
+
+        # Validate inputs before starting the process
+        if not prompt:
+            raise ValueError(f"{self.name} cannot run with empty prompt")
+
         with tempfile.TemporaryDirectory(prefix="roundtable-") as td:
             output_file = Path(td) / "last.txt" if self.name == "Codex" else None
             cmd = self.command(prompt, output_file, no_edit)
+
+            # Log diagnostic info before starting process
             prompt_marker = (
                 f"<prompt chars={len(prompt)} sha256="
                 f"{hashlib.sha256(prompt.encode()).hexdigest()[:16]}>"
@@ -940,11 +1022,14 @@ class Agent:
                 f"launch cwd={self.workspace} no_edit={no_edit} "
                 f"effective_effort={self.effective_effort() or 'cli-default'} "
                 f"argv={json.dumps(logged_cmd, ensure_ascii=False)}")
+
             if self.debug:
                 sys.stderr.write(
                     f"[debug] [{self.name}] exec cmd: "
                     f"{json.dumps(logged_cmd, ensure_ascii=False)} (cwd={self.workspace})\n")
                 sys.stderr.flush()
+
+            proc = None
             try:
                 proc = subprocess.Popen(
                     cmd, cwd=self.workspace, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -953,14 +1038,18 @@ class Agent:
                     start_new_session=os.name == "posix",
                 )
             except OSError as exc:
+                elapsed = time.monotonic() - started
                 self.log_diagnostic(
-                    f"launch failed after {time.monotonic() - started:.3f}s: "
+                    f"launch failed after {elapsed:.3f}s: "
                     f"{type(exc).__name__}: {exc}")
                 raise RuntimeError(f"{self.name} failed to start process: {exc}") from exc
+
             self.log_diagnostic(f"started pid={proc.pid} process_group={proc.pid if os.name == 'posix' else 'n/a'}")
+
             if self.debug:
                 sys.stderr.write(f"[debug] [{self.name}] started PID={proc.pid}\n")
                 sys.stderr.flush()
+
             captured: list[str] = []
             events: queue.SimpleQueue[str] = queue.SimpleQueue()
             ticked_lines = 0
@@ -980,6 +1069,7 @@ class Agent:
 
             def read_output() -> None:
                 try:
+                    assert proc is not None
                     assert proc.stdout is not None
                     for line in proc.stdout:
                         if (self.name == "Qwen"
@@ -1000,17 +1090,20 @@ class Agent:
 
             def send_signal(sig: int) -> None:
                 """Signal the CLI and any tool subprocesses it started."""
+                if proc is None:
+                    return
                 self.log_diagnostic(f"sending signal={sig} pid={proc.pid}")
                 try:
                     if os.name == "posix":
                         os.killpg(proc.pid, sig)
                     else:
                         proc.send_signal(sig)
-                except (ProcessLookupError, PermissionError, OSError):
+                except (ProcessLookupError, PermissionError, OSError) as exc:
+                    self.log_diagnostic(f"signal {sig} failed for pid={proc.pid}: {exc}")
                     pass
 
             def stop_process() -> None:
-                if proc.poll() is not None:
+                if proc is None or proc.poll() is not None:
                     return
                 send_signal(signal.SIGTERM)
                 try:
@@ -1020,24 +1113,34 @@ class Agent:
                     try:
                         proc.wait(timeout=2)
                     except subprocess.TimeoutExpired:
+                        self.log_diagnostic(f"process {proc.pid} did not terminate after SIGKILL")
                         pass
 
             def finish_reader() -> None:
                 reader.join(timeout=2)
-                if (proc.stdout is not None and not reader.is_alive()
+                if (proc is not None and proc.stdout is not None and not reader.is_alive()
                         and hasattr(proc.stdout, "close")):
-                    proc.stdout.close()
+                    try:
+                        proc.stdout.close()
+                    except Exception:
+                        pass  # Close might fail if process already terminated
+
+            # Track if process has already been terminated to avoid duplicate signals
+            process_terminated = False
 
             try:
-                while proc.poll() is None:
+                while proc is not None and proc.poll() is None:
                     if cancel_event is not None and cancel_event.is_set():
                         self.log_diagnostic("cancellation event set")
                         stop_process()
+                        process_terminated = True
                         finish_reader()
+                        elapsed = time.monotonic() - started
                         self.log_diagnostic(
-                            f"cancelled pid={proc.pid} duration={time.monotonic() - started:.3f}s "
-                            f"reader_alive={reader.is_alive()}")
+                            f"cancelled pid={proc.pid if proc else 'unknown'} duration={elapsed:.3f}s "
+                            f"reader_alive={reader.is_alive() if proc else False}")
                         raise RuntimeError(f"{self.name} cancelled")
+
                     delivered = False
                     while True:
                         try:
@@ -1050,37 +1153,68 @@ class Agent:
                     time.sleep(0.1)
             except KeyboardInterrupt:
                 self.log_diagnostic("keyboard interrupt received")
-                stop_process()
+                if not process_terminated:
+                    stop_process()
+                    process_terminated = True
                 finish_reader()
+                elapsed = time.monotonic() - started
                 self.log_diagnostic(
-                    f"interrupted pid={proc.pid} duration={time.monotonic() - started:.3f}s "
-                    f"reader_alive={reader.is_alive()}")
+                    f"interrupted pid={proc.pid if proc else 'unknown'} duration={elapsed:.3f}s "
+                    f"reader_alive={reader.is_alive() if proc else False}")
                 raise
-            code = proc.returncode
-            finish_reader()
+            except Exception as exc:
+                # A deliberate cancellation raises RuntimeError(f"{name} cancelled") from the loop
+                # above, which already logged its own reason before reaching here -- don't relabel
+                # that expected case as an "unexpected error" in the diagnostic log.
+                if not (isinstance(exc, RuntimeError) and str(exc) == f"{self.name} cancelled"):
+                    self.log_diagnostic(f"unexpected error during run: {type(exc).__name__}: {exc}")
+                if not process_terminated and proc is not None and proc.poll() is None:
+                    stop_process()
+                    process_terminated = True
+                finish_reader()
+                elapsed = time.monotonic() - started
+                self.log_diagnostic(
+                    f"failed pid={proc.pid if proc else 'unknown'} duration={elapsed:.3f}s "
+                    f"reader_alive={reader.is_alive() if proc else False}")
+                raise
+            finally:
+                finish_reader()
+
+            # At this point, process has terminated
+            code = proc.returncode if proc else -1
             elapsed = time.monotonic() - started
             self.log_diagnostic(
-                f"exited pid={proc.pid} status={code} duration={elapsed:.3f}s "
+                f"exited pid={proc.pid if proc else 'unknown'} status={code} duration={elapsed:.3f}s "
                 f"captured_chars={sum(len(part) for part in captured)} "
-                f"captured_lines={len(captured)} reader_alive={reader.is_alive()}")
+                f"captured_lines={len(captured)}")
+
             if self.debug:
-                sys.stderr.write(f"[debug] [{self.name}] PID={proc.pid} exited with status {code}\n")
+                sys.stderr.write(f"[debug] [{self.name}] PID={proc.pid if proc else 'unknown'} exited with status {code}\n")
                 sys.stderr.flush()
+
+            # Deliver any remaining events
             while True:
                 try:
                     deliver(events.get_nowait())
                 except queue.Empty:
                     break
+
             raw = "".join(captured).strip()
             if self.name == "Qwen":
                 raw = QWEN_YOLO_WARNING.sub("", QWEN_SAFE_MODE_BANNER.sub("", raw)).strip()
+
             if output_file and output_file.exists():
-                answer = output_file.read_text(encoding="utf-8", errors="replace").strip()
-                self.log_diagnostic(
-                    f"read final answer file chars={len(answer)} raw_stdout_chars={len(raw)}")
+                try:
+                    answer = output_file.read_text(encoding="utf-8", errors="replace").strip()
+                    self.log_diagnostic(
+                        f"read final answer file chars={len(answer)} raw_stdout_chars={len(raw)}")
+                except Exception as exc:
+                    self.log_diagnostic(f"failed to read output file: {exc}")
+                    answer = raw  # Fall back to captured stdout
             else:
                 answer = raw
                 self.log_diagnostic(f"using captured output as answer chars={len(answer)}")
+
             if code != 0:
                 limit_detail = usage_limit_detail(raw)
                 if limit_detail:
@@ -1090,9 +1224,11 @@ class Agent:
                     sys.stderr.write(f"[debug] [{self.name}] exit code {code} output detail:\n{raw}\n")
                     sys.stderr.flush()
                 raise RuntimeError(f"{self.name} exited with status {code}\n{raw[-2000:]}")
+
             if not answer:
                 self.log_diagnostic("classified failure as empty response")
                 raise RuntimeError(f"{self.name} returned an empty response")
+
             self.log_diagnostic(f"completed successfully answer_chars={len(answer)}")
             return answer
 
@@ -1242,14 +1378,18 @@ class PromptContext:
     history: str
     role_hints: dict[str, str]
     dibs_claims: dict[str, str]
+    prompt_board_entries: str = ""
 
 
-def prepare_prompt_context(objective: str, turns: list[Turn]) -> PromptContext:
+def prepare_prompt_context(objective: str, turns: list[Turn],
+                           workspace: Path | str | None = None) -> PromptContext:
     """Render and inspect a transcript once for prompts built from the same session state."""
+    board_entries = extract_agent_prompt_entries(workspace) if workspace else ""
     return PromptContext(
         transcript(turns) or "(No contributions yet.)",
         role_hints_for(objective),
         extract_dibs(turns),
+        board_entries,
     )
 
 
@@ -1286,11 +1426,15 @@ def prompt_for(objective: str, turns: list[Turn], phase: str, speaker: str,
                     f"the strongest use of your turn — don't silently redo the same ground.")
     dibs_hint = DIBS_HINT if speaker in AGENT_NAMES else ""
     prompt_board_hint = AGENT_PROMPT_HINT if speaker in AGENT_NAMES else ""
+    board_entries_note = ""
+    if context.prompt_board_entries and speaker in AGENT_NAMES:
+        board_entries_note = f"\n\nActive prompt board entries ({AGENT_PROMPT_FILE}):\n{context.prompt_board_entries}"
     status_hint = TASK_STATUS_HINT if task_status_check else ""
     vote_hint = RESTART_VOTE_HINT if restart_vote_pending and speaker in AGENT_NAMES else ""
     return (f"{SYSTEM_BRIEF}\n\nUSER OBJECTIVE:\n{objective}\n\nSHARED TRANSCRIPT:\n{history}\n\n"
-           f"YOUR TURN ({speaker}, {phase}):\n{task}{role_hint}{dibs_note}{dibs_hint}{prompt_board_hint}{scope}"
-           f"{status_hint}{vote_hint}")
+           f"YOUR TURN ({speaker}, {phase}):\n{task}{role_hint}{dibs_note}{dibs_hint}{prompt_board_hint}"
+           f"{board_entries_note}{scope}{status_hint}{vote_hint}")
+
 
 
 def final_prompt(objective: str, turns: list[Turn], followup: bool = False,
@@ -1491,32 +1635,56 @@ class RunLog:
     keeps everything — including full prompt text — so a live run can be tailed, or a completed
     one inspected, for detail --mock never produces (auth failures, bad exit codes, empty
     responses, timeouts).
+
+    Disk failures never abort the roundtable: missing parents are created when possible, and any
+    remaining OSError on open/write/close degrades this instance to a silent no-op so a full
+    agent phase cannot die because the diagnostic log path is unwritable.
     """
 
     def __init__(self, path: Path | None):
         self.path = path
         self.started = time.monotonic()
         self._lock = threading.Lock()
-        self._handle: TextIO | None = path.open("a", encoding="utf-8") if path else None
-        if self._handle is not None:
+        self._handle: TextIO | None = None
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._handle = path.open("a", encoding="utf-8")
             path.chmod(0o600)
-            self._handle.write(f"\n# Roundtable run started {datetime.now(timezone.utc).isoformat()}\n")
+            self._handle.write(
+                f"\n# Roundtable run started {datetime.now(timezone.utc).isoformat()}\n")
             self._handle.flush()
+        except OSError:
+            self._drop_handle()
+
+    def _drop_handle(self) -> None:
+        """Close and forget the file handle; further writes become no-ops."""
+        handle = self._handle
+        self._handle = None
+        if handle is None:
+            return
+        try:
+            handle.close()
+        except OSError:
+            pass
 
     def write(self, kind: str, text: str) -> None:
         with self._lock:
             if self._handle is None:
                 return
-            elapsed = time.monotonic() - self.started
-            for line in text.splitlines() or [""]:
-                self._handle.write(f"+{elapsed:8.1f}s  {kind.upper():7s} {line}\n")
-            self._handle.flush()
+            try:
+                elapsed = time.monotonic() - self.started
+                for line in text.splitlines() or [""]:
+                    self._handle.write(f"+{elapsed:8.1f}s  {kind.upper():7s} {line}\n")
+                self._handle.flush()
+            except OSError:
+                # Mid-run disk full / permission revoke / closed fd: keep the agents running.
+                self._drop_handle()
 
     def close(self) -> None:
         with self._lock:
-            if self._handle is not None:
-                self._handle.close()
-                self._handle = None
+            self._drop_handle()
 
 
 def attach_agent_diagnostics(run_log: RunLog, agents: Iterable[Agent | None]) -> None:
@@ -3396,29 +3564,45 @@ def _wait_for_agent_availability(agent: Agent, on_tick: Callable[[str], None],
     the console with nothing new to say -- silence between those two ticks means it's still waiting.
     """
     announced = False
+    agent.log_diagnostic(f"Waiting for agent availability: {detail or 'unknown issue'}")
+
     while True:
         now = clock()
         reset_at = parse_reset_time(detail, now) if detail else None
+
         if reset_at is not None:
             wait_seconds = max(0.0, (reset_at - now).total_seconds()) + RESET_TIME_BUFFER_SECONDS
             if not announced:
                 formatted_reset = reset_at.strftime('%I:%M%p').lstrip('0')
                 on_tick(f"usage limit reached — waiting until {formatted_reset} "
                         "before checking availability")
+                agent.log_diagnostic(f"Will wait until {reset_at} (approximately {wait_seconds}s)")
         else:
             wait_seconds = AVAILABILITY_CHECK_SECONDS
             if not announced:
                 on_tick(f"usage limit reached — polling every {wait_seconds:g}s until available")
+                agent.log_diagnostic(f"Using polling mode with {wait_seconds}s intervals")
+
         announced = True
+
+        # Wait for either the specified time or cancellation
         if cancel_event.wait(wait_seconds):
+            agent.log_diagnostic("Cancellation received during availability wait")
             raise RuntimeError(f"{agent.name} cancelled")
+
         try:
+            agent.log_diagnostic("Attempting preflight check to verify availability...")
             agent.run(PREFLIGHT_PROMPT, on_tick, cancel_event, no_edit=True)
+            agent.log_diagnostic("Agent is now available again")
         except RuntimeError as exc:
+            agent.log_diagnostic(f"Agent still unavailable: {exc}")
             if str(exc) == f"{agent.name} cancelled" or cancel_event.is_set():
+                agent.log_diagnostic("Cancellation detected during availability check")
                 raise RuntimeError(f"{agent.name} cancelled") from exc
             detail = usage_limit_detail(str(exc))
+            # Continue waiting if still hitting usage limits
             continue
+
         on_tick("agent available again — retrying the original task")
         return
 
@@ -3543,7 +3727,7 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
     names = [name for name, _ in agents]
     by_name = dict(agents)
     status(names, message)
-    context = prepare_prompt_context(session.objective, session.turns)
+    context = prepare_prompt_context(session.objective, session.turns, workspace=session.workspace)
     prompts = {
         name: prompt_for(session.objective, session.turns, phase, name, sequential=False,
                          scope=scope_hint(name, agent_speed) if agent_speed is not None else "",
@@ -3780,9 +3964,11 @@ def _run_sequential_phase(session: Session, agents: list[tuple[str, Agent]], pha
     """
     for name, agent in agents:
         status([name], message)
+        context = prepare_prompt_context(session.objective, session.turns, workspace=session.workspace)
         prompt = prompt_for(session.objective, session.turns, phase, name, sequential=True,
                             task_status_check=task_status_check,
-                            restart_vote_pending=restart_vote_pending)
+                            restart_vote_pending=restart_vote_pending,
+                            context=context)
         log_prompt(name, prompt)
         content = _run_with_retry(agent, prompt, lambda line, speaker=name: tick(speaker, line))
         # Independently verify this agent's turn against real, deterministic evidence rather than
@@ -4960,7 +5146,9 @@ def main() -> int:
                         f"{type(save_exc).__name__}: {save_exc}")
             print(f"\nRoundtable could not complete: {exc}", file=sys.stderr)
             if checkpoint_paths:
-                print(f"Transcript: {checkpoint_paths[1]}\nLog: {run_log.path}", file=sys.stderr)
+                print(f"Transcript: {checkpoint_paths[1]}", file=sys.stderr)
+            if run_log.path:
+                print(f"Log: {run_log.path}", file=sys.stderr)
             return 1
         finally:
             if not preserve_prompt_board:

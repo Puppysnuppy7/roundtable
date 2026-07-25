@@ -125,6 +125,9 @@ class RoundtableTests(unittest.TestCase):
         patcher = mock.patch.object(roundtable, "AGENT_SPAWN_STAGGER_SECONDS", 0.0)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # --self verification caches suite results by source fingerprint; isolate each test so a
+        # prior case's PASS/FAIL cannot leak into a later assertion about subprocess calls.
+        roundtable.clear_self_verification_cache()
 
     def test_work_event_strips_terminal_codes_and_labels_common_operations(self):
         self.assertEqual(roundtable.work_event("\x1b[32mReading app.py\x1b[0m"),
@@ -285,6 +288,21 @@ class RoundtableTests(unittest.TestCase):
             self.assertIn(str(Path("src") / "main.py"), snapshot)
             self.assertNotIn(str(Path(".git") / "HEAD"), snapshot)
             self.assertNotIn(str(Path("__pycache__") / "module.pyc"), snapshot)
+
+    def test_workspace_monitor_large_file_handling(self):
+        """Test that the monitor handles large files correctly without performance issues."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            monitor = roundtable.WorkspaceMonitor(root, max_files=5)  # Small limit for testing
+
+            # Create more files than the limit
+            for i in range(10):
+                (root / f"file_{i}.txt").write_text(f"Content {i}")
+
+            # The monitor should handle this gracefully
+            changes = monitor.refresh(force=True)
+            # Should be truncated due to file limit
+            self.assertTrue(monitor.truncated)
 
     def test_touchscreen_detection_matches_yoga_digitizer(self):
         devices = 'N: Name="Atmel Atmel maXTouch Digitizer"\nH: Handlers=mouse1 event5\n'
@@ -1011,6 +1029,38 @@ class RoundtableTests(unittest.TestCase):
         run_log.write("phase", "should not raise")
         run_log.close()
 
+    def test_run_log_creates_missing_parent_directories(self):
+        """A nested log path under a not-yet-created tree should still open and write."""
+        with tempfile.TemporaryDirectory() as td:
+            nested = Path(td) / "nested" / "run" / "activity.log"
+            self.assertFalse(nested.parent.exists())
+            run_log = roundtable.RunLog(nested)
+            run_log.write("tick", "created parents")
+            run_log.close()
+            self.assertTrue(nested.is_file())
+            self.assertIn("TICK    created parents", nested.read_text())
+
+    def test_run_log_handles_file_errors_gracefully(self):
+        """Open/write OSErrors degrade to a silent no-op; they must not crash the run."""
+        with tempfile.TemporaryDirectory() as td:
+            # path is an existing directory — open("a") raises IsADirectoryError (OSError).
+            blocked = Path(td) / "not_a_file"
+            blocked.mkdir()
+            run_log = roundtable.RunLog(blocked)
+            self.assertIsNone(run_log._handle)
+            run_log.write("tick", "must not raise")
+            run_log.close()
+
+            # Mid-run write failure also degrades rather than raising into agent phases.
+            good = Path(td) / "ok.log"
+            run_log = roundtable.RunLog(good)
+            self.assertIsNotNone(run_log._handle)
+            with mock.patch.object(run_log._handle, "write", side_effect=OSError("disk full")):
+                run_log.write("error", "simulated write failure")
+            self.assertIsNone(run_log._handle)
+            run_log.write("tick", "still a no-op after drop")
+            run_log.close()
+
     def test_run_context_logs_reproducibility_details_but_not_environment(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "activity.log"
@@ -1176,6 +1226,30 @@ class RoundtableTests(unittest.TestCase):
             log = next(Path(out).glob("*.log"))
             self.assertIn(f"Transcript: {transcript}", printed)
             self.assertIn(f"Log: {log}", printed)
+
+    def test_plain_mode_failure_prints_log_path_with_no_turns_saved(self):
+        """A failure before any turn exists has no transcript to checkpoint, but the activity log
+        was opened before conduct() ever ran -- its path must still be reported, not silently
+        dropped just because there's no Transcript: line to go with it."""
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "out"
+
+            def fake_conduct(_session, *_args, **_kwargs):
+                raise RuntimeError("boom: simulated startup failure")
+
+            argv = ["roundtable", "Solve it", "--mock", "--plain", "--skip-preflight",
+                    "-r", "0", "-C", td, "--output-dir", str(out)]
+            stderr = io.StringIO()
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(roundtable, "conduct", side_effect=fake_conduct), \
+                 contextlib.redirect_stderr(stderr):
+                self.assertEqual(roundtable.main(), 1)
+            printed = stderr.getvalue()
+            self.assertIn("could not complete", printed)
+            log = next(Path(out).glob("*.log"))
+            self.assertIn(f"Log: {log}", printed)
+            self.assertNotIn("Transcript:", printed)
+            self.assertEqual(list(Path(out).glob("*.md")), [])
 
     def test_plain_mode_cancel_with_no_turns_yet_skips_paths(self):
         """Cancelling before any turn exists means nothing was ever saved -- the message must stay
@@ -1351,7 +1425,9 @@ class RoundtableTests(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertIn("boom: simulated failure", stderr.getvalue())
             self.assertNotIn("Traceback", stderr.getvalue())
-            log = next((Path(td) / "out").glob("*.log")).read_text()
+            log_path = next((Path(td) / "out").glob("*.log"))
+            self.assertIn(f"Log: {log_path}", stderr.getvalue())
+            log = log_path.read_text()
             self.assertIn("Traceback (most recent call last)", log)
             self.assertIn("boom: simulated failure", log)
 
@@ -3108,6 +3184,113 @@ class RoundtableTests(unittest.TestCase):
                 passed, detail = roundtable.run_self_verification(td, timeout=1)
             self.assertFalse(passed)
             self.assertIn("timed out", detail)
+
+    def test_self_source_fingerprint_is_stable_and_content_sensitive(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "roundtable.py").write_text("alpha")
+            (root / "test_roundtable.py").write_text("beta")
+            (root / "README.md").write_text("gamma")
+            first = roundtable.self_source_fingerprint(td)
+            self.assertEqual(first, roundtable.self_source_fingerprint(td))
+            (root / "roundtable.py").write_text("alpha-changed")
+            self.assertNotEqual(first, roundtable.self_source_fingerprint(td))
+            # Restoring identical bytes restores the same fingerprint (content, not mtime).
+            (root / "roundtable.py").write_text("alpha")
+            self.assertEqual(first, roundtable.self_source_fingerprint(td))
+
+    def test_run_self_verification_reuses_cache_when_source_is_unchanged(self):
+        """Parallel --self phases would otherwise spawn one full suite per agent against identical
+        files; the fingerprint cache must make the second call a pure reuse."""
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "test_roundtable.py").write_text("# stand-in")
+            (Path(td) / "roundtable.py").write_text("# code")
+            completed = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr="Ran 1 test in 0.0s\n\nOK\n")
+            with mock.patch.object(roundtable.subprocess, "run", return_value=completed) as run:
+                first = roundtable.run_self_verification(td)
+                second = roundtable.run_self_verification(td)
+            self.assertEqual(first, (True, "Ran 1 test in 0.0s · OK"))
+            self.assertEqual(second, first)
+            self.assertEqual(run.call_count, 1)
+
+    def test_run_self_verification_reruns_after_source_change(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "test_roundtable.py").write_text("# stand-in")
+            (root / "roundtable.py").write_text("v1")
+            pass_result = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr="OK\n")
+            fail_result = subprocess.CompletedProcess(
+                args=[], returncode=1, stdout="", stderr="FAILED\n")
+            with mock.patch.object(
+                    roundtable.subprocess, "run",
+                    side_effect=[pass_result, fail_result]) as run:
+                first = roundtable.run_self_verification(td)
+                (root / "roundtable.py").write_text("v2")
+                second = roundtable.run_self_verification(td)
+            self.assertEqual(first, (True, "OK"))
+            self.assertEqual(second, (False, "FAILED"))
+            self.assertEqual(run.call_count, 2)
+
+    def test_run_self_verification_does_not_cache_timeouts(self):
+        """A load-induced timeout must not stick as a FAIL once the source is still the same."""
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "test_roundtable.py").write_text("# stand-in")
+            completed = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr="OK\n")
+            with mock.patch.object(
+                    roundtable.subprocess, "run",
+                    side_effect=[
+                        roundtable.subprocess.TimeoutExpired(cmd="x", timeout=1),
+                        completed,
+                    ]) as run:
+                first = roundtable.run_self_verification(td, timeout=1)
+                second = roundtable.run_self_verification(td, timeout=1)
+            self.assertEqual(first, (False, "verification timed out after 1s"))
+            self.assertEqual(second, (True, "OK"))
+            self.assertEqual(run.call_count, 2)
+
+    def test_run_self_verification_serializes_concurrent_callers(self):
+        """Two agents finishing a parallel phase at once must not thrash two suite runs when the
+        source is unchanged — one runs, the other waits and reuses."""
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "test_roundtable.py").write_text("# stand-in")
+            (Path(td) / "roundtable.py").write_text("# code")
+            started = threading.Event()
+            release = threading.Event()
+            calls = {"n": 0}
+
+            def slow_run(*_args, **_kwargs):
+                calls["n"] += 1
+                started.set()
+                # Hold the suite long enough that the second caller is waiting on the lock.
+                self.assertTrue(release.wait(2.0))
+                return subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout="", stderr="OK\n")
+
+            results: list[tuple[bool, str] | None] = [None, None]
+
+            def worker(index: int) -> None:
+                results[index] = roundtable.run_self_verification(td)
+
+            with mock.patch.object(roundtable.subprocess, "run", side_effect=slow_run) as run:
+                t1 = threading.Thread(target=worker, args=(0,))
+                t2 = threading.Thread(target=worker, args=(1,))
+                t1.start()
+                self.assertTrue(started.wait(2.0))
+                t2.start()
+                # Give the second thread a moment to block on the verification lock.
+                time.sleep(0.05)
+                release.set()
+                t1.join(2.0)
+                t2.join(2.0)
+            self.assertFalse(t1.is_alive())
+            self.assertFalse(t2.is_alive())
+            self.assertEqual(results[0], (True, "OK"))
+            self.assertEqual(results[1], (True, "OK"))
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(calls["n"], 1)
 
     def test_verify_self_edit_turn_is_a_noop_for_non_self_sessions(self):
         session = roundtable.Session("Ordinary goal", "/tmp", 0, "now", [])
@@ -5205,6 +5388,27 @@ class RoundtableTests(unittest.TestCase):
         killpg.assert_called_once_with(proc.pid, roundtable.signal.SIGTERM)
         proc.terminate.assert_not_called()
 
+    def test_agent_cancellation_does_not_log_it_as_an_unexpected_error(self):
+        """Regression: the broad except-Exception cleanup handler added around the subprocess
+        loop must not relabel a deliberate cancellation's own RuntimeError as an "unexpected
+        error" -- the cancellation branch just above it already logs its own, more specific
+        reason, so the generic label would be actively misleading in a --debug log."""
+        agent = roundtable.Agent("Claude", Path("/tmp"))
+        cancelled = threading.Event()
+        cancelled.set()
+        proc = mock.Mock(pid=4321, stdout=[])
+        proc.poll.return_value = None
+        proc.wait.return_value = 0
+        logged: list[str] = []
+        agent.log_diagnostic = logged.append
+
+        with mock.patch.object(roundtable.subprocess, "Popen", return_value=proc), \
+             mock.patch.object(roundtable.os, "killpg"):
+            with self.assertRaisesRegex(RuntimeError, "Claude cancelled"):
+                agent.run("task", lambda _line: None, cancelled)
+
+        self.assertFalse(any("unexpected error" in line for line in logged), logged)
+
     def test_agent_run_caps_ticked_lines_but_keeps_the_full_answer(self):
         """Regression: a real run once had a single turn print roughly 100k lines (a CLI
         re-printing a large file across tool calls), and on_tick was called once per line with
@@ -5390,6 +5594,46 @@ class RoundtableTests(unittest.TestCase):
         self.assertIn(roundtable.AGENT_PROMPT_FILE, prompt)
         user_prompt = roundtable.prompt_for("Objective", [], "proposal", "User")
         self.assertNotIn(roundtable.AGENT_PROMPT_FILE, user_prompt)
+
+    def test_extract_agent_prompt_entries(self):
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            self.assertEqual(roundtable.extract_agent_prompt_entries(workspace), "")
+            roundtable.ensure_agent_prompt_file(workspace)
+            self.assertEqual(roundtable.extract_agent_prompt_entries(workspace), "")
+            board_path = workspace / roundtable.AGENT_PROMPT_FILE
+            entry_text = "## From Antigravity to all — testing\nHello from test."
+            board_path.write_text(roundtable.AGENT_PROMPT_TEMPLATE + "\n" + entry_text, encoding="utf-8")
+            self.assertEqual(roundtable.extract_agent_prompt_entries(workspace), entry_text)
+
+    def test_extract_agent_prompt_entries_caps_context_and_keeps_newest_content(self):
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            board_path = workspace / roundtable.AGENT_PROMPT_FILE
+            oldest = "o" * 20
+            newest = "n" * roundtable.AGENT_PROMPT_CONTEXT_CHARS
+            board_path.write_text(
+                roundtable.AGENT_PROMPT_TEMPLATE + oldest + newest, encoding="utf-8")
+
+            entries = roundtable.extract_agent_prompt_entries(workspace)
+
+            self.assertIn("20 older characters omitted", entries)
+            self.assertNotIn(oldest, entries)
+            self.assertTrue(entries.endswith(newest))
+
+    def test_prompt_for_includes_active_agent_prompt_board_entries(self):
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            roundtable.ensure_agent_prompt_file(workspace)
+            board_path = workspace / roundtable.AGENT_PROMPT_FILE
+            entry_text = "## From Antigravity to all — testing\nHello from test."
+            board_path.write_text(roundtable.AGENT_PROMPT_TEMPLATE + "\n" + entry_text, encoding="utf-8")
+            ctx = roundtable.prepare_prompt_context("Objective", [], workspace=workspace)
+            self.assertEqual(ctx.prompt_board_entries, entry_text)
+            prompt = roundtable.prompt_for("Objective", [], "proposal", "Codex", context=ctx)
+            self.assertIn("Active prompt board entries (AGENT_PROMPTS.md):", prompt)
+            self.assertIn(entry_text, prompt)
+
 
     def test_prompt_for_includes_restart_vote_hint_for_agents_only_when_pending(self):
         prompt = roundtable.prompt_for(
@@ -5849,6 +6093,22 @@ class RoundtableTests(unittest.TestCase):
         with mock.patch.object(display.s, "addnstr") as mock_addnstr:
             display._put(5, -2, "test")
             mock_addnstr.assert_not_called()
+
+    def test_agent_run_handles_empty_prompt_gracefully(self):
+        """Test that Agent.run properly validates inputs and raises appropriate errors."""
+        agent = roundtable.Agent("Codex", Path("/tmp"))
+        with self.assertRaises(ValueError) as cm:
+            agent.run("", lambda x: None)
+        self.assertIn("cannot run with empty prompt", str(cm.exception))
+
+    def test_agent_run_handles_process_launch_failure(self):
+        """Test that Agent.run properly handles process launch failures."""
+        agent = roundtable.Agent("Codex", Path("/tmp"))
+        with mock.patch.object(roundtable.subprocess, "Popen") as mock_popen:
+            mock_popen.side_effect = OSError("Command not found")
+            with self.assertRaises(RuntimeError) as cm:
+                agent.run("test prompt", lambda x: None)
+            self.assertIn("failed to start process", str(cm.exception))
 
 
 if __name__ == "__main__":
