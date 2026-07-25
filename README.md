@@ -87,6 +87,8 @@ Useful options:
 --reassign-idle        In parallel phases, the first agent that finishes while ≥2 others are still
                        on their primary turn gets one extra prompt to pick up unclaimed work or help
                        a still-running agent; later finishers stay idle (one concurrent bonus max)
+--dead-code-check      Before the final answer is drafted, have one agent search this session's
+                       code changes for now-unused functions/branches and remove any it finds
 --preflight-timeout S  Set the positive timeout in seconds for each startup connectivity check
                        (default: 90, or 25 with --no-extended-preflight)
 --skip-preflight       Skip startup connectivity checks
@@ -152,7 +154,16 @@ panes, independent working/waiting states, and agent-specific activity tickers n
 rotating quadrant for Aider, a dashing line for Grok, and a spinning arc for Qwen). On tall enough
 terminals the six panes lay out as a 2×3 grid (roughly double the panel width of a single six-wide
 row); shorter terminals keep one row of six so the outcome/monitor band still fits. A one-line roster
-under the status line shows each agent's icon and ● working / ✓ done / ○ waiting mark at a glance.
+under the status line shows each agent's icon and ● working / ↻ retrying / ⏳ rate-limited /
+✓ done / ✗ failed / ○ waiting mark at a glance. While a phase is running, the status line also
+reports how many agents are currently working and how many have finished that phase (and, when
+applicable, how many are mid-retry or waiting on a provider limit, and how many were dropped after a
+hard failure). Failures are not counted as done; stalled agents stay inside the working count and
+are called out separately (`N retrying` / `N limited`) so a silent backoff is not mistaken for
+progress. The count is retained as a sequential relay hands work from one agent to the next and
+resets when the operation moves to a new phase. Coordinator signals for a hard phase drop or a
+TASK STATUS: complete declaration also appear in the default console filter (key events), not only
+in the all-activity firehose.
 Per-agent usage sparklines show response time, output size, and activity, while a live work feed
 inside each active agent's own pane keeps reported file reads, searches, edits, commands, tests, and
 other CLI progress attributed to the agent that emitted them; once the agent finishes, its pane
@@ -172,7 +183,10 @@ synthesis pass as one. No estimate is shown before there is real timing evidence
 retries, or unusually different later phases can move it; treat it as an operational ETA, not a
 deadline. Time spent waiting for a provider usage limit to reset is excluded from later latency
 samples, so one blocked agent does not turn the rest of the run's estimates into hour-scale guesses.
-The same estimate appears in plain-mode phase output.
+Every active phase also begins with `Step N/total`, where a step is one proposal, review, optional
+dead-code sweep, or final-answer pass. Unlike a speculative percentage, this is an exact pipeline
+position; its total contracts when verified completion skips planned reviews or synthesis passes.
+The same step and estimate text appears in plain-mode phase output.
 
 While agents are working, press `i` (or click/tap the "ADD PROMPT [i]" control next to the status
 line) to interrupt and open the same follow-up box used between rounds, without stopping the run.
@@ -182,6 +196,14 @@ comes next. An active agent acknowledges the queued prompt for you on the status
 Acknowledged queued task: …"), rotating through whichever agents are currently working so the
 acknowledgment isn't always attributed to the same one. After an answer, a follow-up text box lets
 you keep the same roundtable conversation going. Complete transcripts are written to `.roundtable/`.
+
+Every run also opens with a one-line `Config:` summary (collab mode, reasoning effort, synthesis
+passes, which optional checks — `--balance-load`, `--task-status-check`, `--reassign-idle`,
+`--dead-code-check` — are enabled, and which agents run `--elevated`), so the flags actually
+governing this run's behavior are visible up front instead of requiring a trip into the private
+`.log` file. `--mock` runs are flagged with a leading `⚠ MOCK` marker so simulated output is never
+mistaken for a real CLI response. It appears at the top of the console panel in the GUI and as the
+first printed line in plain mode.
 
 Agents can also coordinate through the append-only `AGENT_PROMPTS.md` board in the workspace.
 It remains available through every phase, follow-up, and internal `--self` checkpoint restart in
@@ -202,9 +224,15 @@ complete filtered history, same as the agent and answer panels. Mouse wheel or t
 on the console the same as any other panel, whether it's expanded or still in the compact dashboard
 view, and the title shows `↑N` while scrolled back from the latest entry. Pressing `?` or `h`
 (or, in touch mode, tapping the `? HELP` button in the header) opens an interactive Help modal
-overlay detailing all keyboard shortcuts and controls. In any expanded panel,
+overlay detailing all keyboard shortcuts and controls. On a terminal too short to list every
+shortcut, the modal shows as many as fit and a trailing `+N more — resize taller to see all`
+line rather than truncating silently. In any expanded panel,
 the arrow keys scroll one line; Page Up/Page Down move a screen at a time; and Home/End jump to the
 oldest/latest content, so long output remains navigable without a mouse.
+For keyboard-only navigation, `Tab` and `Shift-Tab` move a visible focus highlight through the six
+agent panels, Task Outcome, Code Monitor, and Console; press `Enter` to expand or collapse the
+selected panel. The direct `1`–`6`, `f` (outcome), `m` (code monitor), and `0` (console) shortcuts
+remain available.
 
 In a parallel phase, agents finish independently but the transcript only advances once every agent
 in the round is done — so a lone slow agent can leave the screen looking stuck. The console and log
@@ -232,6 +260,14 @@ finishing). The in-flight bonus is cut short if it's still running once the roun
 over, so it can add value without ever making the phase wait longer than its slowest primary agent.
 Under `--reasoning-effort auto`, that opportunistic bonus turn is hinted at low effort.
 
+`--dead-code-check` runs once, after review rounds finish and before the synthesis relay drafts the
+final answer. Unlike synthesis itself (prose only, no file edits), this turn keeps edit rights: one
+agent is asked to search this session's code changes for functions, branches, or variables that were
+added or left behind but no longer have any caller, confirm via a real search for call sites (not
+just the definition) before touching anything, remove what's genuinely unused, and run the project's
+test suite to confirm nothing broke. A failure here is non-fatal — synthesis proceeds without it, the
+same way a failed refinement pass does.
+
 A CLI failure on a real, load-bearing proposal, review, or initial final-draft turn is retried once
 after a short pause before it's treated as fatal — real-world failures on a long run are often a
 transient rate limit or network timeout partway through a long chain of tool calls, not a broken
@@ -249,6 +285,15 @@ line once the agent
 responds — the repeated 30-second rechecks stay silent instead of flooding the console, and the
 original task is resent once the agent responds. The wait continues only while Roundtable is running
 and remains cancellable with Ctrl+C (or by `--task-status-check`).
+
+Retries and provider-limit waits use a yellow `↻` event in the GUI console and remain visible in
+its default **key events** filter. A transient retry reports its exact backoff and attempt count
+(for example, `retrying once in 3s (attempt 2/2)`); usage-limit events report whether Roundtable is
+waiting for a provider-supplied reset time or polling, followed by confirmation when service
+returns. The same stall is mirrored on the agent pane (`↻ retrying` / `⏳ rate limited` with
+elapsed time), the roster mark, and optional status counts (`N retrying` / `N limited`) so the
+operator does not need the console open to notice a blocked turn. These events are operational
+warnings, not fatal errors; exhausted retries still surface as failures.
 
 Final synthesis uses six sequential model calls by default: the chosen synthesizer drafts, then the
 other five agents refine in turn. For a faster, lower-cost run, `--synthesis-passes 1` returns the
@@ -272,9 +317,10 @@ agent to check current progress (`git status`/`git diff`, re-reading relevant fi
 anything else, since time has passed and its own earlier partial work, or another agent's in a
 shared `--self` workspace, may already cover part of the task.
 
-Any panel — Codex, Claude, Antigravity, Aider, Grok, Qwen, the task outcome, or the console — can be
-expanded to full-screen for its complete, un-truncated content: press `1`-`6`/`f`/`0`, or click/tap
-the panel.
+Any panel — Codex, Claude, Antigravity, Aider, Grok, Qwen, the task outcome, the code monitor, or the
+console — can be expanded to full-screen for its complete, un-truncated content: press
+`1`-`6`/`f`/`m`/`0`, or click/tap the panel. The code monitor title also shows compact `+N ~M −D`
+change counts when files have been added, modified, or deleted.
 The same key, a click on the expanded panel, or `Esc`/`q` collapses it back to the dashboard. Keyboard
 shortcuts are only live while agents are working (not while typing a follow-up, so digits still type
 normally there); clicking a panel works in both. Prompt and follow-up text boxes support multiline
@@ -299,7 +345,9 @@ and authentication tokens are deliberately excluded; prompt arguments in command
 replaced by their length and SHA-256 fingerprint because the complete prompt already has its own
 record. You can `tail -f` a live run or grep a completed one for real exit codes, empty responses,
 auth failures, and timeouts. The log shares a filename stem with the session's `.json`/`.md`
-transcript and is created in both fullscreen and `--plain` modes.
+transcript and is created in both fullscreen and `--plain` modes. Both paths are printed on exit —
+after a normal finish, a `--plain` failure, and a `Ctrl-C` cancel (whenever a transcript exists to
+report) — so you never have to guess where a run's evidence went.
 
 Text-box controls:
 
@@ -316,7 +364,9 @@ startup options screen, the objective prompt, and the preflight connectivity che
 `Cancelled.` and exiting instead of a raw traceback.
 
 The UI automatically adjusts when you resize your terminal window, maintaining proper layout and
-preventing display corruption.
+preventing display corruption. Expanded panels remain open; if a compact layout hides the focused
+Console panel, keyboard focus moves to the nearest visible panel instead of leaving Enter attached
+to an invisible target.
 
 ## Touchscreen and convertible use
 
@@ -376,7 +426,11 @@ Every `--self` run is also told about a throwaway copy of the source kept at
 agent can copy its edited `roundtable.py` there and run it directly with `--mock --plain
 --skip-preflight --synthesis-passes 1 -r 0` to smoke-test a change without running inside the live
 shared workspace other agents may be concurrently editing, waiting for interactive follow-up input,
-or interfering with this run's own in-memory process.
+or interfering with this run's own in-memory process. If the sandbox directory cannot be created,
+startup fails with a clear error; individual file copy failures warn on stderr and leave the rest of
+the refresh intact. In the TUI, `--self` shows a `⚡ self` header badge, strips the standing note from
+the objective line, and surfaces the sandbox path on the status line so operators can see where the
+smoke-test copy lives without reading the full agent prompt.
 
 ## Smoke test
 

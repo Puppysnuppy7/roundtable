@@ -134,6 +134,36 @@ SELF_EDIT_NOTE = (
     "run `python3 -m unittest test_roundtable` yourself before finishing — report the result."
 )
 
+# Matches the absolute path embedded by self_test_sandbox_note() so the dashboard can surface it
+# without threading a separate Session field through save/load.
+_SELF_SANDBOX_PATH_RE = re.compile(r"kept at `([^`]+)`")
+
+
+def session_is_self(session: "Session") -> bool:
+    """True when this session is a --self run (note on the objective or a user turn)."""
+    if SELF_EDIT_NOTE in session.objective:
+        return True
+    return any(SELF_EDIT_NOTE in turn.content for turn in session.turns)
+
+
+def clean_self_objective(objective: str) -> str:
+    """Strip SELF_EDIT_NOTE and the trailing sandbox boilerplate for header display."""
+    if SELF_EDIT_NOTE not in objective:
+        return objective
+    return objective.split(SELF_EDIT_NOTE)[0].strip()
+
+
+def self_sandbox_path(session: "Session") -> str | None:
+    """Absolute path advertised in the self-test sandbox note, if present on objective or turns."""
+    chunks = [session.objective]
+    chunks.extend(turn.content for turn in session.turns if turn.speaker == "User")
+    for chunk in chunks:
+        match = _SELF_SANDBOX_PATH_RE.search(chunk)
+        if match:
+            return match.group(1)
+    return None
+
+
 AGENT_NAMES: tuple[str, ...] = ("Codex", "Claude", "Antigravity", "Aider", "Grok", "Qwen")
 
 # Nudges agents toward complementary parts of the work instead of six redundant attempts at the
@@ -338,10 +368,11 @@ def dashboard_hint(width: int, touch_mode: bool, busy: bool) -> str:
     else:
         add_prompt = " · i add prompt" if busy else ""
         choices = [
-            f"ctrl+c cancel{add_prompt} · 1-6/f/0 expand · click panel · c filter · ? help · "
-            "transcript autosaved",
-            f"ctrl+c cancel{add_prompt} · 1-6/f/0 expand · ? help",
-            f"ctrl+c cancel{add_prompt} · 1-6/f/0 expand",
+            f"ctrl+c cancel{add_prompt} · Tab select · Enter expand · 1-6/f/0/m · click panel · "
+            "c filter · ? help · transcript autosaved",
+            f"ctrl+c cancel{add_prompt} · 1-6/f/0/m expand · click panel · ? help",
+            f"ctrl+c cancel{add_prompt} · 1-6/f/0/m expand · ? help",
+            f"ctrl+c cancel{add_prompt} · 1-6/f/0/m expand",
         ]
     return next((choice for choice in choices if len(choice) <= width), choices[-1][:width])
 
@@ -350,17 +381,34 @@ def expanded_hint(width: int, touch_mode: bool) -> str:
     """Return width-aware help for a full-screen panel."""
     if touch_mode:
         choices = [
+            "tap panel to collapse · swipe to scroll · tap another panel to switch · tap ? for help",
             "tap panel to collapse · swipe to scroll · tap another panel to switch",
             "tap panel to collapse · swipe to scroll",
         ]
     else:
         choices = [
-            "same key or Esc/q collapses · 1-6/f/0 switch panels · c cycles filter · "
-            "↑/↓/PgUp/PgDn/Home/End or wheel scrolls",
-            "Esc/q collapse · 1-6/f/0 switch · ↑/↓/PgUp/PgDn scroll · c filter",
-            "Esc/q collapse · 1-6/f/0 switch · ↑/↓ scroll",
+            "same key or Esc/q collapses · 1-6/f/0/m switch panels · c cycles filter · "
+            "↑/↓/PgUp/PgDn/Home/End or wheel scrolls · ? for help",
+            "Esc/q collapse · 1-6/f/0/m switch · ↑/↓/PgUp/PgDn scroll · c filter · ? help",
+            "Esc/q collapse · 1-6/f/0/m switch · ↑/↓ scroll · ? help",
+            "Esc/q collapse · 1-6/f/0/m switch · ↑/↓ scroll",
         ]
     return next((choice for choice in choices if len(choice) <= width), choices[-1][:width])
+
+
+def code_change_summary(changes: list) -> str:
+    """Compact ``+N ~M −D`` counts for Code Monitor titles (empty when no changes)."""
+    if not changes:
+        return ""
+    counts = Counter(getattr(c, "kind", "") for c in changes)
+    parts: list[str] = []
+    if counts.get("added"):
+        parts.append(f"+{counts['added']}")
+    if counts.get("modified"):
+        parts.append(f"~{counts['modified']}")
+    if counts.get("deleted"):
+        parts.append(f"−{counts['deleted']}")
+    return " ".join(parts)
 
 
 def agent_grid(total_width: int, agent_area_height: int, count: int,
@@ -1202,6 +1250,30 @@ Do not mention the roundtable process, the transcript, these instructions, or th
 Return only the polished answer."""
 
 
+def dead_code_check_prompt(objective: str, turns: list[Turn], history: str | None = None) -> str:
+    """Ask one agent to sweep for now-unused code before the final answer is drafted.
+
+    Unlike final_prompt/refine_prompt (prose only, no_edit=True), this turn keeps edit rights: a
+    dead function found here needs to actually be deleted, not just mentioned in the write-up.
+    """
+    return f"""{SYSTEM_BRIEF}
+
+USER OBJECTIVE:
+{objective}
+
+COMPLETE ROUNDTABLE TRANSCRIPT:
+{transcript(turns) if history is None else history}
+
+Before the final answer is written, check the code changes made this session for dead code:
+functions, classes, branches, or variables that were added or left behind but no longer have any
+caller or use -- a common leftover from an abandoned approach or a half-finished feature. Search
+the codebase for call sites (not just the definition) to confirm something is genuinely unused
+before touching it; do not remove code that is still called, part of a public or test-facing API,
+or outside the scope of this session's changes. If you find genuinely dead code, remove it and run
+the project's test suite to confirm nothing broke. If you find nothing, say so briefly. Report only
+what you found and did in a few sentences -- do not write the final answer here."""
+
+
 def reassignment_prompt(objective: str, turns: list[Turn], phase: str, speaker: str,
                         remaining: Iterable[str]) -> str:
     """Prompt for an agent that finished its turn while others in the same phase are still working:
@@ -1252,17 +1324,23 @@ def _session_stamp(session: Session) -> str:
         return f"legacy-{digest}"
 
 
+def artifact_paths_for(session: Session, output_dir: Path) -> tuple[Path, Path, Path]:
+    """JSON/Markdown transcript and diagnostic-log paths, sharing one stamp per session."""
+    stamp = _session_stamp(session)
+    return (output_dir / f"roundtable-{stamp}.json",
+            output_dir / f"roundtable-{stamp}.md",
+            output_dir / f"roundtable-{stamp}.log")
+
+
 def log_path_for(session: Session, output_dir: Path) -> Path:
     """Path to this session's activity log — pairs with its .json/.md transcript."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    return output_dir / f"roundtable-{_session_stamp(session)}.log"
+    return artifact_paths_for(session, output_dir)[2]
 
 
 def save_session(session: Session, output_dir: Path) -> tuple[Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    stamp = _session_stamp(session)
-    json_path = output_dir / f"roundtable-{stamp}.json"
-    md_path = output_dir / f"roundtable-{stamp}.md"
+    json_path, md_path, _ = artifact_paths_for(session, output_dir)
     data = asdict(session)
     atomic_write_text(json_path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
     body = [f"# Roundtable\n\n**Objective:** {session.objective}\n"]
@@ -1372,12 +1450,13 @@ def log_run_context(run_log: RunLog, args: argparse.Namespace, session: Session,
     for agent in agents:
         if agent is None:
             continue
-        executable = executable_names[agent.name]
+        agent_name = getattr(agent, "name", "")
+        executable = executable_names.get(agent_name, str(agent_name).lower() or "cli")
         agent_details.append({
-            "name": agent.name,
-            "model": agent.model or "cli-default",
-            "reasoning_effort": agent.reasoning_effort,
-            "elevated": agent.elevated,
+            "name": agent_name,
+            "model": getattr(agent, "model", None) or "cli-default",
+            "reasoning_effort": getattr(agent, "reasoning_effort", None),
+            "elevated": getattr(agent, "elevated", False),
             "executable": shutil.which(executable) or f"<missing:{executable}>",
         })
     source_path = Path(__file__).resolve()
@@ -1436,7 +1515,7 @@ def log_run_context(run_log: RunLog, args: argparse.Namespace, session: Session,
                 "plain", "self", "mock", "collab", "synthesizer", "synthesis_passes",
                 "reasoning_effort", "balance_load", "task_status_check", "reassign_idle",
                 "skip_preflight", "preflight_timeout", "extended_preflight", "touch_mode",
-                "debug",
+                "debug", "dead_code_check",
             )
         },
         "agents": agent_details,
@@ -1447,23 +1526,76 @@ def log_run_context(run_log: RunLog, args: argparse.Namespace, session: Session,
     run_log.write("config", json.dumps(context, indent=2, ensure_ascii=False, default=str))
 
 
+def config_summary(args: argparse.Namespace) -> str:
+    """One-line, human-readable echo of the flags that change how this run behaves.
+
+    log_run_context already writes every option to the private disk log for reproducibility, but
+    that file is only found after the fact (or not at all, in plain/non-interactive mode). This is
+    printed/logged where the operator is actually looking at the start of a run, so "what mode is
+    this running in" never requires opening the log to answer.
+    """
+    checks = [label for enabled, label in (
+        (getattr(args, "balance_load", False), "balance-load"),
+        (getattr(args, "task_status_check", False), "task-status"),
+        (getattr(args, "reassign_idle", False), "reassign-idle"),
+        (getattr(args, "dead_code_check", False), "dead-code"),
+    ) if enabled]
+    elevated_raw = list(dict.fromkeys(getattr(args, "elevated", None) or ()))
+    elevated = "all" if "all" in elevated_raw else (", ".join(sorted(elevated_raw)) or "none")
+    parts = [
+        f"collab={getattr(args, 'collab', 'parallel')}",
+        f"effort={getattr(args, 'reasoning_effort', 'auto')}",
+        f"synthesis-passes={getattr(args, 'synthesis_passes', 6)}",
+        f"checks={', '.join(checks) or 'none'}",
+        f"elevated={elevated}",
+    ]
+    summary = "Config: " + "  ·  ".join(parts)
+    if getattr(args, "mock", False):
+        summary = "⚠ MOCK (simulated agents, no real CLI calls)  ·  " + summary
+    return summary
+
+
 # (label, kinds-to-show — None means everything). Cycled with the 'c' key; "key events" is the
-# default so the console opens signal-dense (phase changes, completed turns, errors) rather than a
-# firehose of raw per-line ticks, with the option to drill into everything or one category on demand.
+# default so the console opens signal-dense (phase changes, retries, completed turns, errors) rather
+# than a firehose of raw per-line ticks, with the option to drill into everything or one category
+# on demand.
 CONSOLE_FILTERS: tuple[tuple[str, tuple[str, ...] | None], ...] = (
-    ("key events", ("phase", "turn", "error")),
+    ("key events", ("phase", "retry", "turn", "error")),
     ("all activity", None),
     ("prompts", ("prompt",)),
     ("errors only", ("error",)),
 )
 CONSOLE_KIND_GLYPH: dict[str, str] = {
-    "phase": "▶", "turn": "✓", "tick": "·", "prompt": "➤", "error": "✗", "info": "·",
+    "phase": "▶", "retry": "↻", "turn": "✓", "tick": "·", "prompt": "➤", "error": "✗",
+    "info": "·",
 }
 
 _ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
-_EXEC_PATTERN = re.compile(r"\b(exec|execute|executing|command|shell|bash|test|running)\b", re.IGNORECASE)
-_READ_PATTERN = re.compile(r"\b(read|reading|open|inspect|search|find|list)\b", re.IGNORECASE)
-_WRITE_PATTERN = re.compile(r"\b(write|writing|edit|editing|patch|create|delete)\b", re.IGNORECASE)
+# Glyph classifiers for the live work feed. Keep these tool-ish / progress-phrase-shaped so
+# ordinary prose ("open source", "list of findings", "the latest contest is running") does not
+# paint every line as a read/exec/write. Counters use the tighter Display.*_PATTERN set below;
+# work_event also accepts a few natural CLI progress phrases the counters deliberately skip.
+_EXEC_PATTERN = re.compile(
+    r"\b(run_command|execute_command|execute_bash|execute_script|"
+    r"exec(?:ute|uting)?(?:\s+\S+)?|"
+    r"run(?:ning)?\s+command|ran\s+command|executed\s+command|"
+    r"executed\s+code|executing\s+code|"
+    r"python3?\s+-m\b)\b",
+    re.IGNORECASE,
+)
+_READ_PATTERN = re.compile(
+    r"\b(view_file|read_file|grep_search|search_grep|list_dir|glob_files|"
+    r"read(?:ing)?\s+(?:file\b|\S+\.\w{1,10})|"
+    r"view(?:ed|ing)?\s+file|open\s+file|load\s+file|fetch\s+file)\b",
+    re.IGNORECASE,
+)
+_WRITE_PATTERN = re.compile(
+    r"\b(replace_file_content|write_to_file|edit_file|write_file|"
+    r"writ(?:e|ing|es|ten)?\s+file|edited\s+file|editing\s+file|wrote\s+file|"
+    r"modify\s+file|update\s+file|save\s+file|create\s+file|delete\s+file|remove\s+file|"
+    r"apply(?:ing)?\s+patch|applied\s+patch)\b",
+    re.IGNORECASE,
+)
 
 
 def work_event(line: str) -> str:
@@ -1484,14 +1616,17 @@ def work_event(line: str) -> str:
 
 class Display:
     def __init__(self, stdscr: curses.window, session: Session, touch_mode: bool = False,
-                run_log: RunLog | None = None):
+                 run_log: RunLog | None = None, mock: bool = False):
         self.s = stdscr
         self.session = session
         self.run_log = run_log or RunLog(None)
+        self.mock = mock
         self.status = "Ready"
         self.activity: dict[str, str] = {}
         self.active: set[str] = set()
         self.phase_completed: set[str] = set()
+        # Agents dropped from the current phase after a hard failure (distinct from successful done).
+        self.phase_failed: set[str] = set()
         self.busy = False
         self.error = ""
         self.frame = 0
@@ -1503,6 +1638,7 @@ class Display:
         self.scroll = {"Codex": 0, "Claude": 0, "Antigravity": 0, "Aider": 0, "Grok": 0, "Qwen": 0,
                       "Final": 0, "Console": 0, "Code": 0}
         self.expanded: str | None = None
+        self.focused_panel: str | None = None
         self.show_help = False
         self.console_filter = 0
         self.usage_names = ("Codex", "Claude", "Antigravity", "Aider", "Grok", "Qwen")
@@ -1518,18 +1654,25 @@ class Display:
         # Sparse on purpose: an agent absent from this dict means no usage-limit signal has been
         # seen for it, not that it's known to be at 0% -- never show a number we don't have.
         self.usage_percent: dict[str, float] = {}
+        self.retry_state: dict[str, str] = {}
         self.turn_start: dict[str, float] = {}
         for turn in session.turns:
             if turn.speaker in self.turn_outputs:
                 self.turn_outputs[turn.speaker].append(len(turn.content))
         self._known_turn_count = len(session.turns)
         self.console: deque[tuple[str, str]] = deque(maxlen=300)
-        self.log(f"Objective: {session.objective}", kind="phase")
+        clean_log_obj = clean_self_objective(session.objective)
+        is_self = session_is_self(session)
+        log_text = f"Objective: {clean_log_obj}" + (" [⚡ self]" if is_self else "")
+        self.log(log_text, kind="phase")
         try:
             curses.curs_set(0)
         except curses.error:
             pass
-        self.s.nodelay(True)
+        # Real curses windows provide nodelay; lightweight screen-compatible adapters used by
+        # embedders and tests may not. Drawing should still work for those adapters.
+        if hasattr(self.s, "nodelay"):
+            self.s.nodelay(True)
         try:
             curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
             curses.mouseinterval(0)
@@ -1561,22 +1704,64 @@ class Display:
 
     def update_status(self, active: Iterable[str], message: str) -> None:
         next_active = set(active)
+        message_changed = message != self.status
+        if message_changed:
+            # A new phase starts a fresh completion count. Within one phase, preserve agents that
+            # leave the active set even when a sequential relay swaps one agent for another.
+            self.phase_completed = set()
+            self.phase_failed = set()
+            self.activity = {}
+            if hasattr(self, "retry_state"):
+                self.retry_state = {}
+        else:
+            self.phase_completed.update(self.active - next_active)
+            # Leaving the active set is not a success by itself; failures are demoted later when
+            # the coordinator emits "dropped from this phase after a failure".
+            self.phase_completed -= getattr(self, "phase_failed", set())
         for name in next_active - self.active:
             self.turn_start[name] = time.monotonic()
             if name in getattr(self, "scroll", {}):
                 self.scroll[name] = 0
             if name in getattr(self, "work_activity", {}):
                 self.work_activity[name].clear()
-        if message != self.status:
+        if message_changed:
             self.log(message, kind="phase")
-        if next_active < self.active:
-            self.phase_completed.update(self.active - next_active)
-        else:
-            self.phase_completed = set()
-            self.activity = {}
         self.active, self.status = next_active, message
         for name in self.active:
             self.activity.setdefault(name, "")
+
+    @staticmethod
+    def _tick_console_kind(line: str) -> str:
+        """Classify coordinator-authored ticks so critical ops stay visible on the default console.
+
+        Raw CLI chatter stays kind=tick (hidden until the operator cycles to all-activity). Hard
+        Phase drops and task-complete signals are elevated so the key-events view stays honest.
+        Transient retries and usage-limit waits use their own non-fatal key-event kind.
+        """
+        lower = line.lower()
+        if "dropped from this phase after a failure" in lower:
+            return "error"
+        if (lower.startswith("temporarily unavailable:")
+                or lower.startswith("usage limit reached — ")
+                or lower.startswith("agent available again — ")
+                or " — retrying" in lower):
+            return "retry"
+        if "marked the task complete" in lower:
+            return "phase"
+        return "tick"
+
+    def note_phase_failure(self, name: str) -> None:
+        """Record that *name* left the current phase via a hard failure, not a successful finish."""
+        if not name:
+            return
+        failed = getattr(self, "phase_failed", None)
+        if failed is None:
+            self.phase_failed = set()
+            failed = self.phase_failed
+        failed.add(name)
+        completed = getattr(self, "phase_completed", None)
+        if completed is not None:
+            completed.discard(name)
 
     def tick(self, name: str, line: str = "") -> None:
         self.frame += 1
@@ -1587,14 +1772,20 @@ class Display:
             if entry and feed is not None and (not feed or feed[-1] != entry):
                 feed.append(entry)
             if name:
-                self.log(f"[{name}] {line}", kind="tick")
+                kind = self._tick_console_kind(line)
+                if kind == "error" and "dropped from this phase after a failure" in line.lower():
+                    self.note_phase_failure(name)
+                self.log(f"[{name}] {line}", kind=kind)
                 self.parse_work_activity(name, line)
                 self.parse_usage_gauge(name, line)
+                self.parse_retry_state(name, line)
         if name in self.activity_pulses:
             self.activity_pulses[name].append(time.monotonic())
         if len(self.session.turns) > self._known_turn_count:
             for turn in self.session.turns[self._known_turn_count:]:
                 start = self.turn_start.pop(turn.speaker, None)
+                if hasattr(self, "retry_state"):
+                    self.retry_state.pop(turn.speaker, None)
                 duration = None
                 if turn.speaker in self.turn_outputs:
                     self.turn_outputs[turn.speaker].append(len(turn.content))
@@ -1602,7 +1793,10 @@ class Display:
                         duration = time.monotonic() - start
                         self.turn_times[turn.speaker].append(duration)
                 detail = f"{duration:.1f}s · " if duration is not None else ""
-                self.log(f"{turn.speaker} · {turn.phase} · {detail}{len(turn.content)} chars", kind="turn")
+                rate_str = ""
+                if duration and duration > 0 and len(turn.content) > 0:
+                    rate_str = f" ({len(turn.content) / duration:.0f} c/s)"
+                self.log(f"{turn.speaker} · {turn.phase} · {detail}{len(turn.content)} chars{rate_str}", kind="turn")
             self._known_turn_count = len(self.session.turns)
         self.monitor.refresh()
         self.draw()
@@ -1670,6 +1864,31 @@ class Display:
         if pct is not None:
             self.usage_percent[name] = pct
 
+    def parse_retry_state(self, name: str, line: str) -> None:
+        """Track transient retry and provider-limit waits for panel/roster/status badges.
+
+        Sets stick until the agent produces normal progress again (clears a transient retry),
+        availability is restored after a usage limit, the turn completes, or the phase resets.
+        """
+        if not hasattr(self, "retry_state"):
+            self.retry_state = {}
+        if not name:
+            return
+        lower = line.lower()
+        if (lower.startswith(self.USAGE_LIMIT_HIT_PREFIX)
+                or lower.startswith("usage limit reached — ")):
+            self.retry_state[name] = "rate limited"
+            return
+        if line == self.USAGE_LIMIT_CLEARED or lower.startswith("agent available again — "):
+            self.retry_state.pop(name, None)
+            return
+        if " — retrying " in lower:
+            self.retry_state[name] = "retrying"
+            return
+        # Any non-retry chatter means the second attempt (or normal work) is underway.
+        if self.retry_state.get(name) == "retrying":
+            self.retry_state.pop(name, None)
+
     @staticmethod
     def _inside(box: tuple[int, int, int, int], y: int, x: int) -> bool:
         top, left, bottom, right = box
@@ -1677,17 +1896,25 @@ class Display:
 
     EXPAND_KEYS = {ord("1"): "Codex", ord("2"): "Claude", ord("3"): "Antigravity", ord("4"): "Aider",
                   ord("5"): "Grok", ord("6"): "Qwen",
-                  ord("f"): "Final", ord("F"): "Final", ord("0"): "Console"}
+                  ord("f"): "Final", ord("F"): "Final",
+                  ord("m"): "Code", ord("M"): "Code",
+                  ord("0"): "Console"}
     COLLAPSE_KEYS = (27, ord("q"), ord("Q"))  # Esc, q
     CONSOLE_FILTER_KEYS = (ord("c"), ord("C"))
     INTERRUPT_KEYS = (ord("i"), ord("I"))
     HELP_KEYS = (ord("?"), ord("h"), ord("H"))
+    FOCUS_NEXT_KEYS = (9,)  # Tab
+    FOCUS_PREVIOUS_KEYS = (curses.KEY_BTAB,)
+    ACTIVATE_KEYS = (10, 13, curses.KEY_ENTER)
     SCROLL_KEYS = (
         curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE,
         curses.KEY_HOME, curses.KEY_END,
     )
-    PANEL_NAMES = ("Codex", "Claude", "Antigravity", "Aider", "Grok", "Qwen", "Final", "Console")
-    SCROLL_NAMES = PANEL_NAMES + ("Code",)
+    # Order matches visual layout: agents, then Final, Code Monitor, Console.
+    # Code used to be scroll-only (mouse wheel) with no expand path — m/click/Tab now work.
+    PANEL_NAMES = ("Codex", "Claude", "Antigravity", "Aider", "Grok", "Qwen",
+                   "Final", "Code", "Console")
+    SCROLL_NAMES = PANEL_NAMES
     AGENTS = (
         ("Codex", "◇", "OpenAI coding agent", 1),
         ("Claude", "✳", "Anthropic coding agent", 5),
@@ -1699,7 +1926,40 @@ class Display:
 
     def toggle_expanded(self, name: str) -> None:
         """Show one panel full-size for its complete content, or collapse back to the dashboard."""
+        self.focused_panel = name
         self.expanded = None if self.expanded == name else name
+        self.draw()
+
+    def move_panel_focus(self, direction: int) -> None:
+        """Move keyboard focus through expandable panels and keep it visible."""
+        visible = tuple(
+            name for name in self.PANEL_NAMES if name.lower() in getattr(self, "hitboxes", {}))
+        focus_order = visible or self.PANEL_NAMES
+        current = getattr(self, "focused_panel", None)
+        if current not in focus_order:
+            index = 0 if direction >= 0 else len(focus_order) - 1
+        else:
+            index = (focus_order.index(current) + direction) % len(focus_order)
+        self.focused_panel = focus_order[index]
+        self.draw()
+
+    def handle_resize(self) -> None:
+        """Redraw for the new dimensions and keep dashboard focus on a visible panel."""
+        self.draw()
+        if self.expanded:
+            return
+        focused = getattr(self, "focused_panel", None)
+        if not focused or focused.lower() in self.hitboxes:
+            return
+        visible = tuple(name for name in self.PANEL_NAMES if name.lower() in self.hitboxes)
+        if visible:
+            old_index = self.PANEL_NAMES.index(focused)
+            before = [name for name in visible if self.PANEL_NAMES.index(name) < old_index]
+            self.focused_panel = before[-1] if before else visible[0]
+        else:
+            # A too-small warning has no actionable panels. Do not leave Enter wired to an
+            # invisible selection while the user is trying to resize the terminal.
+            self.focused_panel = None
         self.draw()
 
     def cycle_console_filter(self) -> None:
@@ -1708,8 +1968,8 @@ class Display:
         self.draw()
 
     def scroll_expanded(self, key: int) -> bool:
-        """Scroll the expanded panel from the keyboard, returning whether the key was handled."""
-        name = self.expanded
+        """Scroll the expanded or focused panel from the keyboard, returning whether the key was handled."""
+        name = self.expanded or getattr(self, "focused_panel", None)
         if not name or key not in self.SCROLL_KEYS:
             return False
         page = max(3, self.s.getmaxyx()[0] - 10)
@@ -1740,6 +2000,7 @@ class Display:
     def _kind_attr(kind: str) -> int:
         return {
             "phase": curses.color_pair(1) | curses.A_BOLD,
+            "retry": curses.color_pair(5) | curses.A_BOLD,
             "turn": curses.color_pair(3),
             "tick": curses.A_DIM,
             "error": curses.color_pair(4) | curses.A_BOLD,
@@ -1790,16 +2051,35 @@ class Display:
             if key == 3:
                 raise KeyboardInterrupt
             if key == curses.KEY_RESIZE:
-                # Handle terminal resize by redrawing the UI with new dimensions
-                self.draw()
+                self.handle_resize()
                 continue
             if getattr(self, "show_help", False):
+                if key == curses.KEY_MOUSE or key == getattr(curses, "KEY_MOUSE", -999):
+                    try:
+                        _, x, y, _, state = curses.getmouse()
+                    except curses.error:
+                        continue
+                    action = self.handle_mouse(x, y, state)
+                    if action == "stop":
+                        raise KeyboardInterrupt
+                    if action == "interrupt":
+                        self.trigger_interrupt()
+                    continue
                 self.show_help = False
                 self.draw()
                 continue
             if key in self.HELP_KEYS:
                 self.show_help = not getattr(self, "show_help", False)
                 self.draw()
+                continue
+            if key in self.FOCUS_NEXT_KEYS:
+                self.move_panel_focus(1)
+                continue
+            if key in self.FOCUS_PREVIOUS_KEYS:
+                self.move_panel_focus(-1)
+                continue
+            if key in self.ACTIVATE_KEYS and getattr(self, "focused_panel", None):
+                self.toggle_expanded(self.focused_panel)
                 continue
             if key in self.INTERRUPT_KEYS:
                 self.trigger_interrupt()
@@ -1831,12 +2111,37 @@ class Display:
     def handle_mouse(self, x: int, y: int, state: int) -> str | None:
         """Translate terminal mouse events, including touchscreen taps and swipes."""
         tapped = state & (curses.BUTTON1_CLICKED | curses.BUTTON1_RELEASED)
+        if getattr(self, "show_help", False):
+            # Help is modal: do not let wheel or pointer events mutate the obscured dashboard.
+            # Keep the visible global controls usable, though, especially STOP while agents run.
+            if tapped and "help" in self.hitboxes and self._inside(self.hitboxes["help"], y, x):
+                self.show_help = False
+                self.draw()
+                return None
+            for action in ("stop", "interrupt"):
+                box = self.hitboxes.get(action)
+                if tapped and box and self._inside(box, y, x):
+                    return action
+            if tapped:
+                self.show_help = False
+                self.draw()
+            return None
+
+        # Some curses/terminal combinations report wheel events alongside a release bit. Consume
+        # scrolling first so a wheel gesture over an expandable panel cannot also open it.
+        button4 = getattr(curses, "BUTTON4_PRESSED", 0)
+        button5 = getattr(curses, "BUTTON5_PRESSED", 0)
+        direction = 3 if button4 and (state & button4) else (
+            -3 if button5 and (state & button5) else 0)
+        if direction:
+            for name in self.SCROLL_NAMES:
+                box = self.hitboxes.get(name.lower())
+                if box and self._inside(box, y, x):
+                    self.scroll[name] = max(0, self.scroll.get(name, 0) + direction)
+                    self.draw()
+                    return None
         if tapped and "help" in self.hitboxes and self._inside(self.hitboxes["help"], y, x):
             self.show_help = not getattr(self, "show_help", False)
-            self.draw()
-            return None
-        if getattr(self, "show_help", False) and tapped:
-            self.show_help = False
             self.draw()
             return None
         if tapped and "stop" in self.hitboxes and self._inside(self.hitboxes["stop"], y, x):
@@ -1851,27 +2156,14 @@ class Display:
             for name in self.PANEL_NAMES:
                 box = self.hitboxes.get(name.lower())
                 if box and self._inside(box, y, x):
+                    self.focused_panel = name
                     self.toggle_expanded(name)
                     return None
-        direction = 0
-        button4 = getattr(curses, "BUTTON4_PRESSED", 0)
-        button5 = getattr(curses, "BUTTON5_PRESSED", 0)
-        if button4 and (state & button4):
-            direction = 3
-        elif button5 and (state & button5):
-            direction = -3
-        if direction:
-            for name in self.SCROLL_NAMES:
-                box = self.hitboxes.get(name.lower())
-                if box and self._inside(box, y, x):
-                    self.scroll[name] = max(0, self.scroll.get(name, 0) + direction)
-                    self.draw()
-                    break
         return None
 
     def _put(self, y: int, x: int, text: str, attr: int = 0) -> None:
         h, w = self.s.getmaxyx()
-        if 0 <= y < h and x < w:
+        if 0 <= y < h and 0 <= x < w:
             try:
                 self.s.addnstr(y, x, text, max(0, w - x - 1), attr)
             except curses.error:
@@ -1898,13 +2190,36 @@ class Display:
                      icon: str, subtitle: str, color: int) -> None:
         self._box(y, x, height, width, color)
         is_active = name in self.active and self.busy
-        has_responded = name in self.phase_completed or any(
-            t.speaker == name for t in self.session.turns)
-        state = "● working" if is_active else ("✓ responded" if has_responded else "○ waiting")
-        compact_state = "● work" if is_active else ("✓ done" if has_responded else "○ wait")
-        state_attr = color | (curses.A_BOLD if is_active else curses.A_DIM)
+        failed_this_phase = name in getattr(self, "phase_failed", set())
+        has_responded = (not failed_this_phase and (
+            name in self.phase_completed or any(
+                t.speaker == name for t in self.session.turns)))
+        retry = getattr(self, "retry_state", {}).get(name)
+        if is_active:
+            start_t = self.turn_start.get(name)
+            elapsed = max(0.0, time.monotonic() - start_t) if start_t is not None else 0.0
+            if retry == "retrying":
+                state = f"↻ retrying ({elapsed:.1f}s)" if elapsed >= 0.1 else "↻ retrying"
+                compact_state = f"↻ retry {elapsed:.0f}s" if elapsed >= 1.0 else "↻ retry"
+                state_attr = curses.color_pair(5) | curses.A_BOLD
+            elif retry == "rate limited":
+                state = f"⏳ rate limited ({elapsed:.1f}s)" if elapsed >= 0.1 else "⏳ rate limited"
+                compact_state = f"⏳ limited {elapsed:.0f}s" if elapsed >= 1.0 else "⏳ limited"
+                state_attr = curses.color_pair(4) | curses.A_BOLD
+            else:
+                state = f"● working ({elapsed:.1f}s)" if elapsed >= 0.1 else "● working"
+                compact_state = f"● work {elapsed:.0f}s" if elapsed >= 1.0 else "● work"
+                state_attr = color | curses.A_BOLD
+        elif failed_this_phase:
+            state = "✗ failed"
+            compact_state = "✗ fail"
+            state_attr = curses.color_pair(4) | curses.A_BOLD
+        else:
+            state = "✓ responded" if has_responded else "○ waiting"
+            compact_state = "✓ done" if has_responded else "○ wait"
+            state_attr = color | curses.A_DIM
         usage_pct = getattr(self, "usage_percent", {}).get(name)
-        if usage_pct is not None:
+        if usage_pct is not None and not failed_this_phase:
             state = f"{state} · {usage_pct:.0f}% used"
             if usage_pct >= 95:
                 state_attr = curses.color_pair(4) | curses.A_BOLD  # red: at/near the limit
@@ -1916,7 +2231,7 @@ class Display:
         # Narrow columns drop "● working · 95% used" to a compact form, but keep the
         # usage signal whenever it still fits — that gauge is the reason the state is red/yellow.
         if len(state) > inner_width:
-            if usage_pct is not None:
+            if usage_pct is not None and not failed_this_phase:
                 with_usage = f"{compact_state} · {usage_pct:.0f}%"
                 state = with_usage if len(with_usage) <= inner_width else compact_state
             else:
@@ -1967,17 +2282,24 @@ class Display:
                 content = f"LIVE WORK · {len(feed)} events\n" + "\n".join(feed)
             else:
                 content = "LIVE WORK\n· Waiting for the agent's first progress event…"
+        elif failed_this_phase:
+            # No successful turn is recorded for a hard drop; surface the coordinator's reason.
+            reason = (self.activity.get(name) or "").strip()
+            content = reason if reason else "Dropped from this phase after a failure"
         else:
             # Show the latest response when not active
             content = items[-1].content if items else "Waiting for the shared task…"
 
         lines = self._wrapped(content, width - 4)
-        offset = min(self.scroll[name], max(0, len(lines) - available))
+        offset = min(self.scroll.get(name, 0), max(0, len(lines) - available))
         self.scroll[name] = offset
         # Same "· ↑N" title cue as Console / Final / Code Monitor.
         scroll_cue = f" · ↑{offset}" if offset else ""
         header = f" {icon}  {name.upper()}{ticker}{scroll_cue} "
-        self._put(y, x + 2, header[:inner_width], color | curses.A_BOLD)
+        header_attr = color | curses.A_BOLD
+        if getattr(self, "focused_panel", None) == name and not self.expanded:
+            header_attr |= curses.A_REVERSE
+        self._put(y, x + 2, header[:inner_width], header_attr)
         end = len(lines) - offset if offset else len(lines)
         lines = lines[max(0, end - available):end]
 
@@ -2006,13 +2328,27 @@ class Display:
         self.hitboxes[name.lower()] = (y, x, y + height - 1, x + width - 1)
 
     def _draw_agent_roster(self, y: int, w: int) -> None:
-        """One-line at-a-glance status for every agent (● working / ✓ done / ○ wait)."""
+        """One-line at-a-glance status (●/↻/⏳ working · ✓ done · ✗ failed · ○ wait)."""
         parts: list[str] = []
+        failed = getattr(self, "phase_failed", set())
+        retries = getattr(self, "retry_state", {})
         for name, icon, _subtitle, _color_num in self.AGENTS:
             is_active = name in self.active and self.busy
-            has_responded = (name in getattr(self, "phase_completed", set())
-                             or any(t.speaker == name for t in self.session.turns))
-            mark = "●" if is_active else ("✓" if has_responded else "○")
+            if name in failed:
+                mark = "✗"
+            elif is_active:
+                stalled = retries.get(name)
+                if stalled == "retrying":
+                    mark = "↻"
+                elif stalled == "rate limited":
+                    mark = "⏳"
+                else:
+                    mark = "●"
+            elif (name in getattr(self, "phase_completed", set())
+                  or any(t.speaker == name for t in self.session.turns)):
+                mark = "✓"
+            else:
+                mark = "○"
             # Short labels keep six agents visible at the 72-col minimum.
             short = {"Antigravity": "Anti"}.get(name, name)
             if w < 90:
@@ -2045,37 +2381,72 @@ class Display:
         # hid turn progress entirely whenever a battery reading existed).
         right_bits = [f"{turns} turns",
                       format_duration(time.monotonic() - self.started)]
+        is_self = session_is_self(self.session)
+        if is_self:
+            right_bits.append("⚡ self")
+        if getattr(self, "mock", False):
+            right_bits.append("🧪 mock")
         if self.touch_mode:
             right_bits.append("☝ touch")
         battery = battery_summary()
         if battery:
             right_bits.append(battery)
         right = " · ".join(right_bits)
-        # Leave room for the brand mark on the left; shorten rather than overwrite it.
-        max_right = max(8, w - 20)
+        # Lay out touch controls from left to right before budgeting the session metadata.
+        # Positioning HELP/STOP backward from an already-wide right label made the controls
+        # overwrite both that label and the brand at the 72-column floor.
+        touch_controls: list[tuple[str, str, int]] = []
+        controls_end = 16  # one-column gap after "◈  ROUNDTABLE"
+        if self.touch_mode:
+            help_label = "  ? HELP  "
+            touch_controls.append(("help", help_label, controls_end))
+            controls_end += len(help_label) + 2
+            if self.busy:
+                stop_label = "  ■ STOP  "
+                touch_controls.append(("stop", stop_label, controls_end))
+                controls_end += len(stop_label) + 2
+        # Leave room for the brand and any controls; shorten rather than overwrite either.
+        max_right = max(8, w - controls_end - 3)
         if len(right) > max_right:
             right = textwrap.shorten(right, width=max_right, placeholder="…")
         self._put(0, w - len(right) - 3, right, curses.A_REVERSE | curses.A_DIM)
-        left_edge = w - len(right) - 3
-        if self.busy and self.touch_mode:
-            label = "  ■ STOP  "
-            stop_x = max(20, w - len(right) - len(label) - 6)
-            self._put(0, stop_x, label, curses.color_pair(4) | curses.A_REVERSE | curses.A_BOLD)
-            self.hitboxes["stop"] = (0, stop_x, 0, stop_x + len(label) - 1)
-            left_edge = stop_x
-        if self.touch_mode:
-            # Touch users have no "?" key to reach for, so the help overlay needs a real
-            # tappable entry point -- without this button, self.hitboxes["help"] (read in
-            # handle_mouse) was never populated and the overlay was unreachable on touch.
-            help_label = "  ? HELP  "
-            help_x = max(2, left_edge - len(help_label) - 2)
-            self._put(0, help_x, help_label, curses.color_pair(1) | curses.A_REVERSE | curses.A_BOLD)
-            self.hitboxes["help"] = (0, help_x, 0, help_x + len(help_label) - 1)
+        for action, label, control_x in touch_controls:
+            color = curses.color_pair(4) if action == "stop" else curses.color_pair(1)
+            self._put(0, control_x, label, color | curses.A_REVERSE | curses.A_BOLD)
+            self.hitboxes[action] = (0, control_x, 0, control_x + len(label) - 1)
 
         self._put(2, 2, "›", curses.color_pair(3) | curses.A_BOLD)
-        obj = textwrap.shorten(self.session.objective, width=max(20, w - 8), placeholder="…")
+        clean_obj = clean_self_objective(self.session.objective)
+        display_obj = f"⚡ {clean_obj}" if is_self else clean_obj
+        obj = textwrap.shorten(display_obj, width=max(20, w - 8), placeholder="…")
         self._put(2, 4, obj, curses.A_BOLD)
-        status_line = f"{self.status}  ·  {self.session.workspace}"
+        status_parts = [self.status]
+        phase_failed = getattr(self, "phase_failed", set())
+        if self.busy and (self.active or self.phase_completed or phase_failed):
+            # Keep phase progress beside the phase name. The roster answers "who"; these counts
+            # answer "how far" without inventing a percentage for work of unpredictable duration.
+            # Failures are demoted out of "done" so a dropped agent is not painted as success.
+            # Retry/limit stalls stay inside "working" (the agent still holds a slot) and are
+            # surfaced as extra counts so a silent backoff is not mistaken for productive work.
+            done_count = len(self.phase_completed - phase_failed)
+            retries = getattr(self, "retry_state", {})
+            retrying = sum(1 for n in self.active if retries.get(n) == "retrying")
+            limited = sum(1 for n in self.active if retries.get(n) == "rate limited")
+            status_parts.append(f"{len(self.active)} working")
+            if retrying:
+                status_parts.append(f"{retrying} retrying")
+            if limited:
+                status_parts.append(f"{limited} limited")
+            status_parts.append(f"{done_count} done")
+            if phase_failed:
+                status_parts.append(f"{len(phase_failed)} failed")
+        status_parts.append(self.session.workspace)
+        status_line = "  ·  ".join(status_parts)
+        if is_self:
+            sandbox = self_sandbox_path(self.session)
+            if sandbox:
+                # Surface the smoke-test copy agents should invoke; shorten with the line budget.
+                status_line = f"{status_line}  ·  ⚡ {sandbox}"
         status_budget = max(10, w - 8)
         if self.busy:
             interrupt_label = " ＋ ADD PROMPT [i] "
@@ -2092,6 +2463,10 @@ class Display:
 
         if self.expanded:
             self._draw_expanded(content_height, w)
+            # Help must still overlay expanded panels — without this the ?/h and touch HELP
+            # paths set show_help and redraw, but the modal never appeared until collapse.
+            if getattr(self, "show_help", False):
+                self._draw_help_modal()
             self.s.refresh()
             return
 
@@ -2123,7 +2498,7 @@ class Display:
         all_final_lines = self._wrapped(final_text, answer_width - 4)
         available_final = consensus_height - 3
         final_rows = available_final
-        final_offset = min(self.scroll["Final"], max(0, len(all_final_lines) - final_rows))
+        final_offset = min(self.scroll.get("Final", 0), max(0, len(all_final_lines) - final_rows))
         self.scroll["Final"] = final_offset
         # Same "· ↑N" scroll cue as CODE MONITOR's title -- compact Final used to give no sign
         # at all that scroll["Final"] had moved you away from the live tail.
@@ -2132,7 +2507,10 @@ class Display:
         final_title = f" ◆  TASK OUTCOME · COMPLETED / FAILED{final_scroll} "
         if len(final_title) > title_width:
             final_title = f" ◆ OUTCOME{final_scroll} "
-        self._put(cy, 3, final_title[:title_width], curses.color_pair(3) | curses.A_BOLD)
+        final_attr = curses.color_pair(3) | curses.A_BOLD
+        if getattr(self, "focused_panel", None) == "Final":
+            final_attr |= curses.A_REVERSE
+        self._put(cy, 3, final_title[:title_width], final_attr)
         final_end = len(all_final_lines) - final_offset if final_offset else len(all_final_lines)
         final_lines = all_final_lines[max(0, final_end - final_rows):final_end]
         for row, line in enumerate(final_lines):
@@ -2155,13 +2533,20 @@ class Display:
         available_changes = max(1, monitor_height - 3)
         code_offset = min(
             self.scroll.get("Code", 0), max(0, len(changes) - available_changes))
+        self.scroll["Code"] = code_offset
         code_scroll = f" · ↑{code_offset}" if code_offset else ""
+        summary = code_change_summary(changes)
+        summary_bit = f" · {summary}" if summary else ""
         title_width = max(0, monitor_width - 4)
-        code_title = f" ⌁  CODE MONITOR · {len(changes)}{code_scroll} "
+        code_title = f" ⌁  CODE MONITOR · {len(changes)}{summary_bit}{code_scroll} "
+        if len(code_title) > title_width:
+            code_title = f" ⌁ CODE · {len(changes)}{summary_bit}{code_scroll} "
         if len(code_title) > title_width:
             code_title = f" ⌁ CODE · {len(changes)}{code_scroll} "
-        self._put(cy, mx + 2, code_title[:title_width],
-                  curses.color_pair(2) | curses.A_BOLD)
+        code_attr = curses.color_pair(2) | curses.A_BOLD
+        if getattr(self, "focused_panel", None) == "Code":
+            code_attr |= curses.A_REVERSE
+        self._put(cy, mx + 2, code_title[:title_width], code_attr)
         if changes:
             icons = {"added": "+", "modified": "~", "deleted": "−"}
             colors = {"added": curses.color_pair(3), "modified": curses.color_pair(5),
@@ -2182,12 +2567,14 @@ class Display:
             console_y = cy + monitor_height + 1
             self._box(console_y, mx, console_height, monitor_width, curses.color_pair(1))
             label, filtered = self._filtered_console()
+            total_logs = len(self.console)
+            filtered_logs = len(filtered)
             available_console = max(1, console_height - 3)
             # Honor scroll["Console"] the same way the expanded console and Final panel do.
             # Wheel/swipe over this box already mutates the offset; previously the compact
             # panel always showed the latest window, so scrolling looked broken.
             console_offset = min(
-                self.scroll.get("Console", 0), max(0, len(filtered) - available_console))
+                self.scroll.get("Console", 0), max(0, filtered_logs - available_console))
             self.scroll["Console"] = console_offset
             # Same "· ↑N" scroll cue as CODE MONITOR's title -- compact Console used to give no
             # sign that scroll["Console"] had moved you away from the live tail.
@@ -2195,18 +2582,27 @@ class Display:
             # Same panel-bound title budget as CODE MONITOR: long filter names used to
             # overwrite the right border at the 72-column minimum (monitor_width ≈ 25).
             title_width = max(0, monitor_width - 4)
-            console_title = f" »  CONSOLE · {label}{console_scroll} "
+            count_suffix = f" ({filtered_logs}/{total_logs})" if filtered_logs < total_logs else (f" ({total_logs})" if total_logs else "")
+            console_title = f" »  CONSOLE · {label}{count_suffix}{console_scroll} "
             if len(console_title) > title_width:
-                console_title = f" » {label}{console_scroll} "
-            self._put(console_y, mx + 2, console_title[:title_width],
-                      curses.color_pair(1) | curses.A_BOLD)
+                console_title = f" » {label}{count_suffix}{console_scroll} "
+                if len(console_title) > title_width:
+                    console_title = f" » {label}{console_scroll} "
+            console_attr = curses.color_pair(1) | curses.A_BOLD
+            if getattr(self, "focused_panel", None) == "Console":
+                console_attr |= curses.A_REVERSE
+            self._put(console_y, mx + 2, console_title[:title_width], console_attr)
             counts = Counter(kind for kind, _ in self.console)
             summary = " ".join(f"{counts[k]}{CONSOLE_KIND_GLYPH[k]}" for k in
-                               ("error", "phase", "turn", "prompt", "tick") if counts.get(k))
+                               ("error", "retry", "phase", "turn", "prompt", "tick")
+                               if counts.get(k))
+            if filtered_logs < total_logs:
+                hidden = total_logs - filtered_logs
+                summary = f"{summary} · {hidden} hidden" if summary else f"{hidden} hidden"
             if summary:
                 self._put(console_y + 1, mx + 3, summary[:max(0, monitor_width - 5)], curses.A_DIM)
-            console_end = (len(filtered) - console_offset if console_offset
-                           else len(filtered))
+            console_end = (filtered_logs - console_offset if console_offset
+                           else filtered_logs)
             entries = filtered[max(0, console_end - available_console):console_end]
             for row, (kind, text) in enumerate(entries):
                 glyph = CONSOLE_KIND_GLYPH.get(kind, "·")
@@ -2227,12 +2623,18 @@ class Display:
     def _draw_help_modal(self) -> None:
         """Draw a centered modal overlay window showing keyboard shortcuts and GUI controls."""
         h, w = self.s.getmaxyx()
-        modal_w = min(68, max(44, w - 6))
-        modal_h = min(18, max(12, h - 4))
+        # Make modal size responsive to terminal size
+        modal_w = min(80, max(50, w - 6))
+        modal_h = min(28, max(16, h - 4))
         top = (h - modal_h) // 2
         left = (w - modal_w) // 2
 
         self._box(top, left, modal_h, modal_w, curses.color_pair(1))
+        # _box only paints the border; without a fill, dashboard chrome drawn underneath
+        # (status line, agent titles, panel corners) bleeds into every content row.
+        inner = " " * max(0, modal_w - 2)
+        for row in range(top + 1, top + modal_h - 1):
+            self._put(row, left + 1, inner)
         if self.touch_mode:
             title = " ◈  ROUNDTABLE — TOUCH CONTROLS & HELP "
         else:
@@ -2251,25 +2653,76 @@ class Display:
             ]
         else:
             shortcuts = [
+                ("Tab/Shift-Tab", "Select the next / previous expandable panel"),
+                ("Enter", "Expand or collapse the selected panel"),
                 ("1 - 6", "Expand / collapse Agent 1..6 panel full-screen"),
                 ("f / F", "Expand / collapse Final Answer & Outcome panel"),
+                ("m / M", "Expand / collapse Code Monitor panel"),
                 ("0",     "Expand / collapse Console log panel"),
                 ("c / C", "Cycle Console filter (Key events / All / Prompts / Errors)"),
                 ("i / I", "Interrupt execution to queue a follow-up prompt"),
-                ("↑ / ↓", "Scroll expanded panel or Console log up / down"),
+                ("↑ / ↓", "Scroll expanded panel or Code / Console log up / down"),
                 ("PgUp/PgDn", "Scroll expanded panel by page"),
                 ("Home/End", "Jump to top / bottom of expanded panel"),
                 ("Esc / q", "Collapse expanded panel or close Help overlay"),
                 ("? / h", "Toggle this Help overlay modal"),
+                ("Ctrl+C", "Cancel current operation"),
             ]
 
-        available_rows = modal_h - 4
-        label_width = 18 if self.touch_mode else 11
+        # Operational transparency — only document chrome that is actually drawn.
+        # There is no separate progress-bar widget; step N/total and coarse ETAs live in the
+        # status line that the coordinator updates between phases.
+        op_transparency = [
+            ("Status line", "Shows 'N working · N done · N failed' during phases"),
+            ("Agent panels", "Show '● working', '✓ responded', '✗ failed', '○ waiting'"),
+            ("Console panel", "Displays key events, prompts, errors, and activity"),
+            ("Step / ETA", "Status line shows Step N/total and coarse est. time left"),
+            ("Retry status", "Shows '↻ retrying' when agents are retrying"),
+            ("Rate limits", "Shows '⏳ rate limited' when agents are waiting"),
+            ("Activity feed", "Live work events in each active agent's panel"),
+        ]
+
+        available_rows = max(1, modal_h - 3)
+        label_width = 18 if self.touch_mode else 16
+
+        num_shortcuts = len(shortcuts)
+        num_ops = len(op_transparency)
+
+        total_items = num_shortcuts + num_ops
+        if total_items <= available_rows:
+            visible_items = [(label, desc, "shortcut") for label, desc in shortcuts]
+            visible_items.extend([(label, desc, "op") for label, desc in op_transparency])
+            hidden = 0
+        else:
+            # Reserve a content row for the overflow notice. Previously the list consumed every
+            # available row and "+N more" was painted directly onto the modal footer.
+            visible_capacity = max(0, available_rows - 1)
+            visible_shortcuts = shortcuts[:visible_capacity]
+            remaining = visible_capacity - len(visible_shortcuts)
+            visible_ops = op_transparency[:remaining]
+            visible_items = [(label, desc, "shortcut") for label, desc in visible_shortcuts]
+            visible_items.extend([(label, desc, "op") for label, desc in visible_ops])
+            hidden = total_items - len(visible_items)
+
         desc_x = left + 3 + label_width + 1
-        for i, (key_label, desc) in enumerate(shortcuts[:available_rows]):
+
+        for i, (key_label, desc, item_type) in enumerate(visible_items):
             y = top + 2 + i
-            self._put(y, left + 3, key_label.ljust(label_width), curses.color_pair(3) | curses.A_BOLD)
-            self._put(y, desc_x, textwrap.shorten(desc, width=max(10, modal_w - label_width - 7), placeholder="…"), curses.A_DIM)
+            # Different styling for operational transparency
+            if item_type == "op":
+                label_attr = curses.color_pair(6) | curses.A_BOLD  # Different color for operational info
+                desc_attr = curses.A_DIM
+            else:
+                label_attr = curses.color_pair(3) | curses.A_BOLD
+                desc_attr = curses.A_DIM
+
+            self._put(y, left + 3, key_label.ljust(label_width), label_attr)
+            self._put(y, desc_x, textwrap.shorten(desc, width=max(10, modal_w - label_width - 7), placeholder="…"), desc_attr)
+
+        if hidden > 0:
+            more_line = textwrap.shorten(f"+{hidden} more — resize taller to see all",
+                                         width=max(10, modal_w - 6), placeholder="…")
+            self._put(top + 2 + len(visible_items), left + 3, more_line, curses.A_DIM)
 
         footer = " Press any key or tap to close "
         self._put(top + modal_h - 1, left + max(1, (modal_w - len(footer)) // 2), footer, curses.A_REVERSE | curses.A_DIM)
@@ -2287,18 +2740,49 @@ class Display:
             color = curses.color_pair(1)
             self._box(top, 1, height, w - 2, color)
             label, filtered = self._filtered_console()
+            total_logs = len(self.console)
+            filtered_logs = len(filtered)
             available = max(1, height - 3)
-            offset = min(self.scroll.get("Console", 0), max(0, len(filtered) - available))
+            offset = min(self.scroll.get("Console", 0), max(0, filtered_logs - available))
             self.scroll["Console"] = offset
             scroll_label = f" · ↑{offset}" if offset else ""
-            exp_title = f" »  CONSOLE (expanded) · {label}{scroll_label} "
+            count_suffix = f" ({filtered_logs}/{total_logs})" if filtered_logs < total_logs else (f" ({total_logs})" if total_logs else "")
+            exp_title = f" »  CONSOLE (expanded) · {label}{count_suffix}{scroll_label} "
             self._put(top, 3, exp_title[:max(0, w - 6)], color | curses.A_BOLD)
-            end = len(filtered) - offset if offset else len(filtered)
+            end = filtered_logs - offset if offset else filtered_logs
             for row, (kind, text) in enumerate(filtered[max(0, end - available):end]):
                 glyph = CONSOLE_KIND_GLYPH.get(kind, "·")
                 line = textwrap.shorten(f"{glyph} {text}", width=w - 6, placeholder="…")
                 self._put(top + 2 + row, 3, line, self._kind_attr(kind))
             self.hitboxes["console"] = (top, 1, top + height - 1, w - 2)
+        elif self.expanded == "Code":
+            color = curses.color_pair(2)
+            self._box(top, 1, height, w - 2, color)
+            changes = list(self.monitor.changes)
+            available = max(1, height - 3)
+            offset = min(self.scroll.get("Code", 0), max(0, len(changes) - available))
+            self.scroll["Code"] = offset
+            scroll_label = f" · ↑{offset}" if offset else ""
+            summary = code_change_summary(changes)
+            summary_bit = f" · {summary}" if summary else ""
+            exp_title = (f" ⌁  CODE MONITOR (expanded) · {len(changes)}"
+                         f"{summary_bit}{scroll_label} ")
+            self._put(top, 3, exp_title[:max(0, w - 6)], color | curses.A_BOLD)
+            if changes:
+                icons = {"added": "+", "modified": "~", "deleted": "−"}
+                colors = {"added": curses.color_pair(3), "modified": curses.color_pair(5),
+                          "deleted": curses.color_pair(4)}
+                end = len(changes) - offset if offset else len(changes)
+                visible = changes[max(0, end - available):end]
+                for row, change in enumerate(visible):
+                    label = textwrap.shorten(change.path, width=max(5, w - 8), placeholder="…")
+                    self._put(top + 2 + row, 3, f"{icons[change.kind]} {label}",
+                              colors[change.kind])
+            else:
+                self._put(top + 2, 3, "No file changes yet", curses.A_DIM)
+                if getattr(self.monitor, "truncated", False):
+                    self._put(top + 3, 3, "Large workspace · partial scan", curses.A_DIM)
+            self.hitboxes["code"] = (top, 1, top + height - 1, w - 2)
         else:  # "Final"
             color = curses.color_pair(3)
             self._box(top, 1, height, w - 2, color)
@@ -2306,7 +2790,7 @@ class Display:
                        "Completed and failed work will be summarized here after the task.")
             lines = self._wrapped(content, w - 6)
             available = max(1, height - 3)
-            offset = min(self.scroll["Final"], max(0, len(lines) - available))
+            offset = min(self.scroll.get("Final", 0), max(0, len(lines) - available))
             self.scroll["Final"] = offset
             scroll_label = f" · ↑{offset}" if offset else ""
             title = f" ◆  TASK OUTCOME (expanded){scroll_label} "
@@ -2364,15 +2848,17 @@ OPTION_TOGGLES: tuple[tuple[str, str], ...] = (
     ("elevated", "Elevated permissions — all agents bypass sandboxing (dangerous)"),
     ("balance_load", "Balance load — scope down an agent running much slower than the others"),
     ("task_status_check", "Task status check — stop redundant work once one agent finishes"),
-    ("self", "Self-edit — point the workspace at roundtable's own source to improve itself"),
+    ("self", "Self-edit — agents edit roundtable's own source (dangerous)"),
     ("skip_preflight", "Skip preflight — bypass the preliminary system check (saves time)"),
     ("extended_preflight", "Extended preflight — use a longer timeout for slow-starting agents"),
     ("reassign_idle", "Reassign idle — a finished agent picks up other work instead of waiting"),
     ("debug", "Debug mode — enable verbose subprocess and diagnostic trace logging"),
+    ("dead_code_check", "Dead code check — sweep for and remove unused code before the final answer"),
 )
 
 # Trust/safety posture flags: highlighted more strongly when enabled on the options screen.
-DANGEROUS_OPTIONS = frozenset({"elevated"})
+# self is included because it points agents at Roundtable's own source and enables live restarts.
+DANGEROUS_OPTIONS = frozenset({"elevated", "self"})
 
 
 def apply_option_key(values: dict[str, bool], key: object, cursor: int = 0) -> tuple[dict[str, bool], int, bool]:
@@ -2458,7 +2944,10 @@ def read_options_ui(stdscr: curses.window, defaults: dict[str, bool]) -> dict[st
         if h >= min_h and w >= 40:
             stdscr.addstr(2, 3, "Opt-in flags for this run (CLI flags pre-check matching rows):",
                           curses.A_BOLD)
-            stdscr.addnstr(3, 3, "↑/↓ or j/k move · Space/1-8 toggle · Enter continue",
+            n_opts = len(OPTION_TOGGLES)
+            digit_span = f"1-{n_opts}" if n_opts > 1 else "1"
+            stdscr.addnstr(3, 3,
+                           f"↑/↓ or j/k move · Space/{digit_span} toggle · Enter continue",
                            w - 6, curses.A_DIM)
             for i, (name, label) in enumerate(OPTION_TOGGLES):
                 on = values[name]
@@ -2588,7 +3077,7 @@ def read_objective_ui(stdscr: curses.window, workspace: Path, touch_mode: bool =
         key = stdscr.get_wch()
         if key == "\x03":  # Ctrl-C: same explicit fallback as Display.poll_input, in case the
             raise KeyboardInterrupt  # terminal doesn't deliver it as a real SIGINT here.
-        if key == curses.KEY_MOUSE and touch_mode:
+        if (key == curses.KEY_MOUSE or key == getattr(curses, "KEY_MOUSE", -999)) and (touch_mode or buttons):
             try:
                 _, x, y, _, state = curses.getmouse()
             except curses.error:
@@ -2903,7 +3392,9 @@ def _run_with_retry(agent: Agent, prompt: str, on_tick: Callable[[str], None],
                 agent.log_diagnostic(
                     f"failure classified as transient; retrying after "
                     f"{RETRY_BACKOFF_SECONDS:g}s")
-                on_tick(f"failed ({exc}) — retrying once after a short pause")
+                on_tick(
+                    f"failed ({exc}) — retrying once in {RETRY_BACKOFF_SECONDS:g}s "
+                    f"(attempt {transient_failures + 1}/{transient_retries + 1})")
                 if active_cancel.wait(RETRY_BACKOFF_SECONDS):
                     agent.log_diagnostic("transient retry aborted by cancellation during backoff")
                     raise RuntimeError(f"{agent.name} cancelled")
@@ -3410,6 +3901,29 @@ def synthesize(session: Session, order: list[tuple[str, Agent]],
     return sign_final_work(draft, contributors)
 
 
+def run_dead_code_check(session: Session, name: str, agent: Agent,
+                        tick: Callable[[str, str], None],
+                        status: Callable[[Iterable[str], str], None],
+                        log_prompt: Callable[[str, str], None] = lambda *_: None) -> None:
+    """Run one agent through a dead-code sweep before the synthesis relay drafts the final answer.
+
+    A soft failure here (the agent errors out) is not fatal to the run -- it just means synthesis
+    proceeds without this check, the same way a failed refinement pass does in synthesize().
+    """
+    status([name], f"{name} is checking for dead code")
+    prompt = dead_code_check_prompt(session.objective, session.turns, transcript(session.turns))
+    log_prompt(name, prompt)
+    try:
+        content = _run_with_retry(
+            agent, prompt, lambda line: tick(name, line), threading.Event(),
+            suggested_effort="medium", transient_retries=0)
+    except RuntimeError as exc:
+        tick(name, f"dead-code check skipped after failure: {exc}")
+        return
+    session.turns.append(Turn(name, "dead-code-check", sign_agent_work(name, content)))
+    status([], "Dead-code check complete")
+
+
 PREFLIGHT_PROMPT = ("This is a startup connectivity check, not the real task. Reply with exactly "
                     "the single word OK and do not read, write, or execute anything.")
 
@@ -3542,6 +4056,7 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
             log_prompt: Callable[[str, str], None] = lambda *_: None,
             balance_load: bool = False, task_status_check: bool = False,
             reassign_idle: bool = False, synthesis_passes: int = 6,
+            dead_code_check: bool = False,
             checkpoint: Callable[[], None] = lambda: None,
             completed_phases: set[str] | None = None,
             stagger: float | None = None) -> None:
@@ -3567,21 +4082,47 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
             remaining_phase_units += phase_work_units(_phase_runner(collab, planned_round))
     remaining_synthesis_units = (0 if "consensus" in completed_phases
                                  else max(1, min(synthesis_passes, len(agents))))
+    if dead_code_check and "dead-code-check" not in completed_phases and "consensus" not in completed_phases:
+        remaining_synthesis_units += 1
     estimator = CompletionEstimator(remaining_phase_units + remaining_synthesis_units)
+    # A user-facing step is one named operation (proposal, review, dead-code sweep, or synthesis
+    # pass), unlike CompletionEstimator's latency units where a sequential six-agent phase counts
+    # as six. Keep both: step N/total explains pipeline position while the measured ETA models time.
+    operation_total_steps = int(phase not in completed_phases)
+    operation_total_steps += sum(
+        1 for planned_round in range(1, session.rounds + 1)
+        if (f"followup-review {planned_round}" if followup
+            else f"review {planned_round}") not in completed_phases
+    )
+    if dead_code_check and "dead-code-check" not in completed_phases and "consensus" not in completed_phases:
+        operation_total_steps += 1
+    if "consensus" not in completed_phases:
+        operation_total_steps += max(1, min(synthesis_passes, len(agents)))
+    operation_step = 0
     cached_message = ""
     cached_estimated_message = ""
 
     def estimated_status(active: Iterable[str], phase_message: str) -> None:
-        nonlocal cached_message, cached_estimated_message
+        nonlocal cached_message, cached_estimated_message, operation_step
         active_names = tuple(active)
         if phase_message != cached_message:
             cached_message = phase_message
-            cached_estimated_message = phase_message
+            if active_names:
+                operation_step = min(operation_total_steps, operation_step + 1)
+            step_prefix = (
+                f"Step {operation_step}/{operation_total_steps} · "
+                if active_names and operation_total_steps else "")
+            cached_estimated_message = f"{step_prefix}{phase_message}"
             remaining = estimator.remaining_seconds()
             if active_names and remaining is not None:
                 cached_estimated_message = (
-                    f"{phase_message} · {format_completion_estimate(remaining)}")
+                    f"{cached_estimated_message} · {format_completion_estimate(remaining)}")
         status(active_names, cached_estimated_message)
+
+    def abandon_operation_steps(count: int) -> None:
+        """Remove named operations skipped after an early completion signal."""
+        nonlocal operation_total_steps
+        operation_total_steps = max(operation_step, operation_total_steps - max(0, count))
 
     def estimated_tick(name: str, line: str = "") -> None:
         if name and line.startswith("temporarily unavailable:"):
@@ -3645,6 +4186,11 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
                     abandoned += phase_work_units(_phase_runner(collab, later))
             if abandoned:
                 estimator.abandon(abandoned)
+                abandon_operation_steps(sum(
+                    1 for later in range(round_no, session.rounds + 1)
+                    if (f"followup-review {later}" if followup
+                        else f"review {later}") not in completed_phases
+                ))
                 estimated_status(
                     [], "Objective marked complete — skipping remaining review rounds")
             break
@@ -3666,6 +4212,13 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
     if "consensus" in completed_phases:
         return
     drain_queued_prompts(session)
+    if dead_code_check and "dead-code-check" not in completed_phases:
+        checker_name, checker_agent = pick_synthesizer(
+            synthesizer, session, codex, claude, antigravity, aider, grok, qwen)
+        run_dead_code_check(session, checker_name, checker_agent, estimated_tick, estimated_status,
+                            log_prompt)
+        estimator.complete(1)
+        checkpoint()
     # When the objective is already marked complete, a full synthesis relay is mostly polish.
     # Prefer the agent that finished the work as drafter (under rotate) and cap the relay length
     # so wall time is spent on the answer, not six sequential CLI turns of rephrasing.
@@ -3680,6 +4233,7 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
         abandoned_synth = planned_synth - used_synth
         if abandoned_synth:
             estimator.abandon(abandoned_synth)
+            abandon_operation_steps(abandoned_synth)
             estimated_status(
                 [], "Objective marked complete — using a shorter final synthesis")
     order = synthesis_order(synthesizer, session, codex, claude, antigravity, aider, grok, qwen,
@@ -3695,11 +4249,17 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
             resumed: bool = False, checkpoint: Callable[[], None] = lambda: None,
             completed_phases: set[str] | None = None) -> int:
     suppress_focus_reporting()
-    run_log = RunLog(log_path_for(session, Path(args.output_dir)))
+    run_log = RunLog(log_path_for(session, Path(getattr(args, "output_dir", None) or ".roundtable")))
     agents = (codex, claude, antigravity, aider, grok, qwen)
     attach_agent_diagnostics(run_log, agents)
     log_run_context(run_log, args, session, agents, resumed, completed_phases)
-    ui = Display(stdscr, session, args.touch_mode, run_log)
+    touch_mode = getattr(args, "touch_mode", None)
+    if touch_mode is None:
+        touch_mode = getattr(args, "touch", None)
+    if touch_mode is None:
+        touch_mode = False
+    ui = Display(stdscr, session, touch_mode, run_log, mock=getattr(args, "mock", False))
+    ui.log(config_summary(args), kind="phase")
     preserve_prompt_board = False
     def status(active: Iterable[str], message: str) -> None:
         ui.update_status(active, message)
@@ -3707,12 +4267,13 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
     try:
         ui.busy = True
         stdscr.nodelay(True)
-        if not args.skip_preflight:
+        if not getattr(args, "skip_preflight", False):
             run_preflight([("Codex", codex), ("Claude", claude), ("Antigravity", antigravity),
                            ("Aider", aider), ("Grok", grok), ("Qwen", qwen)],
                           ui.tick, status, timeout=args.preflight_timeout)
         else:
             run_log.write("info", "Preflight skipped by configuration")
+            ui.log("Preflight skipped by configuration", kind="phase")
         ui.busy = False
         ui.status = "Ready"
         followup = resumed
@@ -3737,7 +4298,8 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
                    collab=args.collab, synthesizer=args.synthesizer, log_prompt=ui.log_prompt,
                    balance_load=args.balance_load, task_status_check=args.task_status_check,
                    reassign_idle=args.reassign_idle,
-                   synthesis_passes=getattr(args, "synthesis_passes", 6), checkpoint=checkpoint,
+                   synthesis_passes=getattr(args, "synthesis_passes", 6),
+                   dead_code_check=args.dead_code_check, checkpoint=checkpoint,
                    completed_phases=completed_phases)
             ui.busy = False
             paths = save_session(session, Path(args.output_dir))
@@ -3834,24 +4396,38 @@ def source_fingerprint(path: Path | None = None) -> str:
         return ""
 
 
-def create_self_test_sandbox(workspace: Path, output_dir: Path) -> Path:
-    """Copy the current roundtable.py/test_roundtable.py/README.md into a throwaway directory so a
-    --self agent can smoke-test a real invocation of its edited file without running inside the live
-    shared workspace other agents may be concurrently editing, or interfering with this run's own
-    process. Called again on every restart, so its contents track the workspace at each restart."""
+def create_self_test_sandbox(workspace: Path | str, output_dir: Path | str,
+                             errors: list[str] | None = None) -> Path:
+    """Copy the current roundtable.py/test_roundtable.py/README.md/AGENT_PROMPTS.md into a throwaway
+    directory so a --self agent can smoke-test a real invocation of its edited file without running
+    inside the live shared workspace other agents may be concurrently editing, or interfering with
+    this run's own process. Called again on every restart, so its contents track the workspace at
+    each restart.
+
+    Raises OSError if the sandbox directory cannot be created. Per-file copy/unlink failures are
+    soft: they are appended to ``errors`` when provided (and always skipped so one bad file does not
+    abort the whole refresh). Missing sources still drop stale dest copies when possible.
+    """
     # Agents run with workspace as their cwd, which need not be the cwd where Roundtable resolved a
     # relative --output-dir. Give their prompt an absolute path so the advertised command works.
+    workspace = Path(workspace)
+    output_dir = Path(output_dir)
     base = output_dir if output_dir.is_absolute() else Path.cwd() / output_dir
     sandbox = base / "self-test-sandbox"
     sandbox.mkdir(parents=True, exist_ok=True)
-    for name in ("roundtable.py", "test_roundtable.py", "README.md"):
+    for name in ("roundtable.py", "test_roundtable.py", "README.md", "AGENT_PROMPTS.md"):
         source = workspace / name
         dest = sandbox / name
-        if source.is_file():
-            shutil.copy2(source, dest)
-        elif dest.is_file():
-            # Drop stale copies so a refresh matches the workspace (missing source stays missing).
-            dest.unlink()
+        try:
+            if source.is_file():
+                shutil.copy2(source, dest)
+            elif dest.is_file():
+                # Drop stale copies so a refresh matches the workspace (missing source stays missing).
+                dest.unlink()
+        except OSError as exc:
+            message = f"{name}: {type(exc).__name__}: {exc}"
+            if errors is not None:
+                errors.append(message)
     return sandbox
 
 
@@ -3910,6 +4486,7 @@ def restart_arguments(args: argparse.Namespace, session_path: Path,
                             ("--balance-load", args.balance_load),
                             ("--task-status-check", args.task_status_check),
                             ("--reassign-idle", args.reassign_idle),
+                            ("--dead-code-check", args.dead_code_check),
                             ("--debug", getattr(args, "debug", False))):
         if enabled:
             command.append(option)
@@ -3996,6 +4573,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "others are still on their primary turn gets one extra prompt to pick "
                              "up different unclaimed work or help a still-running agent, instead of "
                              "sitting idle; later finishers stay idle (one concurrent bonus max)")
+    parser.add_argument("--dead-code-check", action="store_true",
+                        help="before the final answer is drafted, have one agent search this "
+                             "session's code changes for now-unused functions/branches and remove "
+                             "any it finds, with edit rights (unlike the prose-only synthesis relay)")
     parser.add_argument("--elevated",
                         choices=["codex", "claude", "antigravity", "aider", "grok", "qwen", "all"],
                         action="append", default=[], metavar="AGENT",
@@ -4054,6 +4635,7 @@ def main() -> int:
                 "extended_preflight": args.extended_preflight,
                 "reassign_idle": args.reassign_idle,
                 "debug": args.debug,
+                "dead_code_check": args.dead_code_check,
             })
         except KeyboardInterrupt:
             # No session/run_log exists yet this early, so there is nothing to save -- just exit
@@ -4071,6 +4653,7 @@ def main() -> int:
         args.extended_preflight = toggled["extended_preflight"]
         args.reassign_idle = toggled["reassign_idle"]
         args.debug = toggled["debug"]
+        args.dead_code_check = toggled["dead_code_check"]
     if args.preflight_timeout is None:
         args.preflight_timeout = (EXTENDED_PREFLIGHT_TIMEOUT_SECONDS if args.extended_preflight
                                   else DEFAULT_PREFLIGHT_TIMEOUT_SECONDS)
@@ -4098,7 +4681,15 @@ def main() -> int:
     if not workspace.is_dir():
         parser.error(f"workspace is not a directory: {workspace}")
     if args.self:
-        sandbox = create_self_test_sandbox(workspace, Path(args.output_dir))
+        sandbox_errors: list[str] = []
+        try:
+            sandbox = create_self_test_sandbox(workspace, Path(args.output_dir), sandbox_errors)
+        except OSError as exc:
+            parser.error(
+                f"--self could not create test sandbox under {args.output_dir}: "
+                f"{type(exc).__name__}: {exc}")
+        for message in sandbox_errors:
+            print(f"warning: self-test sandbox: {message}", file=sys.stderr)
     request = args.objective
     continuing = args.continue_after_restart is not None
     if not request and not continuing and not (resumed and sys.stdin.isatty()):
@@ -4114,6 +4705,8 @@ def main() -> int:
                 return 130
     if resumed and not continuing:
         if request:
+            if args.self and SELF_EDIT_NOTE not in request:
+                request = f"{request}\n\n{SELF_EDIT_NOTE}\n\n{self_test_sandbox_note(sandbox)}"
             session.turns.append(Turn("User", "follow-up", request))
         elif not sys.stdin.isatty():
             parser.error("a follow-up is required when resuming in non-interactive mode")
@@ -4161,6 +4754,9 @@ def main() -> int:
         agents = (codex, claude, antigravity, aider, grok, qwen)
         attach_agent_diagnostics(run_log, agents)
         log_run_context(run_log, args, session, agents, resumed, completed_phases)
+        summary = config_summary(args)
+        run_log.write("phase", summary)
+        print(summary, flush=True)
         preserve_prompt_board = False
         def tick(name: str, line: str) -> None:
             if line:
@@ -4185,6 +4781,7 @@ def main() -> int:
                    collab=args.collab, synthesizer=args.synthesizer, log_prompt=log_prompt,
                    balance_load=args.balance_load, task_status_check=args.task_status_check,
                    reassign_idle=args.reassign_idle, synthesis_passes=args.synthesis_passes,
+                   dead_code_check=args.dead_code_check,
                    checkpoint=checkpoint, completed_phases=completed_phases)
             successful_paths = save_session(session, Path(args.output_dir))
             run_log.write(
@@ -4207,33 +4804,45 @@ def main() -> int:
                 paths = save_session(session, Path(args.output_dir))
                 run_log.write(
                     "artifact", f"partial session saved json={paths[0]} markdown={paths[1]}")
-            print("\nCancelled.", file=sys.stderr)
+                print(f"\nCancelled.\n\nTranscript: {paths[1]}\nLog: {run_log.path}",
+                      file=sys.stderr)
+            else:
+                print("\nCancelled.", file=sys.stderr)
             return 130
         except Exception as exc:
             run_log.write("error", str(exc))
             run_log.write("debug", traceback.format_exc())
             if getattr(args, "debug", False):
                 traceback.print_exc()
+            checkpoint_paths = None
             if session.turns:
                 try:
-                    paths = save_session(session, Path(args.output_dir))
+                    checkpoint_paths = save_session(session, Path(args.output_dir))
                     run_log.write(
-                        "artifact", f"failure checkpoint saved json={paths[0]} markdown={paths[1]}")
+                        "artifact",
+                        f"failure checkpoint saved json={checkpoint_paths[0]} "
+                        f"markdown={checkpoint_paths[1]}")
                 except OSError as save_exc:
                     run_log.write(
                         "error", f"Could not save failure checkpoint: "
                         f"{type(save_exc).__name__}: {save_exc}")
             print(f"\nRoundtable could not complete: {exc}", file=sys.stderr)
+            if checkpoint_paths:
+                print(f"Transcript: {checkpoint_paths[1]}\nLog: {run_log.path}", file=sys.stderr)
             return 1
         finally:
             if not preserve_prompt_board:
                 finalize_agent_prompt_file(Path(session.workspace), run_log)
             run_log.close()
         _, md_path = successful_paths
-        print(f"\n{session.final}\n\nTranscript: {md_path}")
+        print(f"\n{session.final}\n\nTranscript: {md_path}\nLog: {run_log.path}")
     else:
-        return curses.wrapper(run_tui, args, session, codex, claude, antigravity, aider, grok, qwen,
+        code = curses.wrapper(run_tui, args, session, codex, claude, antigravity, aider, grok, qwen,
                               followup, checkpoint, completed_phases)
+        _, md_path, log_path = artifact_paths_for(session, Path(args.output_dir))
+        if md_path.exists():
+            print(f"\nTranscript: {md_path}\nLog: {log_path}")
+        return code
     return 0
 
 
