@@ -164,6 +164,59 @@ def self_sandbox_path(session: "Session") -> str | None:
     return None
 
 
+SELF_VERIFICATION_TIMEOUT_SECONDS = 300.0
+
+
+def self_verification_command(workspace: Path | str) -> list[str] | None:
+    """The deterministic check for a --self session, if this workspace is roundtable's own source.
+
+    None means there is nothing to verify this way (an ordinary, non-self task), so callers incur
+    no extra cost -- this is never run outside a --self session.
+    """
+    if not (Path(workspace) / "test_roundtable.py").is_file():
+        return None
+    return [sys.executable, "-m", "unittest", "test_roundtable", "-q"]
+
+
+def run_self_verification(
+        workspace: Path | str, timeout: float = SELF_VERIFICATION_TIMEOUT_SECONDS
+) -> tuple[bool, str] | None:
+    """Independently verify a --self session's current code, instead of trusting whatever an agent
+    claimed about it -- the same discipline as re-running a test suite yourself rather than taking a
+    self-report at face value. Returns (passed, one-line detail), or None when this workspace has
+    nothing to verify this way (not a --self session).
+    """
+    command = self_verification_command(workspace)
+    if command is None:
+        return None
+    try:
+        result = subprocess.run(
+            command, cwd=workspace, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, f"verification timed out after {timeout:.0f}s"
+    except OSError as exc:
+        return False, f"could not run verification: {type(exc).__name__}: {exc}"
+    lines = [line for line in (result.stdout + "\n" + result.stderr).splitlines() if line.strip()]
+    detail = " · ".join(lines[-2:]) if len(lines) >= 2 else (lines[-1] if lines else "no output")
+    return result.returncode == 0, detail
+
+
+def verify_self_edit_turn(session: "Session", agent: "Agent", tick: Callable[[str], None]) -> None:
+    """Tick the real, independently-run result of run_self_verification for a --self session.
+
+    No-op (and no subprocess cost) for a session that isn't self-editing roundtable's own source,
+    or for a MockAgent turn: --mock exists specifically to test orchestration without any real
+    invocations, and a MockAgent's simulated content has no genuine code change to verify.
+    """
+    if not session_is_self(session) or isinstance(agent, MockAgent):
+        return
+    verification = run_self_verification(session.workspace)
+    if verification is None:
+        return
+    passed, detail = verification
+    tick(f"independent verification: {'PASS' if passed else 'FAIL'} — {detail}")
+
+
 AGENT_NAMES: tuple[str, ...] = ("Codex", "Claude", "Antigravity", "Aider", "Grok", "Qwen")
 
 # Nudges agents toward complementary parts of the work instead of six redundant attempts at the
@@ -1064,6 +1117,42 @@ TASK_STATUS_HINT = (
     "stop their own attempt and review/refine your work instead of redoing it from scratch."
 )
 
+RESTART_VOTE_PATTERN = re.compile(
+    r"^\s*(?:[#\-*]+\s*)?`?\*?\*?restart:\s*\**`*\s*(now|later)\b[^\n]*$",
+    re.IGNORECASE | re.MULTILINE)
+RESTART_VOTE_HINT = (
+    "\n\nRoundtable's own source changed since this segment of the run started (another agent's "
+    "edit landed). End your response with a line reading `RESTART: now` or `RESTART: later`, plus a "
+    "short reason, saying whether Roundtable should restart to load that change before the next "
+    "phase, or run this next phase first and restart right after. Majority across all agents this "
+    "phase decides (a tie favors restarting, since running stale source is the riskier failure "
+    "mode); if your vote doesn't match the outcome, your stated reason stays on the record, and "
+    "either way keep your own work here in a state that is fine to resume after a restart -- one is "
+    "coming regardless, now or after this one phase."
+)
+
+
+def tally_restart_votes(turns: list[Turn], phase: str) -> str:
+    """Majority RESTART: now/later vote among a phase's turns.
+
+    Ties -- including no votes cast at all -- favor "now", since running stale --self source is
+    the riskier failure mode than an extra restart.
+    """
+    now_votes = 0
+    later_votes = 0
+    for turn in turns:
+        if turn.phase != phase:
+            continue
+        match = RESTART_VOTE_PATTERN.search(turn.content)
+        if not match:
+            continue
+        if match.group(1).lower() == "later":
+            later_votes += 1
+        else:
+            now_votes += 1
+    return "later" if later_votes > now_votes else "now"
+
+
 
 def signals_task_complete(text: str) -> bool:
     """Whether an agent's response ends with a TASK STATUS: complete marker."""
@@ -1166,6 +1255,7 @@ def prepare_prompt_context(objective: str, turns: list[Turn]) -> PromptContext:
 
 def prompt_for(objective: str, turns: list[Turn], phase: str, speaker: str,
               sequential: bool = False, scope: str = "", task_status_check: bool = False,
+              restart_vote_pending: bool = False,
               context: PromptContext | None = None) -> str:
     context = context or prepare_prompt_context(objective, turns)
     history = context.history
@@ -1197,9 +1287,10 @@ def prompt_for(objective: str, turns: list[Turn], phase: str, speaker: str,
     dibs_hint = DIBS_HINT if speaker in AGENT_NAMES else ""
     prompt_board_hint = AGENT_PROMPT_HINT if speaker in AGENT_NAMES else ""
     status_hint = TASK_STATUS_HINT if task_status_check else ""
+    vote_hint = RESTART_VOTE_HINT if restart_vote_pending and speaker in AGENT_NAMES else ""
     return (f"{SYSTEM_BRIEF}\n\nUSER OBJECTIVE:\n{objective}\n\nSHARED TRANSCRIPT:\n{history}\n\n"
            f"YOUR TURN ({speaker}, {phase}):\n{task}{role_hint}{dibs_note}{dibs_hint}{prompt_board_hint}{scope}"
-           f"{status_hint}")
+           f"{status_hint}{vote_hint}")
 
 
 def final_prompt(objective: str, turns: list[Turn], followup: bool = False,
@@ -3423,7 +3514,7 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
                         log_prompt: Callable[[str, str], None] = lambda *_: None,
                         agent_speed: dict[str, list[float]] | None = None,
                         task_status_check: bool = False, reassign_idle: bool = False,
-                        stagger: float | None = None) -> str | None:
+                        stagger: float | None = None, restart_vote_pending: bool = False) -> str | None:
     """Run one collaboration phase concurrently and record results deterministically.
 
     When agent_speed is provided, an agent running notably slower than the others (based on
@@ -3456,7 +3547,8 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
     prompts = {
         name: prompt_for(session.objective, session.turns, phase, name, sequential=False,
                          scope=scope_hint(name, agent_speed) if agent_speed is not None else "",
-                         task_status_check=task_status_check, context=context)
+                         task_status_check=task_status_check,
+                         restart_vote_pending=restart_vote_pending, context=context)
         for name, _ in agents
     }
     for name in names:
@@ -3484,10 +3576,14 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
                     raise RuntimeError(f"{speaker} cancelled")
                 agent_started[speaker] = time.monotonic()
                 try:
-                    return _run_with_retry(
+                    content = _run_with_retry(
                         agent, prompt, lambda line: events.put((speaker, line)), cancel_event)
                 finally:
                     agent_finished[speaker] = time.monotonic()
+                # Independently verify this agent's turn against real, deterministic evidence
+                # rather than whatever it claimed -- a no-op outside a --self session.
+                verify_self_edit_turn(session, agent, lambda line: events.put((speaker, line)))
+                return content
 
             futures[name] = pool.submit(_primary_run)
         pending = set(names)
@@ -3670,7 +3766,8 @@ def _run_sequential_phase(session: Session, agents: list[tuple[str, Agent]], pha
                           tick: Callable[[str, str], None],
                           status: Callable[[Iterable[str], str], None], message: str,
                           log_prompt: Callable[[str, str], None] = lambda *_: None,
-                          task_status_check: bool = False) -> str | None:
+                          task_status_check: bool = False,
+                          restart_vote_pending: bool = False) -> str | None:
     """Run one collaboration phase as a live relay: each agent reads and builds on the one before it.
 
     Unlike the parallel phase, each agent's prompt is built right before it runs, after the previous
@@ -3684,9 +3781,13 @@ def _run_sequential_phase(session: Session, agents: list[tuple[str, Agent]], pha
     for name, agent in agents:
         status([name], message)
         prompt = prompt_for(session.objective, session.turns, phase, name, sequential=True,
-                            task_status_check=task_status_check)
+                            task_status_check=task_status_check,
+                            restart_vote_pending=restart_vote_pending)
         log_prompt(name, prompt)
         content = _run_with_retry(agent, prompt, lambda line, speaker=name: tick(speaker, line))
+        # Independently verify this agent's turn against real, deterministic evidence rather than
+        # whatever it claimed -- a no-op outside a --self session.
+        verify_self_edit_turn(session, agent, lambda line, speaker=name: tick(speaker, line))
         session.turns.append(Turn(name, phase, sign_agent_work(name, content)))
         if task_status_check and signals_task_complete(content):
             # Agents already finished stay in the transcript; later names in the configured order
@@ -4030,7 +4131,7 @@ def _run_phase(runner: Callable[..., str | None], session: Session, agents: list
               log_prompt: Callable[[str, str], None],
               agent_speed: dict[str, list[float]] | None,
               task_status_check: bool = False, reassign_idle: bool = False,
-              stagger: float | None = None) -> str | None:
+              stagger: float | None = None, restart_vote_pending: bool = False) -> str | None:
     """Dispatch to a phase runner, passing parallel-only knobs only to the parallel runner.
 
     Returns the name of an agent that marked TASK STATUS: complete this phase, if any — used by
@@ -4041,10 +4142,11 @@ def _run_phase(runner: Callable[..., str | None], session: Session, agents: list
         phase = f"followup-{phase}"
     if runner is _run_parallel_phase:
         return runner(session, agents, phase, tick, status, message, log_prompt, agent_speed,
-                      task_status_check, reassign_idle, stagger)
+                      task_status_check, reassign_idle, stagger, restart_vote_pending)
     if runner is _run_sequential_phase:
         return runner(session, agents, phase, tick, status, message, log_prompt,
-                      task_status_check=task_status_check)
+                      task_status_check=task_status_check,
+                      restart_vote_pending=restart_vote_pending)
     return runner(session, agents, phase, tick, status, message, log_prompt)
 
 
@@ -4170,13 +4272,27 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
             elif index and reviews_after_complete is not None:
                 reviews_after_complete -= 1
 
+    # --self restart timing vote: a checkpoint()-triggered restart is normally immediate and silent.
+    # Instead, when the proposal phase leaves roundtable.py changed, defer that one restart into
+    # review round 1 (if any is scheduled) so every agent can vote RESTART: now / RESTART: later
+    # (see RESTART_VOTE_HINT) rather than being restarted out from under them with no say. Majority
+    # decides (ties favor "now"); a "later" majority gets exactly one grace phase, then the ordinary
+    # checkpoint() at the following round -- or the safety net right after this loop, if round 1 was
+    # the last one scheduled -- restarts for real regardless of further votes.
+    self_mode = session_is_self(session)
+    restart_baseline = source_fingerprint() if self_mode else ""
+    review_vote_pending = False
+    restart_deferred_once = False
     if phase not in completed_phases:
         completed_by = _run_phase(
             proposal_runner, session, agents, phase, estimated_tick, estimated_status, message,
             log_prompt, agent_speed, task_status_check, reassign_idle, stagger)
         estimator.complete(phase_work_units(proposal_runner))
         note_phase_completion(completed_by)
-        checkpoint()
+        if self_mode and session.rounds >= 1 and source_fingerprint() != restart_baseline:
+            review_vote_pending = True
+        else:
+            checkpoint()
     for round_no in range(1, session.rounds + 1):
         if reviews_after_complete is not None and reviews_after_complete <= 0:
             abandoned = 0
@@ -4197,18 +4313,31 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
         phase = f"followup-review {round_no}" if followup else f"review {round_no}"
         runner = _phase_runner(collab, round_no)
         round_style = "in sequence" if runner is _run_sequential_phase else "in parallel"
+        asking_vote_this_round = review_vote_pending and round_no == 1
         if phase not in completed_phases:
             completed_by = _run_phase(
                 runner, session, agents, phase, estimated_tick, estimated_status,
                 f"Agents are reviewing {round_style} · round {round_no}/{session.rounds}",
                 log_prompt, agent_speed, task_status_check, reassign_idle, stagger,
+                restart_vote_pending=asking_vote_this_round,
             )
             estimator.complete(phase_work_units(runner))
             if task_status_check and completed_by:
                 note_phase_completion(completed_by)
             elif reviews_after_complete is not None:
                 reviews_after_complete -= 1
-            checkpoint()
+            if asking_vote_this_round:
+                review_vote_pending = False
+                if tally_restart_votes(session.turns, phase) == "now":
+                    checkpoint()
+                else:
+                    restart_deferred_once = True
+            else:
+                checkpoint()
+    if restart_deferred_once:
+        # The one grace phase promised to a "later" majority has now run (or was skipped by an
+        # early completion) -- honor the restart for real regardless of any further votes.
+        checkpoint()
     if "consensus" in completed_phases:
         return
     drain_queued_prompts(session)
@@ -4217,6 +4346,9 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
             synthesizer, session, codex, claude, antigravity, aider, grok, qwen)
         run_dead_code_check(session, checker_name, checker_agent, estimated_tick, estimated_status,
                             log_prompt)
+        # The dead-code check itself has edit rights, so re-verify after it too rather than
+        # trusting its own report of what it removed.
+        verify_self_edit_turn(session, checker_agent, lambda line: estimated_tick(checker_name, line))
         estimator.complete(1)
         checkpoint()
     # When the objective is already marked complete, a full synthesis relay is mostly polish.

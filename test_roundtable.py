@@ -3,6 +3,7 @@ import inspect
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -19,6 +20,23 @@ import roundtable
 class FailingAgent(roundtable.Agent):
     def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
         raise RuntimeError("boom: simulated failure")
+
+
+class RestartVotingAgent(roundtable.Agent):
+    """Casts a fixed RESTART: now/later vote only when its prompt actually asks for one, and
+    records every prompt it receives so a test can inspect which phases got the vote hint."""
+
+    def __init__(self, name, workspace, vote):
+        super().__init__(name, workspace)
+        self.vote = vote
+        self.received_prompts = []
+
+    def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+        self.received_prompts.append(prompt)
+        content = f"{self.name} did some work."
+        if "RESTART:" in prompt:
+            content += f"\n\nRESTART: {self.vote} — because reasons"
+        return content
 
 
 class FakeScreen:
@@ -1952,6 +1970,120 @@ class RoundtableTests(unittest.TestCase):
                              ["consensus"])
             self.assertEqual(session.final, "Completed\n\nDone")
 
+    def test_conduct_restart_vote_majority_now_restarts_at_review_round_1(self):
+        """A --self session that changes source during the proposal phase defers the restart into
+        review round 1 so agents can vote, instead of restarting immediately and silently."""
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session(
+                f"Improve gui\n\n{roundtable.SELF_EDIT_NOTE}", td, 1, "now", [])
+            votes = {"Codex": "now", "Claude": "now", "Antigravity": "now",
+                    "Aider": "later", "Grok": "later", "Qwen": "now"}
+            agents = {name: RestartVotingAgent(name, Path(td), votes[name])
+                     for name in roundtable.AGENT_NAMES}
+            checkpoint = mock.Mock(side_effect=roundtable.SelfRestartRequired)
+            with mock.patch.object(
+                    roundtable, "source_fingerprint", side_effect=["baseline", "changed"]):
+                with self.assertRaises(roundtable.SelfRestartRequired):
+                    roundtable.conduct(
+                        session, *(agents[name] for name in roundtable.AGENT_NAMES),
+                        lambda *_: None, lambda *_: None, checkpoint=checkpoint)
+            codex_prompts = agents["Codex"].received_prompts
+            self.assertEqual(len(codex_prompts), 2)
+            self.assertNotIn("RESTART:", codex_prompts[0])  # proposal: nothing pending yet
+            self.assertIn("`RESTART: now`", codex_prompts[1])  # review 1: vote requested
+            checkpoint.assert_called_once()
+
+    def test_conduct_restart_vote_majority_later_defers_one_more_round(self):
+        """A 'later' majority gets exactly one grace phase: round 2 runs with no further vote hint,
+        and its ordinary checkpoint restarts for real regardless of round 1's outcome."""
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session(
+                f"Improve gui\n\n{roundtable.SELF_EDIT_NOTE}", td, 2, "now", [])
+            votes = {"Codex": "later", "Claude": "later", "Antigravity": "later",
+                    "Aider": "now", "Grok": "now", "Qwen": "later"}
+            agents = {name: RestartVotingAgent(name, Path(td), votes[name])
+                     for name in roundtable.AGENT_NAMES}
+            checkpoint = mock.Mock(side_effect=roundtable.SelfRestartRequired)
+            with mock.patch.object(
+                    roundtable, "source_fingerprint", side_effect=["baseline", "changed"]):
+                with self.assertRaises(roundtable.SelfRestartRequired):
+                    roundtable.conduct(
+                        session, *(agents[name] for name in roundtable.AGENT_NAMES),
+                        lambda *_: None, lambda *_: None, checkpoint=checkpoint)
+            codex_prompts = agents["Codex"].received_prompts
+            self.assertEqual(len(codex_prompts), 3)  # proposal, review 1 (vote), review 2 (no vote)
+            self.assertNotIn("`RESTART: now`", codex_prompts[0])
+            self.assertIn("`RESTART: now`", codex_prompts[1])  # review 1: the hint itself
+            # review 2's prompt naturally quotes round 1's votes as transcript history; only the
+            # *hint* asking for a fresh vote must be absent, not the bare marker text.
+            self.assertNotIn("`RESTART: now`", codex_prompts[2])
+            checkpoint.assert_called_once()
+
+    def test_conduct_restart_vote_majority_later_with_no_further_round_forces_restart(self):
+        """A 'later' vote at the only scheduled review round still restarts afterward -- the grace
+        period is bounded even when there is no round 2 to force it naturally."""
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session(
+                f"Improve gui\n\n{roundtable.SELF_EDIT_NOTE}", td, 1, "now", [])
+            agents = {name: RestartVotingAgent(name, Path(td), "later")
+                     for name in roundtable.AGENT_NAMES}
+            checkpoint = mock.Mock(side_effect=roundtable.SelfRestartRequired)
+            with mock.patch.object(
+                    roundtable, "source_fingerprint", side_effect=["baseline", "changed"]):
+                with self.assertRaises(roundtable.SelfRestartRequired):
+                    roundtable.conduct(
+                        session, *(agents[name] for name in roundtable.AGENT_NAMES),
+                        lambda *_: None, lambda *_: None, checkpoint=checkpoint)
+            checkpoint.assert_called_once()
+
+    def test_conduct_restart_vote_skipped_for_a_non_self_session(self):
+        """An ordinary (non --self) session must keep the original immediate, unconditional restart
+        -- no vote hint, no deferral -- even if source_fingerprint happens to differ."""
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session("Improve gui", td, 1, "now", [])
+            agents = [roundtable.MockAgent(name, Path(td)) for name in roundtable.AGENT_NAMES]
+            checkpoint = mock.Mock(side_effect=roundtable.SelfRestartRequired)
+            with mock.patch.object(
+                    roundtable, "source_fingerprint", side_effect=["baseline", "changed"]):
+                with self.assertRaises(roundtable.SelfRestartRequired):
+                    roundtable.conduct(session, *agents, lambda *_: None, lambda *_: None,
+                                       checkpoint=checkpoint)
+            checkpoint.assert_called_once()
+
+    def test_conduct_restart_vote_skipped_with_zero_review_rounds(self):
+        """With no review round to defer into, a --self session restarts immediately, same as the
+        non-self case -- there is nothing to vote in."""
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session(
+                f"Improve gui\n\n{roundtable.SELF_EDIT_NOTE}", td, 0, "now", [])
+            agents = [roundtable.MockAgent(name, Path(td)) for name in roundtable.AGENT_NAMES]
+            checkpoint = mock.Mock(side_effect=roundtable.SelfRestartRequired)
+            with mock.patch.object(
+                    roundtable, "source_fingerprint", side_effect=["baseline", "changed"]):
+                with self.assertRaises(roundtable.SelfRestartRequired):
+                    roundtable.conduct(session, *agents, lambda *_: None, lambda *_: None,
+                                       checkpoint=checkpoint)
+            checkpoint.assert_called_once()
+
+    def test_conduct_restart_vote_no_op_when_source_unchanged(self):
+        """No change detected: ordinary checkpoint() runs as always, no vote hint anywhere."""
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session(
+                f"Improve gui\n\n{roundtable.SELF_EDIT_NOTE}", td, 1, "now", [])
+            agents = {name: RestartVotingAgent(name, Path(td), "now")
+                     for name in roundtable.AGENT_NAMES}
+            checkpoint = mock.Mock()
+            with mock.patch.object(
+                    roundtable, "source_fingerprint", side_effect=["same", "same", "same"]):
+                roundtable.conduct(
+                    session, *(agents[name] for name in roundtable.AGENT_NAMES),
+                    lambda *_: None, lambda *_: None, checkpoint=checkpoint)
+            for prompt in agents["Codex"].received_prompts:
+                self.assertNotIn("RESTART:", prompt)
+            # Ordinary, unconditional checkpoints: after proposal, after review 1, and after
+            # synthesis -- none of them gated on a vote since nothing changed.
+            self.assertEqual(checkpoint.call_count, 3)
+
     def test_apply_option_key_toggles_by_number_and_enter_confirms(self):
         values = {"elevated": False, "balance_load": False, "task_status_check": False}
         values, cursor, done = roundtable.apply_option_key(values, "1", 0)
@@ -2927,6 +3059,162 @@ class RoundtableTests(unittest.TestCase):
                     roundtable.create_self_test_sandbox(workspace, out)
             finally:
                 os.chmod(out, 0o755)
+
+    def test_self_verification_command_is_none_outside_a_self_workspace(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertIsNone(roundtable.self_verification_command(td))
+
+    def test_self_verification_command_targets_the_real_test_module(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "test_roundtable.py").write_text("# stand-in")
+            self.assertEqual(
+                roundtable.self_verification_command(td),
+                [sys.executable, "-m", "unittest", "test_roundtable", "-q"])
+
+    def test_run_self_verification_is_none_outside_a_self_workspace(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(roundtable.subprocess, "run") as run:
+                self.assertIsNone(roundtable.run_self_verification(td))
+            run.assert_not_called()
+
+    def test_run_self_verification_reports_pass_with_real_evidence(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "test_roundtable.py").write_text("# stand-in")
+            completed = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr="Ran 333 tests in 45.0s\n\nOK\n")
+            with mock.patch.object(roundtable.subprocess, "run", return_value=completed) as run:
+                passed, detail = roundtable.run_self_verification(td)
+            self.assertTrue(passed)
+            self.assertIn("OK", detail)
+            self.assertEqual(run.call_args.kwargs["cwd"], td)
+
+    def test_run_self_verification_reports_failure_detail(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "test_roundtable.py").write_text("# stand-in")
+            completed = subprocess.CompletedProcess(
+                args=[], returncode=1,
+                stdout="", stderr="Ran 333 tests in 45.0s\n\nFAILED (failures=1)\n")
+            with mock.patch.object(roundtable.subprocess, "run", return_value=completed):
+                passed, detail = roundtable.run_self_verification(td)
+            self.assertFalse(passed)
+            self.assertIn("FAILED", detail)
+
+    def test_run_self_verification_handles_timeout(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "test_roundtable.py").write_text("# stand-in")
+            with mock.patch.object(
+                    roundtable.subprocess, "run",
+                    side_effect=roundtable.subprocess.TimeoutExpired(cmd="x", timeout=1)):
+                passed, detail = roundtable.run_self_verification(td, timeout=1)
+            self.assertFalse(passed)
+            self.assertIn("timed out", detail)
+
+    def test_verify_self_edit_turn_is_a_noop_for_non_self_sessions(self):
+        session = roundtable.Session("Ordinary goal", "/tmp", 0, "now", [])
+        agent = roundtable.Agent("Codex", Path("/tmp"))
+        ticks = []
+        with mock.patch.object(roundtable.subprocess, "run") as run:
+            roundtable.verify_self_edit_turn(session, agent, ticks.append)
+        run.assert_not_called()
+        self.assertEqual(ticks, [])
+
+    def test_verify_self_edit_turn_is_a_noop_for_a_mock_agent(self):
+        """--mock exists to test orchestration without any real invocations; a MockAgent's
+        simulated content has no genuine code change behind it to verify."""
+        session = roundtable.Session(
+            f"Fix the GUI\n\n{roundtable.SELF_EDIT_NOTE}", "/tmp", 0, "now", [])
+        agent = roundtable.MockAgent("Codex", Path("/tmp"))
+        ticks = []
+        with mock.patch.object(roundtable.subprocess, "run") as run:
+            roundtable.verify_self_edit_turn(session, agent, ticks.append)
+        run.assert_not_called()
+        self.assertEqual(ticks, [])
+
+    def test_verify_self_edit_turn_ticks_pass_and_fail(self):
+        session = roundtable.Session(
+            f"Fix the GUI\n\n{roundtable.SELF_EDIT_NOTE}", "/tmp", 0, "now", [])
+        agent = roundtable.Agent("Codex", Path("/tmp"))
+        ticks = []
+        with mock.patch.object(roundtable, "run_self_verification", return_value=(True, "OK")):
+            roundtable.verify_self_edit_turn(session, agent, ticks.append)
+        self.assertEqual(len(ticks), 1)
+        self.assertIn("PASS", ticks[0])
+        self.assertIn("OK", ticks[0])
+
+        ticks.clear()
+        with mock.patch.object(
+                roundtable, "run_self_verification",
+                return_value=(False, "FAILED (failures=1)")):
+            roundtable.verify_self_edit_turn(session, agent, ticks.append)
+        self.assertEqual(len(ticks), 1)
+        self.assertIn("FAIL", ticks[0])
+
+    def test_run_parallel_phase_verifies_each_agents_turn_in_a_self_session(self):
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            session = roundtable.Session(
+                f"Fix the GUI\n\n{roundtable.SELF_EDIT_NOTE}", td, 0, "now", [])
+            agents = [(name, roundtable.MockAgent(name, workspace))
+                     for name in ("Codex", "Claude")]
+            with mock.patch.object(
+                    roundtable, "verify_self_edit_turn") as verify:
+                roundtable._run_parallel_phase(
+                    session, agents, "proposal", lambda *_: None, lambda *_: None, "Working")
+            self.assertEqual(verify.call_count, 2)
+
+    def test_run_parallel_phase_skips_verification_for_an_ordinary_session(self):
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            session = roundtable.Session("Ordinary goal", td, 0, "now", [])
+            agents = [(name, roundtable.MockAgent(name, workspace))
+                     for name in ("Codex", "Claude")]
+            with mock.patch.object(roundtable.subprocess, "run") as run:
+                roundtable._run_parallel_phase(
+                    session, agents, "proposal", lambda *_: None, lambda *_: None, "Working")
+            run.assert_not_called()
+
+    def test_run_parallel_phase_skips_real_verification_for_mock_agents_in_a_self_session(self):
+        """Regression: a --self session run with --mock (as several main()-level --self tests do,
+        e.g. test_self_flag_points_workspace_at_roundtables_own_source) must never trigger a real
+        subprocess -- otherwise a fast, MockAgent-only test recursively spawns the real test suite
+        once per agent and turns a sub-second test into a multi-minute one."""
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            (workspace / "test_roundtable.py").write_text("# stand-in")
+            session = roundtable.Session(
+                f"Fix the GUI\n\n{roundtable.SELF_EDIT_NOTE}", td, 0, "now", [])
+            agents = [(name, roundtable.MockAgent(name, workspace))
+                     for name in ("Codex", "Claude")]
+            with mock.patch.object(roundtable.subprocess, "run") as run:
+                roundtable._run_parallel_phase(
+                    session, agents, "proposal", lambda *_: None, lambda *_: None, "Working")
+            run.assert_not_called()
+
+    def test_run_sequential_phase_verifies_each_agents_turn_in_a_self_session(self):
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            session = roundtable.Session(
+                f"Fix the GUI\n\n{roundtable.SELF_EDIT_NOTE}", td, 0, "now", [])
+            agents = [(name, roundtable.MockAgent(name, workspace))
+                     for name in ("Codex", "Claude")]
+            with mock.patch.object(roundtable, "verify_self_edit_turn") as verify:
+                roundtable._run_sequential_phase(
+                    session, agents, "proposal", lambda *_: None, lambda *_: None, "Working")
+            self.assertEqual(verify.call_count, 2)
+
+    def test_conduct_verifies_after_the_dead_code_check_step(self):
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session(
+                f"Fix the GUI\n\n{roundtable.SELF_EDIT_NOTE}", td, 0, "now",
+                [roundtable.Turn("Codex", "proposal", "done"),
+                 roundtable.Turn("Final", "consensus", "Completed\n\nDone")],
+                "Completed\n\nDone")
+            agents = [roundtable.MockAgent(name, Path(td)) for name in roundtable.AGENT_NAMES]
+            with mock.patch.object(roundtable, "verify_self_edit_turn") as verify:
+                roundtable.conduct(
+                    session, *agents, lambda *_: None, lambda *_: None,
+                    dead_code_check=True, completed_phases={"proposal"})
+            verify.assert_called_once()
 
     def test_draw_keeps_single_row_agent_grid_when_short(self):
         """At the 72×25 floor, agent area is too short for 2×3 — stay one row of six."""
@@ -5102,6 +5390,47 @@ class RoundtableTests(unittest.TestCase):
         self.assertIn(roundtable.AGENT_PROMPT_FILE, prompt)
         user_prompt = roundtable.prompt_for("Objective", [], "proposal", "User")
         self.assertNotIn(roundtable.AGENT_PROMPT_FILE, user_prompt)
+
+    def test_prompt_for_includes_restart_vote_hint_for_agents_only_when_pending(self):
+        prompt = roundtable.prompt_for(
+            "Objective", [], "review 1", "Codex", restart_vote_pending=True)
+        self.assertIn("RESTART: now", prompt)
+        self.assertIn("RESTART: later", prompt)
+        no_vote_prompt = roundtable.prompt_for(
+            "Objective", [], "review 1", "Codex", restart_vote_pending=False)
+        self.assertNotIn("RESTART:", no_vote_prompt)
+        user_prompt = roundtable.prompt_for(
+            "Objective", [], "review 1", "User", restart_vote_pending=True)
+        self.assertNotIn("RESTART:", user_prompt)
+
+    def test_tally_restart_votes_majority_now(self):
+        turns = [
+            roundtable.Turn("Codex", "review 1", "work\n\nRESTART: now — fix is small\n\nSigned: Codex"),
+            roundtable.Turn("Claude", "review 1", "work\n\nRESTART: later — want more polish\n\nSigned: Claude"),
+            roundtable.Turn("Grok", "review 1", "work\n\n**RESTART: now** — agreed\n\nSigned: Grok"),
+        ]
+        self.assertEqual(roundtable.tally_restart_votes(turns, "review 1"), "now")
+
+    def test_tally_restart_votes_majority_later(self):
+        turns = [
+            roundtable.Turn("Codex", "review 1", "work\n\nRESTART: later — keep going\n\nSigned: Codex"),
+            roundtable.Turn("Claude", "review 1", "work\n\n`RESTART: later` — same\n\nSigned: Claude"),
+            roundtable.Turn("Grok", "review 1", "work\n\nRESTART: now — disagree\n\nSigned: Grok"),
+        ]
+        self.assertEqual(roundtable.tally_restart_votes(turns, "review 1"), "later")
+
+    def test_tally_restart_votes_tie_and_no_votes_favor_now(self):
+        tied = [
+            roundtable.Turn("Codex", "review 1", "RESTART: now — a\n\nSigned: Codex"),
+            roundtable.Turn("Claude", "review 1", "RESTART: later — b\n\nSigned: Claude"),
+        ]
+        self.assertEqual(roundtable.tally_restart_votes(tied, "review 1"), "now")
+        no_votes = [roundtable.Turn("Codex", "review 1", "just work, no vote\n\nSigned: Codex")]
+        self.assertEqual(roundtable.tally_restart_votes(no_votes, "review 1"), "now")
+
+    def test_tally_restart_votes_ignores_other_phases(self):
+        turns = [roundtable.Turn("Codex", "review 2", "RESTART: later — wrong phase\n\nSigned: Codex")]
+        self.assertEqual(roundtable.tally_restart_votes(turns, "review 1"), "now")
 
     def test_self_checkpoint_ignores_sibling_files_next_to_loaded_program(self):
         """Restart only tracks Path(__file__); tests/docs next to it must not force execv."""

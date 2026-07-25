@@ -268,6 +268,17 @@ just the definition) before touching anything, remove what's genuinely unused, a
 test suite to confirm nothing broke. A failure here is non-fatal — synthesis proceeds without it, the
 same way a failed refinement pass does.
 
+In a `--self` session (agents editing roundtable's own source), every proposal, review, and
+dead-code-check turn is followed by an independent verification: Roundtable itself — not the agent,
+and not another agent's opinion — runs `python3 -m unittest test_roundtable` against the live
+workspace and reports the real pass/fail result (`independent verification: PASS — Ran 333 tests in
+45.0s · OK`, or the equivalent `FAIL` line). An agent's own claim of "233 tests passed" is never
+taken at face value; ground truth is checked after every single turn that could have changed the
+code. This adds real wall-clock time to a `--self` run (one full test-suite invocation per agent per
+phase) but catches an overclaiming or hallucinating agent immediately, rather than after the fact.
+It costs nothing outside `--self` (there is no known test command for an arbitrary workspace) and
+nothing during `--mock` (a MockAgent's simulated output has no real code change behind it to check).
+
 A CLI failure on a real, load-bearing proposal, review, or initial final-draft turn is retried once
 after a short pause before it's treated as fatal — real-world failures on a long run are often a
 transient rate limit or network timeout partway through a long chain of tool calls, not a broken
@@ -420,6 +431,19 @@ Python has it loaded in memory. After a phase or final synthesis changes `roundt
 run saves its transcript with an atomic file replacement, then replaces the running process with the
 updated program. Completed phases and consensus are skipped on the resumed process, so work continues
 from the saved progress rather than starting over or synthesizing the same answer twice.
+
+That restart is normally immediate and silent the moment `roundtable.py`'s content changes. The one
+exception: if the change lands during the proposal phase and at least one review round is scheduled,
+the restart is deferred by exactly one phase so the agents get a say in timing instead of being
+restarted out from under them with no warning. Review round 1's prompt tells every agent the source
+changed and asks each to end its turn with `RESTART: now` or `RESTART: later`, plus a short reason.
+Majority decides (a tie favors restarting, since running stale source is the riskier failure mode);
+if the vote is `later`, one more review round runs with no further vote requested, and the restart
+happens for real right after — regardless of that round's own outcome — so the deferral is bounded to
+a single grace phase, not an open-ended negotiation. Any agent whose vote didn't match the outcome
+still has its stated reason on the record in the transcript. With zero review rounds configured, or
+outside a `--self` session, the restart stays immediate as before — there's no next phase to defer
+into, and no vote to hold in the first place.
 
 Every `--self` run is also told about a throwaway copy of the source kept at
 `<output-dir>/self-test-sandbox`, refreshed at the start of the run and again on every restart. An
