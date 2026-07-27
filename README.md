@@ -8,7 +8,13 @@ of six complementary lanes — sandboxed execution and testing, architecture and
 and stress-testing the others' work, fast narrowly-scoped diffs, skeptical verification, or
 integrating the group's approaches into one plan — so six parallel attempts produce complementary
 contributions instead of six competing full solutions. Which agent gets which lane rotates by
-objective, so no agent is permanently typecast into the same role run after run. Agents also call
+objective, so no agent is permanently typecast into the same role run after run. Each working prompt
+also makes the agent self-aware of the roster: it is told its own display name and CLI, and the
+names and CLIs of the other five members, derived from the same `AGENT_NAMES` /
+`AGENT_EXECUTABLES` maps that drive preflight and `--list-agents` — so agents do not invent extra
+peers or rediscover membership by grepping source. The same identity context follows an agent into
+reassignment, final synthesis/refinement, and the dead-code check instead of disappearing when its
+role changes. Agents also call
 dibs: each is asked to open its turn with `DIBS: <what I'm taking>`, and the next round's prompts
 list what the others already claimed, so the round-by-round split of the task stays visible and
 agents pick up something new instead of redoing each other's ground. Every agent's prompt also
@@ -21,12 +27,32 @@ the rest refine it in turn, so the result is shaped by all of them instead of au
 model wrote it first — by default that first drafter rotates by objective so it isn't always the
 same model (`--synthesizer`).
 
+## Install
+
+```bash
+python3 install.py
+```
+
+Links `roundtable.py` onto `PATH` as the `roundtable` command (prefers `~/.local/bin` if it's
+already on `PATH`, else the first other writable directory under your home, else creates
+`~/.local/bin`; override with `--bin-dir`), then installs whichever of the six agent CLIs it has a
+verified command for: `npm install -g @openai/codex` (Codex), `npm install -g
+@anthropic-ai/claude-code` (Claude), `pipx install aider-chat` (Aider), and `npm install -g
+@qwen-code/qwen-code` (Qwen) — each skipped if already on `PATH`, and skipped with an explanation
+if the required package manager (`npm`/`pipx`) isn't. Antigravity (`agy`) and Grok (`grok`) have no
+publicly documented package-manager install command this script can verify, so for those two it
+only reports whether the CLI is already present rather than guessing an install command; install
+them yourself per each vendor's own instructions. `--skip-clis` links only the `roundtable` command;
+`--only Codex Aider ...` restricts CLI installation to specific agents; `--dry-run` prints what
+would happen without changing anything. All still need authenticating after install — see below.
+
 ## Run it
 
 All six CLIs must already be installed and authenticated (`codex`, `claude`, `agy`, `aider`, `grok`,
-and `qwen`). Aider is model-agnostic — it defaults to `mistral/codestral-latest` here specifically
-so it doesn't just duplicate one of the five lab-native agents; point `--aider-model` at a different
-provider if you'd rather it run as something else.
+and `qwen`) — `roundtable --list-agents` reports which are currently found on `PATH`. Aider is
+model-agnostic — it defaults to `mistral/codestral-latest` here specifically so it doesn't just
+duplicate one of the five lab-native agents; point `--aider-model` at a different provider if you'd
+rather it run as something else.
 
 ```bash
 cd /path/to/project
@@ -105,6 +131,9 @@ Useful options:
 --output-dir PATH      Where Markdown, JSON, and log files are saved
 --resume SESSION.json  Resume a saved session; an objective argument becomes the follow-up
 --touch / --no-touch   Override automatic touchscreen detection
+--list-agents          Print which of the six known AI CLIs (codex, claude, agy, aider, grok,
+                       qwen) are actually installed on this machine, then exit -- no objective,
+                       TTY, or preflight required
 ```
 
 Resume a prior conversation from its JSON transcript. The original objective, turns, workspace,
@@ -164,7 +193,10 @@ progress. The count is retained as a sequential relay hands work from one agent 
 resets when the operation moves to a new phase. Coordinator signals for a hard phase drop or a
 TASK STATUS: complete declaration also appear in the default console filter (key events), not only
 in the all-activity firehose.
-Per-agent usage sparklines show response time, output size, and activity, while a live work feed
+Each agent pane's subtitle shows that agent's latest `DIBS:` ownership claim from the transcript
+(replacing the static lab label while a claim is active), so you can see who owns what without
+expanding panels or scanning the shared board. Per-agent usage sparklines show response time,
+output size, and activity, while a live work feed
 inside each active agent's own pane keeps reported file reads, searches, edits, commands, tests, and
 other CLI progress attributed to the agent that emitted them; once the agent finishes, its pane
 returns to the completed response. Read/execute/write counters provide an at-a-glance summary;
@@ -175,6 +207,8 @@ failed, and incomplete work, plus a live code monitor showing files changed duri
 console panel round out the diagnostics. Expand an individual agent pane to inspect its full
 response. Mouse-wheel or two-finger scrolling over any panel (including compact agent panes) reveals
 earlier content and marks the offset as `↑N` in that panel's title.
+If new agent work or visible console events arrive while a panel is scrolled back, its title also
+shows `+N new`; returning to the live tail with `End`, ↓, or a downward wheel gesture clears it.
 
 Once the first task phase completes, phase status lines also show a coarse completion estimate.
 It is derived only from wall time observed in the current run and the remaining scheduled work:
@@ -449,8 +483,10 @@ changed and asks each to end its turn with `RESTART: now` or `RESTART: later`, p
 Majority decides (a tie favors restarting, since running stale source is the riskier failure mode);
 if the vote is `later`, one more review round runs with no further vote requested, and the restart
 happens for real right after — regardless of that round's own outcome — so the deferral is bounded to
-a single grace phase, not an open-ended negotiation. Any agent whose vote didn't match the outcome
-still has its stated reason on the record in the transcript. With zero review rounds configured, or
+a single grace phase, not an open-ended negotiation. When the vote resolves, the dashboard status
+line and run log record a one-line tally (`RESTART vote: now=N later=M → …` plus who voted which way)
+so operators do not have to re-read every agent turn to see the outcome. Any agent whose vote didn't
+match the outcome still has its stated reason on the record in the transcript. With zero review rounds configured, or
 outside a `--self` session, the restart stays immediate as before — there's no next phase to defer
 into, and no vote to hold in the first place.
 

@@ -204,10 +204,11 @@ class RoundtableTests(unittest.TestCase):
         display = make_test_display(w=120)
         display.busy = True
         display.active = {"Codex"}
-        display.turn_start["Codex"] = roundtable.time.monotonic() - 5.5
-        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
-             mock.patch.object(roundtable.curses, "has_colors", return_value=False):
-            display.draw()
+        with mock.patch.object(roundtable.time, "monotonic", return_value=100.0):
+            display.turn_start["Codex"] = 94.5
+            with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+                 mock.patch.object(roundtable.curses, "has_colors", return_value=False):
+                display.draw()
         rendered = display.s.text()
         self.assertIn("● working (5.5s)", rendered)
 
@@ -357,6 +358,8 @@ class RoundtableTests(unittest.TestCase):
         Every text box here treats a bare Escape as cancel, so without disabling that reporting mode,
         switching focus away and back could look like the user hit Escape and silently end the run."""
         import linecache
+        import importlib
+        importlib.reload(roundtable)
         linecache.clearcache()
         for name in ("read_options_ui", "read_objective_ui", "run_tui"):
             with self.subTest(entry_point=name):
@@ -1072,7 +1075,7 @@ class RoundtableTests(unittest.TestCase):
                 skip_preflight=True, preflight_timeout=25, extended_preflight=False,
                 touch_mode=False, debug=False)
             agent = roundtable.Agent("Codex", Path(td), "test-model")
-            session = roundtable.Session("Sensitive objective", td, 1, "now", [])
+            session = roundtable.Session("Sensitive objective", td, 1, "now", [], restart_count=2)
             with mock.patch.dict(os.environ, {"ROUND_TABLE_TEST_SECRET": "must-not-appear"}):
                 roundtable.log_run_context(
                     run_log, args, session, [agent], resumed=True,
@@ -1084,6 +1087,7 @@ class RoundtableTests(unittest.TestCase):
         self.assertIn('"completed_phases"', logged)
         self.assertIn('"proposal"', logged)
         self.assertIn('"roundtable_source"', logged)
+        self.assertIn('"restart_count": 2', logged)
         self.assertIn('"workspace_git"', logged)
         self.assertIn("environment variables and credentials intentionally omitted", logged)
         self.assertNotIn("ROUND_TABLE_TEST_SECRET", logged)
@@ -1413,6 +1417,37 @@ class RoundtableTests(unittest.TestCase):
             }))
             self.assertEqual(roundtable.load_session(path).queued_prompts, [])
 
+    def test_load_session_keeps_compatibility_with_sessions_without_restart_count(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "old.json"
+            path.write_text(json.dumps({
+                "objective": "Goal", "workspace": td, "rounds": 1,
+                "started_at": "now", "turns": [],
+            }))
+            self.assertEqual(roundtable.load_session(path).restart_count, 0)
+
+    def test_load_session_round_trips_restart_count(self):
+        with tempfile.TemporaryDirectory() as td:
+            original = roundtable.Session(
+                "Goal", td, 2, "2026-01-01T00:00:00.000001+00:00",
+                [roundtable.Turn("Final", "consensus", "First answer")], "First answer",
+                restart_count=3)
+            json_path, _ = roundtable.save_session(original, Path(td))
+            loaded = roundtable.load_session(json_path)
+            self.assertEqual(loaded.restart_count, 3)
+            self.assertEqual(loaded, original)
+
+    def test_load_session_rejects_negative_or_non_int_restart_count(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = {"objective": "Goal", "workspace": td, "rounds": 1,
+                    "started_at": "now", "turns": []}
+            path = Path(td) / "bad.json"
+            for restart_count in (-1, "2", True):
+                with self.subTest(restart_count=restart_count):
+                    path.write_text(json.dumps({**base, "restart_count": restart_count}))
+                    with self.assertRaisesRegex(ValueError, "restart_count"):
+                        roundtable.load_session(path)
+
     def test_plain_mode_reports_agent_failure_without_traceback(self):
         with tempfile.TemporaryDirectory() as td:
             argv = ["roundtable", "Solve it", "--plain", "-r", "0",
@@ -1703,6 +1738,23 @@ class RoundtableTests(unittest.TestCase):
             saved = sorted((Path(td) / "out").glob("*.json"))[-1]
             session = roundtable.load_session(saved)
             self.assertEqual(Path(session.workspace), Path(roundtable.__file__).resolve().parent)
+
+    def test_self_restart_increments_and_persists_restart_count(self):
+        """A --self run that hits SelfRestartRequired bumps session.restart_count before saving, so
+        the process that resumes (and the operator reading the dashboard) knows this run has
+        already replaced itself, instead of every restart looking like a fresh first pass."""
+        with tempfile.TemporaryDirectory() as td:
+            argv = ["roundtable", "Improve the console panel", "--plain", "-r", "0", "--mock",
+                    "--self", "--output-dir", str(Path(td) / "out")]
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(roundtable, "self_checkpoint",
+                                   return_value=mock.Mock(side_effect=roundtable.SelfRestartRequired)), \
+                 mock.patch.object(roundtable, "restart_self"), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(roundtable.main(), 0)
+            saved = sorted((Path(td) / "out").glob("*.json"))[-1]
+            session = roundtable.load_session(saved)
+            self.assertEqual(session.restart_count, 1)
 
     def test_self_flag_suffixes_the_note_so_the_real_objective_leads(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2057,17 +2109,27 @@ class RoundtableTests(unittest.TestCase):
             agents = {name: RestartVotingAgent(name, Path(td), votes[name])
                      for name in roundtable.AGENT_NAMES}
             checkpoint = mock.Mock(side_effect=roundtable.SelfRestartRequired)
+            status_messages: list[str] = []
+
+            def capture_status(_active, message: str) -> None:
+                status_messages.append(message)
+
             with mock.patch.object(
                     roundtable, "source_fingerprint", side_effect=["baseline", "changed"]):
                 with self.assertRaises(roundtable.SelfRestartRequired):
                     roundtable.conduct(
                         session, *(agents[name] for name in roundtable.AGENT_NAMES),
-                        lambda *_: None, lambda *_: None, checkpoint=checkpoint)
+                        lambda *_: None, capture_status, checkpoint=checkpoint)
             codex_prompts = agents["Codex"].received_prompts
             self.assertEqual(len(codex_prompts), 2)
             self.assertNotIn("RESTART:", codex_prompts[0])  # proposal: nothing pending yet
             self.assertIn("`RESTART: now`", codex_prompts[1])  # review 1: vote requested
             checkpoint.assert_called_once()
+            tally_lines = [m for m in status_messages if m.startswith("RESTART vote:")]
+            self.assertEqual(len(tally_lines), 1)
+            self.assertIn("now=4 later=2 → restarting now", tally_lines[0])
+            self.assertIn("now: Codex, Claude, Antigravity, Qwen", tally_lines[0])
+            self.assertIn("later: Aider, Grok", tally_lines[0])
 
     def test_conduct_restart_vote_majority_later_defers_one_more_round(self):
         """A 'later' majority gets exactly one grace phase: round 2 runs with no further vote hint,
@@ -2252,6 +2314,90 @@ class RoundtableTests(unittest.TestCase):
         # Clamp may shrink the requested offset; whatever is kept must appear in the title band.
         self.assertGreater(display.scroll["Codex"], 0)
         self.assertIn(f"↑{display.scroll['Codex']}", display.s.text())
+
+    def test_scrolled_agent_marks_new_live_activity_until_returning_to_tail(self):
+        display = make_test_display(h=30, w=140)
+        display.busy = True
+        display.active = {"Codex"}
+        display.scroll["Codex"] = 2
+        display.unread = {name: 0 for name in display.scroll}
+        display.work_activity["Codex"].extend(
+            f"Reading older-{index}.py" for index in range(12))
+
+        with mock.patch.object(display, "draw"), mock.patch.object(display, "poll_input"):
+            display.tick("Codex", "Reading file roundtable.py")
+
+        self.assertEqual(display.unread["Codex"], 1)
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0):
+            display._agent_panel(5, 1, 12, 50, "Codex", "◇", "OpenAI coding agent", 0)
+        self.assertIn("+1 new", "".join(display.s.grid[5]))
+        display._agent_panel(18, 1, 10, 22, "Codex", "◇", "OpenAI coding agent", 0)
+        self.assertIn("+1 new", "".join(display.s.grid[18]))
+
+        display.focused_panel = "Codex"
+        with mock.patch.object(display, "draw"):
+            self.assertTrue(display.scroll_expanded(roundtable.curses.KEY_END))
+        self.assertEqual(display.scroll["Codex"], 0)
+        self.assertEqual(display.unread["Codex"], 0)
+
+    def test_scrolled_console_counts_only_events_visible_in_current_filter(self):
+        display = make_test_display(h=48, w=160)
+        display.scroll["Console"] = 2
+        display.unread = {name: 0 for name in display.scroll}
+        display.console_filter = 0  # key events; raw tick chatter is hidden
+
+        display.log("raw provider chatter", kind="tick")
+        display.log("phase changed", kind="phase")
+        self.assertEqual(display.unread["Console"], 1)
+
+        display.focused_panel = "Console"
+        with mock.patch.object(display, "draw"):
+            display.scroll_expanded(roundtable.curses.KEY_END)
+        self.assertEqual(display.unread["Console"], 0)
+
+    def test_console_filter_change_clears_filter_specific_unread_count(self):
+        display = make_test_display(h=48, w=160)
+        display.unread = {name: 0 for name in display.scroll}
+        display.unread["Console"] = 3
+        with mock.patch.object(display, "draw"):
+            display.cycle_console_filter()
+        self.assertEqual(display.console_filter, 1)
+        self.assertEqual(display.unread["Console"], 0)
+
+    def test_agent_panel_subtitle_shows_latest_dibs_claim(self):
+        """Panel subtitle swaps the static lab label for the agent's latest DIBS claim."""
+        display = make_test_display(
+            h=40, w=160,
+            turns=[
+                roundtable.Turn("Codex", "proposal", "DIBS: the auth flow\nImplemented auth."),
+                roundtable.Turn("Claude", "proposal", "DIBS: the docs\nWrote README notes."),
+                # Later turn overrides Codex's claim; Claude's first claim remains.
+                roundtable.Turn("Codex", "review 1", "DIBS: the retry logic\nFixed backoff."),
+            ],
+        )
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False), \
+             mock.patch.object(roundtable, "battery_summary", return_value=""):
+            display.draw()
+        rendered = display.s.text()
+        self.assertIn("DIBS: the retry logic", rendered)
+        self.assertIn("DIBS: the docs", rendered)
+        self.assertNotIn("DIBS: the auth flow", rendered)
+        # Agents without a claim keep the static lab subtitle.
+        self.assertIn("xAI coding agent", rendered)
+
+    def test_expanded_agent_panel_subtitle_shows_dibs_claim(self):
+        """Expanded agent view uses the same DIBS subtitle as the compact pane."""
+        display = make_test_display(
+            h=40, w=120,
+            turns=[roundtable.Turn("Grok", "proposal", "DIBS: panel dibs display\nLanded it.")],
+        )
+        display.expanded = "Grok"
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False), \
+             mock.patch.object(roundtable, "battery_summary", return_value=""):
+            display.draw()
+        self.assertIn("DIBS: panel dibs display", display.s.text())
 
     def test_read_options_ui_mouse_click_toggles_option_and_continues(self):
         screen = FakeScreen(30, 80)
@@ -2478,6 +2624,202 @@ class RoundtableTests(unittest.TestCase):
                 self.assertEqual(roundtable.main(), 130)
             self.assertEqual(stdout.getvalue(), "")
 
+    def test_list_agents_reports_found_and_missing_clis(self):
+        """list_agents() must reflect real shutil.which lookups for every AGENT_EXECUTABLES entry,
+        using the same mapping verify_clis/log_run_context rely on so they can't drift apart."""
+        def fake_which(executable):
+            return f"/usr/bin/{executable}" if executable in ("codex", "claude") else None
+
+        with mock.patch.object(roundtable.shutil, "which", side_effect=fake_which):
+            report = roundtable.list_agents()
+        lines = report.splitlines()
+        self.assertEqual(len(lines), len(roundtable.AGENT_NAMES))
+        self.assertIn("Codex", lines[0])
+        self.assertIn("/usr/bin/codex", lines[0])
+        claude_line = next(line for line in lines if line.startswith("Claude"))
+        self.assertIn("/usr/bin/claude", claude_line)
+        aider_line = next(line for line in lines if line.startswith("Aider"))
+        self.assertIn("not found", aider_line)
+
+    def test_main_list_agents_flag_prints_and_exits_without_starting_a_session(self):
+        """--list-agents must be a pure query: no curses, no preflight, no workspace/session setup --
+        it should work even without a TTY, unlike the interactive options screen."""
+        argv = ["roundtable", "--list-agents"]
+        stdout = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(stdout), \
+             mock.patch.object(roundtable, "verify_clis") as verify_mock, \
+             mock.patch.object(roundtable.curses, "wrapper") as wrapper_mock:
+            self.assertEqual(roundtable.main(), 0)
+        verify_mock.assert_not_called()
+        wrapper_mock.assert_not_called()
+        printed = stdout.getvalue()
+        for name in roundtable.AGENT_NAMES:
+            self.assertIn(name, printed)
+
+    def test_verify_clis_uses_the_canonical_agent_executables_mapping(self):
+        """Missing-CLI errors must name the actual executables from AGENT_EXECUTABLES, not a
+        second hardcoded list that could silently fall out of sync with it."""
+        def fake_which(executable):
+            return None if executable == "aider" else f"/usr/bin/{executable}"
+
+        with mock.patch.object(roundtable.shutil, "which", side_effect=fake_which):
+            with self.assertRaises(SystemExit) as cm:
+                roundtable.verify_clis(mock=False)
+        self.assertIn("aider", str(cm.exception))
+
+    def test_agent_commands_use_the_canonical_executable_mapping(self):
+        """The roster advertised in prompts and preflight must be the roster actually launched."""
+        original = dict(roundtable.AGENT_EXECUTABLES)
+        try:
+            for name in roundtable.AGENT_NAMES:
+                roundtable.AGENT_EXECUTABLES[name] = f"test-{original[name]}"
+                agent = roundtable.Agent(name, Path("/tmp"))
+                self.assertEqual(agent.command("Solve this")[0], f"test-{original[name]}")
+                roundtable.AGENT_EXECUTABLES[name] = original[name]
+        finally:
+            roundtable.AGENT_EXECUTABLES.clear()
+            roundtable.AGENT_EXECUTABLES.update(original)
+
+    def test_agent_roster_stays_aligned_across_names_executables_ui_and_spinners(self):
+        """The six AIs must agree everywhere they are named: display order, CLI map, TUI panels,
+        and spinner keys. Adding a seventh agent without updating all of these is a real bug."""
+        names = roundtable.AGENT_NAMES
+        self.assertEqual(names, ("Codex", "Claude", "Antigravity", "Aider", "Grok", "Qwen"))
+        self.assertEqual(tuple(roundtable.AGENT_EXECUTABLES), names)
+        self.assertEqual(
+            dict(roundtable.AGENT_EXECUTABLES),
+            {"Codex": "codex", "Claude": "claude", "Antigravity": "agy",
+             "Aider": "aider", "Grok": "grok", "Qwen": "qwen"},
+        )
+        self.assertEqual(roundtable.Display.PANEL_NAMES[:6], names)
+        self.assertEqual(set(roundtable.AGENT_SPINNERS), set(names))
+        self.assertEqual(len(roundtable.ROLE_HINTS_BY_SLOT), len(names))
+        self.assertEqual(set(roundtable.role_hints_for("roster-lock")), set(names))
+
+    def test_roster_awareness_names_self_and_every_peer_from_canonical_maps(self):
+        """Each roster agent must know its own name/CLI and every peer; non-agents get nothing."""
+        for speaker in roundtable.AGENT_NAMES:
+            note = roundtable.roster_awareness(speaker)
+            self.assertIn(f"You are {speaker}", note)
+            self.assertIn(f"`{roundtable.AGENT_EXECUTABLES[speaker]}`", note)
+            self.assertIn(f"one of {len(roundtable.AGENT_NAMES)} members", note)
+            for peer in roundtable.AGENT_NAMES:
+                if peer == speaker:
+                    continue
+                self.assertIn(peer, note)
+                self.assertIn(f"`{roundtable.AGENT_EXECUTABLES[peer]}`", note)
+        self.assertEqual(roundtable.roster_awareness("User"), "")
+        self.assertEqual(roundtable.roster_awareness("Final"), "")
+        self.assertEqual(roundtable.roster_awareness(""), "")
+
+    def test_prompt_for_and_reassignment_inject_roster_self_awareness(self):
+        """Working turns must tell agents who they are and who else sits at the table so
+        discovery of the other AIs does not require re-reading roundtable.py every turn."""
+        for speaker in roundtable.AGENT_NAMES:
+            prompt = roundtable.prompt_for("Goal", [], "proposal", speaker)
+            self.assertIn(f"You are {speaker}", prompt)
+            self.assertIn(f"`{roundtable.AGENT_EXECUTABLES[speaker]}`", prompt)
+            for peer in roundtable.AGENT_NAMES:
+                if peer != speaker:
+                    self.assertIn(peer, prompt)
+            reassigned = roundtable.reassignment_prompt(
+                "Goal", [], "proposal", speaker, {"Claude"} if speaker != "Claude" else {"Codex"})
+            self.assertIn(f"You are {speaker}", reassigned)
+        # Non-roster speakers keep SYSTEM_BRIEF but do not get the roster block.
+        user_prompt = roundtable.prompt_for("Goal", [], "proposal", "User")
+        self.assertNotIn("You are User", user_prompt)
+        self.assertNotIn("Do not invent additional members", user_prompt)
+        # With no speaker named, final/refine stay prose-only (backward-compatible public API).
+        final = roundtable.final_prompt("Goal", [])
+        self.assertNotIn("Do not invent additional members", final)
+
+    def test_named_synthesis_and_dead_code_prompts_keep_roster_self_awareness(self):
+        """Role changes must not make a known agent lose the identity block after review."""
+        prompts = (
+            roundtable.final_prompt("Goal", [], speaker="Claude"),
+            roundtable.refine_prompt("Goal", [], "Draft", speaker="Grok"),
+            roundtable.dead_code_check_prompt("Goal", [], speaker="Qwen"),
+        )
+        for prompt, speaker in zip(prompts, ("Claude", "Grok", "Qwen")):
+            self.assertIn(f"You are {speaker}", prompt)
+            self.assertIn("Do not invent additional members", prompt)
+        # Direct/public helper use remains backward-compatible when no executing agent is known.
+        self.assertNotIn("Do not invent additional members", roundtable.final_prompt("Goal", []))
+
+    def test_synthesize_and_dead_code_check_pass_speaker_into_logged_prompts(self):
+        """Call-site wiring: synthesis/dead-code must inject roster identity for the agent
+        actually running the turn, not only when helpers are called with speaker= in unit tests.
+        A regression that drops speaker=name at the call site would re-blind the agent mid-role-
+        change while the helper-level tests above still pass."""
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            session = roundtable.Session(
+                "Solve it", td, 0, "now",
+                [roundtable.Turn("Codex", "proposal", "Initial idea")])
+            order = [
+                ("Claude", roundtable.MockAgent("Claude", workspace)),
+                ("Grok", roundtable.MockAgent("Grok", workspace)),
+            ]
+            logged: list[tuple[str, str]] = []
+            roundtable.synthesize(
+                session, order, lambda *_: None, lambda *_: None,
+                log_prompt=lambda name, prompt: logged.append((name, prompt)))
+        self.assertEqual([name for name, _ in logged], ["Claude", "Grok"])
+        draft_prompt = logged[0][1]
+        refine_prompt = logged[1][1]
+        self.assertIn("You are Claude", draft_prompt)
+        self.assertIn("`claude`", draft_prompt)
+        self.assertIn("Grok", draft_prompt)
+        self.assertIn("`grok`", draft_prompt)
+        self.assertIn("Do not invent additional members", draft_prompt)
+        self.assertIn("You are Grok", refine_prompt)
+        self.assertIn("`grok`", refine_prompt)
+        self.assertIn("Claude", refine_prompt)
+        # Refiner must not be told it is the drafter.
+        self.assertNotIn("You are Claude", refine_prompt)
+
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session("Goal", td, 0, "now", [])
+            agent = roundtable.MockAgent("Qwen", Path(td))
+            logged = []
+            roundtable.run_dead_code_check(
+                session, "Qwen", agent, lambda *_: None, lambda *_: None,
+                log_prompt=lambda name, prompt: logged.append((name, prompt)))
+        self.assertEqual(len(logged), 1)
+        self.assertEqual(logged[0][0], "Qwen")
+        self.assertIn("You are Qwen", logged[0][1])
+        self.assertIn("`qwen`", logged[0][1])
+        self.assertIn("Do not invent additional members", logged[0][1])
+
+    def test_roster_awareness_edge_cases_for_tiny_rosters(self):
+        """Sole-member and two-member wording must stay grammatical if the roster shrinks in tests
+        or a future fork; production always has six agents but the helper is table-driven."""
+        real_names = roundtable.AGENT_NAMES
+        real_execs = dict(roundtable.AGENT_EXECUTABLES)
+        try:
+            roundtable.AGENT_NAMES = ("Solo",)
+            roundtable.AGENT_EXECUTABLES.clear()
+            roundtable.AGENT_EXECUTABLES["Solo"] = "solo"
+            sole = roundtable.roster_awareness("Solo")
+            self.assertIn("You are Solo", sole)
+            self.assertIn("`solo`", sole)
+            self.assertIn("sole member", sole)
+            self.assertNotIn("other members", sole)
+
+            roundtable.AGENT_NAMES = ("Alpha", "Beta")
+            roundtable.AGENT_EXECUTABLES.clear()
+            roundtable.AGENT_EXECUTABLES.update({"Alpha": "alpha", "Beta": "beta"})
+            pair = roundtable.roster_awareness("Alpha")
+            self.assertIn("You are Alpha", pair)
+            self.assertIn("`alpha`", pair)
+            self.assertIn("one of 2 members", pair)
+            self.assertIn("The other member is Beta (`beta`).", pair)
+            self.assertNotIn("The other members are", pair)
+        finally:
+            roundtable.AGENT_NAMES = real_names
+            roundtable.AGENT_EXECUTABLES.clear()
+            roundtable.AGENT_EXECUTABLES.update(real_execs)
+
     def test_every_store_true_opt_in_flag_has_a_matching_options_screen_toggle(self):
         """Guards against parser flags added to the parser without a matching entry in OPTION_TOGGLES,
         so the interactive menu silently falls behind."""
@@ -2487,7 +2829,7 @@ class RoundtableTests(unittest.TestCase):
             for action in parser._actions
             if isinstance(action, roundtable.argparse._StoreTrueAction)
             and action.help != roundtable.argparse.SUPPRESS
-            and action.dest != "plain"
+            and action.dest not in ("plain", "list_agents")
         }
         toggle_names = {name for name, _ in roundtable.OPTION_TOGGLES}
         self.assertTrue(parser_flags <= toggle_names, f"Missing toggles for: {parser_flags - toggle_names}")
@@ -3056,6 +3398,19 @@ class RoundtableTests(unittest.TestCase):
         self.assertIn("⚡ improve self gui", obj_line)
         self.assertNotIn(roundtable.SELF_EDIT_NOTE, obj_line)
 
+    def test_draw_header_shows_restart_count_after_self_edit_restarts(self):
+        """Header appends '↻N' once a --self run has restarted itself, so the badge reflects the
+        run's own edit-and-reload history instead of always looking like a first pass."""
+        display = make_test_display(h=25, w=120)
+        display.session.objective = f"improve self gui\n\n{roundtable.SELF_EDIT_NOTE}"
+        display.session.restart_count = 2
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False), \
+             mock.patch.object(roundtable, "battery_summary", return_value=""):
+            display.draw()
+        header = "".join(display.s.grid[0])
+        self.assertIn("⚡ self ↻2", header)
+
     def test_session_is_self_and_clean_self_objective_helpers(self):
         plain = roundtable.Session("fix a bug", "/tmp", 0, "now", [])
         self.assertFalse(roundtable.session_is_self(plain))
@@ -3079,6 +3434,46 @@ class RoundtableTests(unittest.TestCase):
         ])
         self.assertTrue(roundtable.session_is_self(followup_only))
         self.assertEqual(roundtable.self_sandbox_path(followup_only), "/var/sandbox")
+
+    def test_main_does_not_auto_enable_self_from_workspace_contents(self):
+        """A plain (non---self) run must stay ordinary even when -C happens to point at a
+        directory that contains test_roundtable.py -- e.g. the roundtable repo itself. Self mode
+        is opt-in via --self only; merely running from that directory must never silently append
+        SELF_EDIT_NOTE to the objective or spin up a self-test sandbox."""
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            (workspace / "test_roundtable.py").write_text("# fixture suite\n")
+            (workspace / "roundtable.py").write_text("print('fixture')\n")
+            out = workspace / "out"
+            argv = [
+                "roundtable", "ordinary task", "--plain", "-r", "0", "--mock",
+                "--skip-preflight", "-C", str(workspace), "--output-dir", str(out),
+            ]
+            with mock.patch.object(sys, "argv", argv), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(roundtable.main(), 0)
+            saved = sorted(out.glob("*.json"))[-1]
+            session = roundtable.load_session(saved)
+            self.assertFalse(roundtable.session_is_self(session))
+            self.assertNotIn(roundtable.SELF_EDIT_NOTE, session.objective)
+            self.assertFalse((out / "self-test-sandbox").exists())
+
+    def test_restart_vote_and_task_status_prompts_keep_roster_self_awareness(self):
+        """RESTART_VOTE / TASK_STATUS ride prompt_for; identity must not drop when those hints attach.
+        (verify_self_edit_turn is not a prompt builder — it only ticks unittest results — so it needs
+        no roster injection.)"""
+        for speaker in ("Grok", "Claude"):
+            voted = roundtable.prompt_for(
+                "Goal", [], "review", speaker, restart_vote_pending=True)
+            statused = roundtable.prompt_for(
+                "Goal", [], "review", speaker, task_status_check=True)
+            for prompt in (voted, statused):
+                self.assertIn(f"You are {speaker}", prompt)
+                self.assertIn(f"`{roundtable.AGENT_EXECUTABLES[speaker]}`", prompt)
+                self.assertIn("Do not invent additional members", prompt)
+            self.assertIn("RESTART: now", voted)
+            self.assertIn("RESTART: later", voted)
+            self.assertIn("TASK STATUS: complete", statused)
 
     def test_draw_status_line_shows_self_sandbox_path(self):
         """Status line surfaces the smoke-test sandbox path advertised in the self note."""
@@ -5654,6 +6049,10 @@ class RoundtableTests(unittest.TestCase):
             roundtable.Turn("Grok", "review 1", "work\n\n**RESTART: now** — agreed\n\nSigned: Grok"),
         ]
         self.assertEqual(roundtable.tally_restart_votes(turns, "review 1"), "now")
+        self.assertEqual(
+            roundtable.extract_restart_votes(turns, "review 1"),
+            {"Codex": "now", "Claude": "later", "Grok": "now"},
+        )
 
     def test_tally_restart_votes_majority_later(self):
         turns = [
@@ -5671,10 +6070,46 @@ class RoundtableTests(unittest.TestCase):
         self.assertEqual(roundtable.tally_restart_votes(tied, "review 1"), "now")
         no_votes = [roundtable.Turn("Codex", "review 1", "just work, no vote\n\nSigned: Codex")]
         self.assertEqual(roundtable.tally_restart_votes(no_votes, "review 1"), "now")
+        self.assertEqual(roundtable.extract_restart_votes(no_votes, "review 1"), {})
 
     def test_tally_restart_votes_ignores_other_phases(self):
         turns = [roundtable.Turn("Codex", "review 2", "RESTART: later — wrong phase\n\nSigned: Codex")]
         self.assertEqual(roundtable.tally_restart_votes(turns, "review 1"), "now")
+
+    def test_extract_restart_votes_latest_per_agent_not_stackable(self):
+        """One agent with two turns in the same phase keeps only its latest vote — no double count."""
+        turns = [
+            roundtable.Turn("Codex", "review 1", "first\n\nRESTART: later — early\n\nSigned: Codex"),
+            roundtable.Turn("Claude", "review 1", "work\n\nRESTART: later — also\n\nSigned: Claude"),
+            roundtable.Turn("Codex", "review 1", "second\n\nRESTART: now — changed mind\n\nSigned: Codex"),
+        ]
+        self.assertEqual(
+            roundtable.extract_restart_votes(turns, "review 1"),
+            {"Codex": "now", "Claude": "later"},
+        )
+        # Without per-agent dedupe this would be later=2 now=1 → "later".
+        self.assertEqual(roundtable.tally_restart_votes(turns, "review 1"), "now")
+
+    def test_format_restart_vote_summary_lists_sides_and_action(self):
+        turns = [
+            roundtable.Turn("Codex", "review 1", "RESTART: now — fix\n\nSigned: Codex"),
+            roundtable.Turn("Claude", "review 1", "RESTART: later — polish\n\nSigned: Claude"),
+            roundtable.Turn("Grok", "review 1", "RESTART: now — agree\n\nSigned: Grok"),
+        ]
+        summary = roundtable.format_restart_vote_summary(turns, "review 1")
+        self.assertIn("RESTART vote: now=2 later=1 → restarting now", summary)
+        self.assertIn("now: Codex, Grok", summary)
+        self.assertIn("later: Claude", summary)
+        later_majority = [
+            roundtable.Turn("Codex", "review 1", "RESTART: later\n\nSigned: Codex"),
+            roundtable.Turn("Claude", "review 1", "RESTART: later\n\nSigned: Claude"),
+            roundtable.Turn("Grok", "review 1", "RESTART: now\n\nSigned: Grok"),
+        ]
+        later_summary = roundtable.format_restart_vote_summary(later_majority, "review 1")
+        self.assertIn("→ deferring restart by one phase", later_summary)
+        empty = roundtable.format_restart_vote_summary([], "review 1")
+        self.assertIn("now=0 later=0 → restarting now", empty)
+        self.assertIn("no votes cast", empty)
 
     def test_self_checkpoint_ignores_sibling_files_next_to_loaded_program(self):
         """Restart only tracks Path(__file__); tests/docs next to it must not force execv."""
@@ -5833,6 +6268,19 @@ class RoundtableTests(unittest.TestCase):
         self.assertNotIn("more", rendered)
         self.assertIn("Toggle this Help overlay modal", rendered)
 
+    def test_help_modal_documents_mouse_click_and_wheel_support(self):
+        """The help overlay previously described keyboard shortcuts only, leaving mouse click
+        (expand a panel) and wheel scroll (page a panel) completely undiscoverable to a
+        non-touch, mouse-enabled terminal user."""
+        display = make_test_display(h=30, w=100)
+        display.show_help = True
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False), \
+             mock.patch.object(roundtable, "battery_summary", return_value=""):
+            display.draw()
+        rendered = display.s.text()
+        self.assertIn("Click / wheel", rendered)
+
     def test_keyboard_focus_cycles_and_enter_expands_selected_panel(self):
         display = make_test_display(h=30, w=100)
         keys = iter([9, 9, roundtable.curses.KEY_BTAB, 10, -1])
@@ -5985,7 +6433,10 @@ class RoundtableTests(unittest.TestCase):
              mock.patch.object(roundtable, "battery_summary", return_value=""):
             display.draw()
         flat = " ".join(display.s.text().split())
-        self.assertIn("rate limited", flat)
+        # At w=140 each agent column is narrow, so the panel uses the compact form
+        # ("⏳ limited" / "⏳ limited Ns"); the internal state key stays "rate limited" above.
+        self.assertIn("⏳", flat)
+        self.assertRegex(flat, r"limited(?:\s+\d+s)?")
         self.assertIn("1 limited", "".join(display.s.grid[3]))
 
         # Normal progress after a transient retry clears the retry badge.
@@ -6109,6 +6560,84 @@ class RoundtableTests(unittest.TestCase):
             with self.assertRaises(RuntimeError) as cm:
                 agent.run("test prompt", lambda x: None)
             self.assertIn("failed to start process", str(cm.exception))
+
+    def test_gui_focused_panel_highlights_box_border(self):
+        """draw() must actually bold the focused panel's border, not just leave focused_panel set.
+
+        Regression check: the previous version of this test only asserted
+        ``display.focused_panel == "Codex"``, which was true before draw() even ran and would
+        pass even if the border-highlighting code were deleted entirely.
+        """
+        display = make_test_display(h=30, w=100)
+        original_box = display._box
+
+        def bold_box_count():
+            calls = []
+            display._box = lambda y, x, height, width, color=0: (
+                calls.append(color), original_box(y, x, height, width, color))[-1]
+            with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+                 mock.patch.object(roundtable.curses, "has_colors", return_value=False), \
+                 mock.patch.object(roundtable, "battery_summary", return_value=""):
+                display.draw()
+            display._box = original_box
+            return sum(1 for color in calls if color & roundtable.curses.A_BOLD)
+
+        display.focused_panel = None
+        self.assertEqual(bold_box_count(), 0)
+
+        for name in ("Codex", "Final", "Code", "Console"):
+            display.focused_panel = name
+            self.assertEqual(bold_box_count(), 1, f"expected exactly one bold border for {name}")
+
+    def test_gui_expanded_panel_has_tappable_close_button(self):
+        display = make_test_display(h=30, w=100)
+        display.expanded = "Codex"
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False), \
+             mock.patch.object(roundtable, "battery_summary", return_value=""):
+            display.draw()
+            self.assertIn("close", display.hitboxes)
+            top, left, bottom, right = display.hitboxes["close"]
+            display.handle_mouse(left, top, roundtable.curses.BUTTON1_CLICKED)
+        self.assertIsNone(display.expanded)
+
+    def test_gui_console_filter_hitbox_and_mouse_tap_cycles(self):
+        display = make_test_display(h=40, w=100)
+        display.console.append(("tick", "Test event"))
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False), \
+             mock.patch.object(roundtable, "battery_summary", return_value=""):
+            display.draw()
+            self.assertIn("console_filter", display.hitboxes)
+            initial_filter = display.console_filter
+            top, left, bottom, right = display.hitboxes["console_filter"]
+            display.handle_mouse(left, top, roundtable.curses.BUTTON1_CLICKED)
+            self.assertEqual(display.console_filter, (initial_filter + 1) % len(roundtable.CONSOLE_FILTERS))
+
+    def test_agent_panel_shows_self_awareness_indicators(self):
+        """Agent panels should show self-awareness indicators when in a self session."""
+        # Create a session that simulates a self session
+        turns = [roundtable.Turn("Codex", "test", "Test content")]
+        session = roundtable.Session(
+            objective=roundtable.SELF_EDIT_NOTE + " Test objective",
+            workspace="/tmp/test",
+            rounds=1,
+            started_at="now",
+            turns=turns
+        )
+
+        display = make_test_display(turns=turns)
+        display.session = session  # Override with our self-aware session
+        display.busy = True
+        display.active = {"Codex"}
+
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False):
+            display.draw()
+
+        rendered = display.s.text()
+        # Check that the self indicator (⚡) appears somewhere in the agent panel
+        self.assertIn("⚡", rendered, "Self-awareness indicator should appear in agent panel for self sessions")
 
 
 if __name__ == "__main__":

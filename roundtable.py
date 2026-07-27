@@ -294,6 +294,42 @@ def verify_self_edit_turn(session: "Session", agent: "Agent", tick: Callable[[st
 
 AGENT_NAMES: tuple[str, ...] = ("Codex", "Claude", "Antigravity", "Aider", "Grok", "Qwen")
 
+# Canonical mapping from display name to the CLI executable roundtable shells out to. Kept as the
+# single source of truth so verify_clis, log_run_context, and --list-agents can't drift apart.
+AGENT_EXECUTABLES: dict[str, str] = {
+    "Codex": "codex", "Claude": "claude", "Antigravity": "agy",
+    "Aider": "aider", "Grok": "grok", "Qwen": "qwen",
+}
+
+
+def roster_awareness(speaker: str) -> str:
+    """Self-awareness block: name this agent and the other members of the table.
+
+    Built only from AGENT_NAMES / AGENT_EXECUTABLES so prompt identity, --list-agents, and the
+    CLIs a real run shells out to can never disagree. Empty for non-roster speakers (User, etc.).
+    """
+    if speaker not in AGENT_NAMES:
+        return ""
+    peers = [name for name in AGENT_NAMES if name != speaker]
+    if not peers:
+        return (
+            f"\n\nYou are {speaker} (CLI `{AGENT_EXECUTABLES[speaker]}`), the sole member of this "
+            "roundtable. Do not invent additional peer agents."
+        )
+    peer_entries = [f"{name} (`{AGENT_EXECUTABLES[name]}`)" for name in peers]
+    if len(peer_entries) == 1:
+        peers_sentence = f"The other member is {peer_entries[0]}."
+    else:
+        peer_list = ", ".join(peer_entries[:-1]) + f", and {peer_entries[-1]}"
+        peers_sentence = f"The other members are {peer_list}."
+    my_cli = AGENT_EXECUTABLES[speaker]
+    return (
+        f"\n\nYou are {speaker} (CLI `{my_cli}`), one of {len(AGENT_NAMES)} members of this "
+        f"roundtable. {peers_sentence} Do not invent additional "
+        "members or treat tools outside this roster as roundtable peers."
+    )
+
+
 # Nudges agents toward complementary parts of the work instead of six redundant attempts at the
 # same whole task. Which agent gets which nudge rotates by objective (see role_hints_for) rather
 # than being fixed to one identity, so no agent is permanently typecast into the same lane.
@@ -341,6 +377,10 @@ class Session:
     turns: list[Turn]
     final: str = ""
     queued_prompts: list[str] = field(default_factory=list)
+    # How many times this --self run has already replaced its own process after editing
+    # roundtable.py mid-run (see SelfRestartRequired). Persisted across restarts so the run stays
+    # aware of its own edit-and-reload history instead of each new process looking pristine.
+    restart_count: int = 0
 
 
 class SelfRestartRequired(RuntimeError):
@@ -787,6 +827,7 @@ def activity_sparkline(pulses: Iterable[float], width: int, window: float = 12.0
 
 DEFAULT_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
+
 # Distinct working-indicator animations per agent, so a glance at the panel identifies
 # who is active without reading the header. 'speed' slows the frame advance for a calmer pulse.
 AGENT_SPINNERS: dict[str, tuple[tuple[str, ...], int]] = {
@@ -893,7 +934,8 @@ class Agent:
     def command(self, prompt: str, output_file: Path | None = None, no_edit: bool = False) -> list[str]:
         effort = self.effective_effort()
         if self.name == "Codex":
-            cmd = ["codex", "exec", "--skip-git-repo-check", "--color", "never", "--ephemeral",
+            cmd = [AGENT_EXECUTABLES[self.name], "exec", "--skip-git-repo-check",
+                   "--color", "never", "--ephemeral",
                    "-C", str(self.workspace)]
             cmd += (["--dangerously-bypass-approvals-and-sandbox"] if self.elevated
                     else ["--sandbox", "workspace-write"])
@@ -905,7 +947,8 @@ class Agent:
                 cmd += ["--output-last-message", str(output_file)]
             return cmd + [prompt]
         if self.name == "Claude":
-            cmd = ["claude", "--print", "--no-session-persistence", "--output-format", "text"]
+            cmd = [AGENT_EXECUTABLES[self.name], "--print", "--no-session-persistence",
+                   "--output-format", "text"]
             cmd += (["--dangerously-skip-permissions"] if self.elevated
                     else ["--permission-mode", "acceptEdits"])
             if effort:
@@ -914,7 +957,7 @@ class Agent:
                 cmd += ["--model", self.model]
             return cmd + [prompt]
         if self.name == "Antigravity":
-            cmd = ["agy", "--print", prompt, "--mode", "accept-edits"]
+            cmd = [AGENT_EXECUTABLES[self.name], "--print", prompt, "--mode", "accept-edits"]
             cmd += ["--dangerously-skip-permissions"] if self.elevated else ["--sandbox"]
             if effort:
                 cmd += ["--effort", effort]
@@ -935,7 +978,7 @@ class Agent:
             # not an edit-format problem: it happened even with --edit-format ask active). A
             # bounded timeout makes Aider fail that one call fast instead, so this harness's own
             # _run_with_retry can retry it -- which resolves in seconds, not tens of minutes.
-            cmd = ["aider", "--message", prompt, "--yes-always", "--no-pretty",
+            cmd = [AGENT_EXECUTABLES[self.name], "--message", prompt, "--yes-always", "--no-pretty",
                    "--no-check-update", "--no-analytics", "--no-auto-commits",
                    "--no-dirty-commits", "--no-gitignore", "--disable-playwright",
                    "--timeout", "180"]
@@ -968,7 +1011,7 @@ class Agent:
             # -p/--single runs one instruction non-interactively then exits. permission-mode and
             # sandbox names mirror Claude's own (Grok Build accepts --dangerously-skip-permissions
             # as a compat alias too), reflecting xAI's deliberate Claude Code flag compatibility.
-            cmd = ["grok", "-p", prompt, "--output-format", "plain"]
+            cmd = [AGENT_EXECUTABLES[self.name], "-p", prompt, "--output-format", "plain"]
             cmd += (["--permission-mode", "bypassPermissions"] if self.elevated
                     else ["--permission-mode", "acceptEdits", "--sandbox", "workspace"])
             if effort:
@@ -990,8 +1033,8 @@ class Agent:
             # which roundtable relies on or wants silently steering a turn -- and measured ~36%
             # faster in practice (13.0s -> 8.4s for a trivial reply). It prints a fixed banner line
             # to stderr, which Agent.run() strips back out (see QWEN_SAFE_MODE_BANNER below).
-            cmd = ["qwen", "-p", prompt, "--output-format", "text", "--auth-type", "openai",
-                   "--safe-mode"]
+            cmd = [AGENT_EXECUTABLES[self.name], "-p", prompt, "--output-format", "text",
+                   "--auth-type", "openai", "--safe-mode"]
             cmd += ["--approval-mode", "yolo"] if self.elevated else ["--approval-mode", "auto-edit"]
             if self.model:
                 cmd += ["-m", self.model]
@@ -1268,25 +1311,50 @@ RESTART_VOTE_HINT = (
 )
 
 
+def extract_restart_votes(turns: list[Turn], phase: str) -> dict[str, str]:
+    """Each named agent's most recent RESTART: now|later vote in this phase.
+
+    Later turns from the same agent override earlier ones so a single agent cannot stack votes.
+    Non-roster speakers (User, Final, …) are ignored.
+    """
+    votes: dict[str, str] = {}
+    for turn in reversed(turns):
+        if turn.phase != phase or turn.speaker not in AGENT_NAMES or turn.speaker in votes:
+            continue
+        match = RESTART_VOTE_PATTERN.search(turn.content)
+        if match:
+            votes[turn.speaker] = match.group(1).lower()
+    return votes
+
+
 def tally_restart_votes(turns: list[Turn], phase: str) -> str:
     """Majority RESTART: now/later vote among a phase's turns.
 
-    Ties -- including no votes cast at all -- favor "now", since running stale --self source is
-    the riskier failure mode than an extra restart.
+    Counts at most one vote per roster agent (see extract_restart_votes). Ties -- including no
+    votes cast at all -- favor "now", since running stale --self source is the riskier failure
+    mode than an extra restart.
     """
-    now_votes = 0
-    later_votes = 0
-    for turn in turns:
-        if turn.phase != phase:
-            continue
-        match = RESTART_VOTE_PATTERN.search(turn.content)
-        if not match:
-            continue
-        if match.group(1).lower() == "later":
-            later_votes += 1
-        else:
-            now_votes += 1
+    votes = extract_restart_votes(turns, phase)
+    now_votes = sum(1 for vote in votes.values() if vote == "now")
+    later_votes = sum(1 for vote in votes.values() if vote == "later")
     return "later" if later_votes > now_votes else "now"
+
+
+def format_restart_vote_summary(turns: list[Turn], phase: str) -> str:
+    """One-line operator-facing tally after a --self restart timing vote resolves."""
+    votes = extract_restart_votes(turns, phase)
+    decision = tally_restart_votes(turns, phase)
+    now_names = [name for name in AGENT_NAMES if votes.get(name) == "now"]
+    later_names = [name for name in AGENT_NAMES if votes.get(name) == "later"]
+    action = ("restarting now" if decision == "now" else "deferring restart by one phase")
+    parts = [f"RESTART vote: now={len(now_names)} later={len(later_names)} → {action}"]
+    if now_names:
+        parts.append(f"now: {', '.join(now_names)}")
+    if later_names:
+        parts.append(f"later: {', '.join(later_names)}")
+    if not votes:
+        parts.append("(no votes cast; defaulting to now)")
+    return " · ".join(parts)
 
 
 
@@ -1431,17 +1499,18 @@ def prompt_for(objective: str, turns: list[Turn], phase: str, speaker: str,
         board_entries_note = f"\n\nActive prompt board entries ({AGENT_PROMPT_FILE}):\n{context.prompt_board_entries}"
     status_hint = TASK_STATUS_HINT if task_status_check else ""
     vote_hint = RESTART_VOTE_HINT if restart_vote_pending and speaker in AGENT_NAMES else ""
-    return (f"{SYSTEM_BRIEF}\n\nUSER OBJECTIVE:\n{objective}\n\nSHARED TRANSCRIPT:\n{history}\n\n"
+    awareness = roster_awareness(speaker)
+    return (f"{SYSTEM_BRIEF}{awareness}\n\nUSER OBJECTIVE:\n{objective}\n\nSHARED TRANSCRIPT:\n{history}\n\n"
            f"YOUR TURN ({speaker}, {phase}):\n{task}{role_hint}{dibs_note}{dibs_hint}{prompt_board_hint}"
            f"{board_entries_note}{scope}{status_hint}{vote_hint}")
 
 
 
 def final_prompt(objective: str, turns: list[Turn], followup: bool = False,
-                 history: str | None = None) -> str:
+                 history: str | None = None, speaker: str = "") -> str:
     focus = ("\nFocus on the user's latest follow-up request (the most recent 'User — follow-up' turn), "
              "consistent with the prior final answer where it still applies.\n" if followup else "")
-    return f"""{SYSTEM_BRIEF}
+    return f"""{SYSTEM_BRIEF}{roster_awareness(speaker)}
 
 USER OBJECTIVE:
 {objective}
@@ -1460,11 +1529,11 @@ polished answer."""
 
 
 def refine_prompt(objective: str, turns: list[Turn], draft: str, followup: bool = False,
-                  history: str | None = None) -> str:
+                  history: str | None = None, speaker: str = "") -> str:
     """Ask an agent to edit another agent's draft final answer rather than write it from scratch."""
     focus = ("\nFocus on the user's latest follow-up request (the most recent 'User — follow-up' turn), "
              "consistent with the prior final answer where it still applies.\n" if followup else "")
-    return f"""{SYSTEM_BRIEF}
+    return f"""{SYSTEM_BRIEF}{roster_awareness(speaker)}
 
 USER OBJECTIVE:
 {objective}
@@ -1485,13 +1554,14 @@ Do not mention the roundtable process, the transcript, these instructions, or th
 Return only the polished answer."""
 
 
-def dead_code_check_prompt(objective: str, turns: list[Turn], history: str | None = None) -> str:
+def dead_code_check_prompt(objective: str, turns: list[Turn], history: str | None = None,
+                           speaker: str = "") -> str:
     """Ask one agent to sweep for now-unused code before the final answer is drafted.
 
     Unlike final_prompt/refine_prompt (prose only, no_edit=True), this turn keeps edit rights: a
     dead function found here needs to actually be deleted, not just mentioned in the write-up.
     """
-    return f"""{SYSTEM_BRIEF}
+    return f"""{SYSTEM_BRIEF}{roster_awareness(speaker)}
 
 USER OBJECTIVE:
 {objective}
@@ -1519,7 +1589,8 @@ def reassignment_prompt(objective: str, turns: list[Turn], phase: str, speaker: 
     dibs_claims = extract_dibs(turns)
     claimed_note = ("; ".join(f"{name} has dibs on {claim}" for name, claim in dibs_claims.items())
                     if dibs_claims else "nothing yet claimed by name")
-    return (f"{SYSTEM_BRIEF}\n\nUSER OBJECTIVE:\n{objective}\n\nSHARED TRANSCRIPT:\n{history}\n\n"
+    awareness = roster_awareness(speaker)
+    return (f"{SYSTEM_BRIEF}{awareness}\n\nUSER OBJECTIVE:\n{objective}\n\nSHARED TRANSCRIPT:\n{history}\n\n"
            f"YOUR TURN ({speaker}, {phase} · extra):\n"
            f"You already finished your part of this round while {still_working} are still working "
            f"({claimed_note}). Rather than sit idle, do one of two things: (1) pick up a different, "
@@ -1624,8 +1695,12 @@ def load_session(path: Path) -> Session:
     queued_prompts = data.get("queued_prompts", [])
     if not isinstance(queued_prompts, list) or any(not isinstance(p, str) for p in queued_prompts):
         raise ValueError("session field 'queued_prompts' must be a list of str")
+    restart_count = data.get("restart_count", 0)
+    if not isinstance(restart_count, int) or isinstance(restart_count, bool) or restart_count < 0:
+        raise ValueError("session field 'restart_count' must be a non-negative int")
     return Session(data["objective"], data["workspace"], data["rounds"],
-                   data["started_at"], turns, final, queued_prompts=queued_prompts)
+                   data["started_at"], turns, final, queued_prompts=queued_prompts,
+                   restart_count=restart_count)
 
 
 class RunLog:
@@ -1702,15 +1777,11 @@ def log_run_context(run_log: RunLog, args: argparse.Namespace, session: Session,
                     completed_phases: set[str] | None = None) -> None:
     """Record reproducibility context without dumping environment variables or credentials."""
     agent_details = []
-    executable_names = {
-        "Codex": "codex", "Claude": "claude", "Antigravity": "agy",
-        "Aider": "aider", "Grok": "grok", "Qwen": "qwen",
-    }
     for agent in agents:
         if agent is None:
             continue
         agent_name = getattr(agent, "name", "")
-        executable = executable_names.get(agent_name, str(agent_name).lower() or "cli")
+        executable = AGENT_EXECUTABLES.get(agent_name, str(agent_name).lower() or "cli")
         agent_details.append({
             "name": agent_name,
             "model": getattr(agent, "model", None) or "cli-default",
@@ -1766,6 +1837,7 @@ def log_run_context(run_log: RunLog, args: argparse.Namespace, session: Session,
         "objective_sha256": hashlib.sha256(session.objective.encode()).hexdigest(),
         "rounds": session.rounds,
         "existing_turns": len(session.turns),
+        "restart_count": session.restart_count,
         "resumed": resumed,
         "completed_phases": sorted(completed_phases or ()),
         "options": {
@@ -1896,6 +1968,8 @@ class Display:
         self.hitboxes: dict[str, tuple[int, int, int, int]] = {}
         self.scroll = {"Codex": 0, "Claude": 0, "Antigravity": 0, "Aider": 0, "Grok": 0, "Qwen": 0,
                       "Final": 0, "Console": 0, "Code": 0}
+        # Keep activity visible when the operator has scrolled away from a live tail.
+        self.unread = {name: 0 for name in self.scroll}
         self.expanded: str | None = None
         self.focused_panel: str | None = None
         self.show_help = False
@@ -1922,7 +1996,11 @@ class Display:
         self.console: deque[tuple[str, str]] = deque(maxlen=300)
         clean_log_obj = clean_self_objective(session.objective)
         is_self = session_is_self(session)
-        log_text = f"Objective: {clean_log_obj}" + (" [⚡ self]" if is_self else "")
+        self_badge = ""
+        if is_self:
+            self_badge = (f" [⚡ self ↻{session.restart_count}]" if session.restart_count
+                          else " [⚡ self]")
+        log_text = f"Objective: {clean_log_obj}" + self_badge
         self.log(log_text, kind="phase")
         try:
             curses.curs_set(0)
@@ -1953,6 +2031,13 @@ class Display:
     def log(self, text: str, kind: str = "info", file_text: str | None = None) -> None:
         elapsed = time.monotonic() - self.started
         self.console.append((kind, f"+{elapsed:6.1f}s  {text}"))
+        _label, visible_kinds = CONSOLE_FILTERS[
+            getattr(self, "console_filter", 0) % len(CONSOLE_FILTERS)]
+        if (getattr(self, "scroll", {}).get("Console", 0) > 0
+                and (visible_kinds is None or kind in visible_kinds)):
+            unread = getattr(self, "unread", None)
+            if unread is not None:
+                unread["Console"] = unread.get("Console", 0) + 1
         self.run_log.write(kind, file_text if file_text is not None else text)
 
     def log_prompt(self, name: str, prompt: str) -> None:
@@ -2030,6 +2115,10 @@ class Display:
             feed = getattr(self, "work_activity", {}).get(name)
             if entry and feed is not None and (not feed or feed[-1] != entry):
                 feed.append(entry)
+                if getattr(self, "scroll", {}).get(name, 0) > 0:
+                    unread = getattr(self, "unread", None)
+                    if unread is not None:
+                        unread[name] = unread.get(name, 0) + 1
             if name:
                 kind = self._tick_console_kind(line)
                 if kind == "error" and "dropped from this phase after a failure" in line.lower():
@@ -2224,6 +2313,11 @@ class Display:
     def cycle_console_filter(self) -> None:
         """Switch the console between key-events / all-activity / prompts-only / errors-only."""
         self.console_filter = (getattr(self, "console_filter", 0) + 1) % len(CONSOLE_FILTERS)
+        # The count belongs to the filter under which events arrived; do not carry a misleading
+        # badge into a different view whose visible event set may be unrelated.
+        unread = getattr(self, "unread", None)
+        if unread is not None:
+            unread["Console"] = 0
         self.draw()
 
     def scroll_expanded(self, key: int) -> bool:
@@ -2247,6 +2341,10 @@ class Display:
         else:  # KEY_NPAGE
             offset = max(0, offset - page)
         self.scroll[name] = offset
+        if offset == 0:
+            unread = getattr(self, "unread", None)
+            if unread is not None:
+                unread[name] = 0
         self.draw()
         return True
 
@@ -2397,6 +2495,10 @@ class Display:
                 box = self.hitboxes.get(name.lower())
                 if box and self._inside(box, y, x):
                     self.scroll[name] = max(0, self.scroll.get(name, 0) + direction)
+                    if self.scroll[name] == 0:
+                        unread = getattr(self, "unread", None)
+                        if unread is not None:
+                            unread[name] = 0
                     self.draw()
                     return None
         if tapped and "help" in self.hitboxes and self._inside(self.hitboxes["help"], y, x):
@@ -2407,6 +2509,13 @@ class Display:
             return "stop"
         if tapped and "interrupt" in self.hitboxes and self._inside(self.hitboxes["interrupt"], y, x):
             return "interrupt"
+        if tapped and "close" in self.hitboxes and self._inside(self.hitboxes["close"], y, x):
+            self.expanded = None
+            self.draw()
+            return None
+        if tapped and "console_filter" in self.hitboxes and self._inside(self.hitboxes["console_filter"], y, x):
+            self.cycle_console_filter()
+            return None
         if tapped:
             for action in ("send", "newline", "finish", "clear"):
                 box = self.hitboxes.get(action)
@@ -2447,7 +2556,8 @@ class Display:
 
     def _agent_panel(self, y: int, x: int, height: int, width: int, name: str,
                      icon: str, subtitle: str, color: int) -> None:
-        self._box(y, x, height, width, color)
+        panel_box_attr = color | (curses.A_BOLD if getattr(self, "focused_panel", None) == name and not self.expanded else 0)
+        self._box(y, x, height, width, panel_box_attr)
         is_active = name in self.active and self.busy
         failed_this_phase = name in getattr(self, "phase_failed", set())
         has_responded = (not failed_this_phase and (
@@ -2484,6 +2594,12 @@ class Display:
                 state_attr = curses.color_pair(4) | curses.A_BOLD  # red: at/near the limit
             elif usage_pct >= 80:
                 state_attr = curses.color_pair(5) | curses.A_BOLD  # yellow: approaching it
+
+        # Add self-awareness indicator to the state
+        is_self = session_is_self(self.session)
+        if is_self:
+            state = f"{state} ⚡"
+
         ticker = f" {spinner_frame(name, self.frame)}" if is_active else ""
         inner_width = max(0, width - 4)
         # Title is drawn after scroll offset is known so it can include a "· ↑N" cue.
@@ -2498,6 +2614,11 @@ class Display:
         state = state[:inner_width]
         state_x = x + width - len(state) - 2
         subtitle_width = max(0, state_x - (x + 2) - 1)
+
+        # Add self-awareness indicator to the subtitle if this is a self session
+        if is_self:
+            subtitle = f"{subtitle} ⚡"
+
         self._put(y + 1, x + 2, subtitle[:subtitle_width], curses.A_DIM)
         self._put(y + 1, state_x, state, state_attr)
         self._put(y + 2, x + 1, "─" * (width - 2), curses.A_DIM)
@@ -2552,9 +2673,21 @@ class Display:
         lines = self._wrapped(content, width - 4)
         offset = min(self.scroll.get(name, 0), max(0, len(lines) - available))
         self.scroll[name] = offset
+        if offset == 0:
+            unread = getattr(self, "unread", None)
+            if unread is not None:
+                unread[name] = 0
         # Same "· ↑N" title cue as Console / Final / Code Monitor.
         scroll_cue = f" · ↑{offset}" if offset else ""
-        header = f" {icon}  {name.upper()}{ticker}{scroll_cue} "
+        unread_count = getattr(self, "unread", {}).get(name, 0) if offset else 0
+        unread_cue = f" · +{unread_count} new" if unread_count else ""
+        header = f" {icon}  {name.upper()}{ticker}{scroll_cue}{unread_cue} "
+        if unread_count and len(header) > inner_width:
+            # On narrow agent columns the fresh-activity signal matters more than the spinner
+            # or full name. Keep it on-screen rather than clipping the suffix off the right.
+            compact_suffix = f" ↑{offset} +{unread_count} new "
+            label_budget = max(0, inner_width - len(compact_suffix))
+            header = f" {icon}{name.upper()}"[:label_budget] + compact_suffix
         header_attr = color | curses.A_BOLD
         if getattr(self, "focused_panel", None) == name and not self.expanded:
             header_attr |= curses.A_REVERSE
@@ -2642,7 +2775,8 @@ class Display:
                       format_duration(time.monotonic() - self.started)]
         is_self = session_is_self(self.session)
         if is_self:
-            right_bits.append("⚡ self")
+            restarts = getattr(self.session, "restart_count", 0)
+            right_bits.append(f"⚡ self ↻{restarts}" if restarts else "⚡ self")
         if getattr(self, "mock", False):
             right_bits.append("🧪 mock")
         if self.touch_mode:
@@ -2739,18 +2873,24 @@ class Display:
         )
         agent_area = content_height - top - consensus_height - 4
         gap = layout_params['gap']
+        # Surface each agent's latest DIBS claim in the panel subtitle so ownership is
+        # visible at a glance (claims already feed prompts; the GUI previously ignored them).
+        dibs_claims = extract_dibs(self.session.turns)
         agents = [(name, icon, subtitle, curses.color_pair(color_num))
                  for name, icon, subtitle, color_num in self.AGENTS]
         _cols, placements = agent_grid(w, agent_area, len(agents), top=top, gap=gap,
                                       min_row_height=layout_params['min_row_height'],
                                       row_gap=layout_params['row_gap'])
         for (y, x, panel_h, panel_w), (name, icon, subtitle, color) in zip(placements, agents):
-            self._agent_panel(y, x, panel_h, panel_w, name, icon, subtitle, color)
+            claim = dibs_claims.get(name)
+            panel_sub = f"DIBS: {claim}" if claim else subtitle
+            self._agent_panel(y, x, panel_h, panel_w, name, icon, panel_sub, color)
 
         cy = top + agent_area + 1
         monitor_width = max(25, min(38, int(w * layout_params['monitor_width_ratio'])))
         answer_width = w - monitor_width - 4
-        self._box(cy, 1, consensus_height, answer_width, curses.color_pair(3))
+        final_box_attr = curses.color_pair(3) | (curses.A_BOLD if getattr(self, "focused_panel", None) == "Final" and not self.expanded else 0)
+        self._box(cy, 1, consensus_height, answer_width, final_box_attr)
 
         final_text = (self.session.final or
                       "Completed and failed work will be summarized here after the task.")
@@ -2787,7 +2927,8 @@ class Display:
             if monitor_height < 4:
                 show_console, monitor_height, console_height = False, consensus_height, 0
 
-        self._box(cy, mx, monitor_height, monitor_width, curses.color_pair(2))
+        code_box_attr = curses.color_pair(2) | (curses.A_BOLD if getattr(self, "focused_panel", None) == "Code" and not self.expanded else 0)
+        self._box(cy, mx, monitor_height, monitor_width, code_box_attr)
         changes = self.monitor.changes
         available_changes = max(1, monitor_height - 3)
         code_offset = min(
@@ -2824,7 +2965,8 @@ class Display:
 
         if show_console:
             console_y = cy + monitor_height + 1
-            self._box(console_y, mx, console_height, monitor_width, curses.color_pair(1))
+            console_box_attr = curses.color_pair(1) | (curses.A_BOLD if getattr(self, "focused_panel", None) == "Console" and not self.expanded else 0)
+            self._box(console_y, mx, console_height, monitor_width, console_box_attr)
             label, filtered = self._filtered_console()
             total_logs = len(self.console)
             filtered_logs = len(filtered)
@@ -2835,22 +2977,40 @@ class Display:
             console_offset = min(
                 self.scroll.get("Console", 0), max(0, filtered_logs - available_console))
             self.scroll["Console"] = console_offset
+            if console_offset == 0:
+                unread = getattr(self, "unread", None)
+                if unread is not None:
+                    unread["Console"] = 0
             # Same "· ↑N" scroll cue as CODE MONITOR's title -- compact Console used to give no
             # sign that scroll["Console"] had moved you away from the live tail.
             console_scroll = f" · ↑{console_offset}" if console_offset else ""
+            console_unread = (getattr(self, "unread", {}).get("Console", 0)
+                              if console_offset else 0)
+            unread_cue = f" · +{console_unread} new" if console_unread else ""
             # Same panel-bound title budget as CODE MONITOR: long filter names used to
             # overwrite the right border at the 72-column minimum (monitor_width ≈ 25).
             title_width = max(0, monitor_width - 4)
             count_suffix = f" ({filtered_logs}/{total_logs})" if filtered_logs < total_logs else (f" ({total_logs})" if total_logs else "")
-            console_title = f" »  CONSOLE · {label}{count_suffix}{console_scroll} "
+            console_title = (
+                f" »  CONSOLE · {label}{count_suffix}{console_scroll}{unread_cue} ")
             if len(console_title) > title_width:
-                console_title = f" » {label}{count_suffix}{console_scroll} "
+                console_title = f" » {label}{count_suffix}{console_scroll}{unread_cue} "
                 if len(console_title) > title_width:
-                    console_title = f" » {label}{console_scroll} "
+                    console_title = f" » {label}{console_scroll}{unread_cue} "
+            if console_unread and len(console_title) > title_width:
+                # Preserve the alert at the 72-column floor; the filter remains discoverable
+                # through the summary and c/tap control.
+                console_title = f" » +{console_unread} new · ↑{console_offset} "
             console_attr = curses.color_pair(1) | curses.A_BOLD
             if getattr(self, "focused_panel", None) == "Console":
                 console_attr |= curses.A_REVERSE
             self._put(console_y, mx + 2, console_title[:title_width], console_attr)
+            filter_pos = console_title.find(label)
+            if filter_pos != -1:
+                fx = mx + 2 + filter_pos
+                fw = len(label)
+                if fx + fw <= mx + monitor_width - 1:
+                    self.hitboxes["console_filter"] = (console_y, fx, console_y, fx + fw - 1)
             counts = Counter(kind for kind, _ in self.console)
             summary = " ".join(f"{counts[k]}{CONSOLE_KIND_GLYPH[k]}" for k in
                                ("error", "retry", "phase", "turn", "prompt", "tick")
@@ -2871,6 +3031,12 @@ class Display:
             self.hitboxes["console"] = (console_y, mx, console_y + console_height - 1,
                                         mx + monitor_width - 1)
 
+        # Add a progress bar visualization to the footer
+        progress_info = self._calculate_progress_info()
+        if progress_info:
+            progress_bar = self._render_progress_bar(progress_info, w - 2)
+            self._put(content_height - 2, 1, progress_bar)
+
         footer = self.error or dashboard_hint(w - 5, self.touch_mode, self.busy)
         attr = curses.color_pair(4) if self.error and curses.has_colors() else curses.A_DIM
         self._put(content_height - 1, 2,
@@ -2878,6 +3044,61 @@ class Display:
         if getattr(self, "show_help", False):
             self._draw_help_modal()
         self.s.refresh()
+
+    def _calculate_progress_info(self) -> dict[str, float] | None:
+        """Calculate progress information for visualization."""
+        if not self.session.turns:
+            return None
+
+        # Count completed turns by agent
+        agent_turns = {}
+        for turn in self.session.turns:
+            if turn.speaker not in agent_turns:
+                agent_turns[turn.speaker] = 0
+            agent_turns[turn.speaker] += 1
+
+        # Calculate average completion rate
+        total_agents = len(AGENT_NAMES)
+        active_agents = len(self.active) if hasattr(self, 'active') else 0
+        completed_agents = len([name for name in AGENT_NAMES
+                                if agent_turns.get(name, 0) > 0])
+
+        return {
+            'total_agents': total_agents,
+            'active_agents': active_agents,
+            'completed_agents': completed_agents,
+            'total_turns': len(self.session.turns),
+        }
+
+    def _render_progress_bar(self, progress_info: dict[str, float], width: int) -> str:
+        """Render a progress bar visualization."""
+        total_agents = progress_info['total_agents']
+        active_agents = progress_info['active_agents']
+        completed_agents = progress_info['completed_agents']
+
+        # Calculate the number of characters for each category
+        total_chars = width - 2  # Leave space for borders
+        if total_chars <= 0:
+            return ""
+
+        completed_chars = int((completed_agents / total_agents) * total_chars) if total_agents > 0 else 0
+        active_chars = int((active_agents / total_agents) * total_chars) if total_agents > 0 else 0
+
+        # Make sure we don't exceed the total width
+        active_chars = min(active_chars, total_chars - completed_chars)
+
+        # Create the progress bar
+        bar = "[" + "=" * completed_chars + ">" * active_chars
+        remaining = total_chars - completed_chars - active_chars
+        bar += " " * remaining + "]"
+
+        # Add labels
+        label = f" Progress: {completed_agents}/{total_agents} agents completed "
+        # Truncate label if it's too long
+        if len(label) > width:
+            label = label[:width]
+
+        return f"{label}{bar}"
 
     def _draw_help_modal(self) -> None:
         """Draw a centered modal overlay window showing keyboard shortcuts and GUI controls."""
@@ -2914,6 +3135,7 @@ class Display:
             shortcuts = [
                 ("Tab/Shift-Tab", "Select the next / previous expandable panel"),
                 ("Enter", "Expand or collapse the selected panel"),
+                ("Click / wheel", "Click a panel to expand it; wheel scrolls it"),
                 ("1 - 6", "Expand / collapse Agent 1..6 panel full-screen"),
                 ("f / F", "Expand / collapse Final Answer & Outcome panel"),
                 ("m / M", "Expand / collapse Code Monitor panel"),
@@ -2939,6 +3161,7 @@ class Display:
             ("Retry status", "Shows '↻ retrying' when agents are retrying"),
             ("Rate limits", "Shows '⏳ rate limited' when agents are waiting"),
             ("Activity feed", "Live work events in each active agent's panel"),
+            ("DIBS claims", "Agent panel subtitle shows latest DIBS: ownership claim"),
         ]
 
         available_rows = max(1, modal_h - 3)
@@ -2990,11 +3213,19 @@ class Display:
         """Show one panel full-size with its complete content, in place of the normal dashboard."""
         top = 5
         height = content_height - top - 2
+        close_btn = " ✕ CLOSE " if self.touch_mode else " ✕ ESC "
+        close_x = w - len(close_btn) - 3
+        if close_x > 25:
+            self._put(top, close_x, close_btn, curses.color_pair(4) | curses.A_REVERSE | curses.A_BOLD)
+            self.hitboxes["close"] = (top, close_x, top, close_x + len(close_btn) - 1)
+
         by_name = {name: (icon, curses.color_pair(color_num), subtitle)
                   for name, icon, subtitle, color_num in self.AGENTS}
         if self.expanded in by_name:
             icon, color, subtitle = by_name[self.expanded]
-            self._agent_panel(top, 1, height, w - 2, self.expanded, icon, subtitle, color)
+            claim = extract_dibs(self.session.turns).get(self.expanded)
+            panel_sub = f"DIBS: {claim}" if claim else subtitle
+            self._agent_panel(top, 1, height, w - 2, self.expanded, icon, panel_sub, color)
         elif self.expanded == "Console":
             color = curses.color_pair(1)
             self._box(top, 1, height, w - 2, color)
@@ -3004,10 +3235,23 @@ class Display:
             available = max(1, height - 3)
             offset = min(self.scroll.get("Console", 0), max(0, filtered_logs - available))
             self.scroll["Console"] = offset
+            if offset == 0:
+                unread = getattr(self, "unread", None)
+                if unread is not None:
+                    unread["Console"] = 0
             scroll_label = f" · ↑{offset}" if offset else ""
+            unread_count = getattr(self, "unread", {}).get("Console", 0) if offset else 0
+            unread_label = f" · +{unread_count} new" if unread_count else ""
             count_suffix = f" ({filtered_logs}/{total_logs})" if filtered_logs < total_logs else (f" ({total_logs})" if total_logs else "")
-            exp_title = f" »  CONSOLE (expanded) · {label}{count_suffix}{scroll_label} "
+            exp_title = (
+                f" »  CONSOLE (expanded) · {label}{count_suffix}{scroll_label}{unread_label} ")
             self._put(top, 3, exp_title[:max(0, w - 6)], color | curses.A_BOLD)
+            filter_pos = exp_title.find(label)
+            if filter_pos != -1:
+                fx = 3 + filter_pos
+                fw = len(label)
+                if fx + fw <= (close_x - 2 if close_x > 25 else w - 4):
+                    self.hitboxes["console_filter"] = (top, fx, top, fx + fw - 1)
             end = filtered_logs - offset if offset else filtered_logs
             for row, (kind, text) in enumerate(filtered[max(0, end - available):end]):
                 glyph = CONSOLE_KIND_GLYPH.get(kind, "·")
@@ -4157,8 +4401,14 @@ def synthesize(session: Session, order: list[tuple[str, Agent]],
     for index, (name, agent) in enumerate(order):
         verb = "drafting" if index == 0 else "refining"
         status([name], f"{name} is {verb} the final answer")
-        prompt = (final_prompt(session.objective, session.turns, followup, history) if index == 0 else
-                  refine_prompt(session.objective, session.turns, draft, followup, history))
+        prompt = (
+            final_prompt(
+                session.objective, session.turns, followup, history, speaker=name
+            ) if index == 0 else
+            refine_prompt(
+                session.objective, session.turns, draft, followup, history, speaker=name
+            )
+        )
         log_prompt(name, prompt)
         # Pass a fresh Event explicitly rather than relying on agent.cancel_event: a prior phase's
         # task_status_check cancellation could otherwise leave that attribute already set, which
@@ -4198,7 +4448,9 @@ def run_dead_code_check(session: Session, name: str, agent: Agent,
     proceeds without this check, the same way a failed refinement pass does in synthesize().
     """
     status([name], f"{name} is checking for dead code")
-    prompt = dead_code_check_prompt(session.objective, session.turns, transcript(session.turns))
+    prompt = dead_code_check_prompt(
+        session.objective, session.turns, transcript(session.turns), speaker=name
+    )
     log_prompt(name, prompt)
     try:
         content = _run_with_retry(
@@ -4514,6 +4766,9 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
                 reviews_after_complete -= 1
             if asking_vote_this_round:
                 review_vote_pending = False
+                # Surface the per-agent tally before acting: previously the majority decided
+                # silently and operators had to re-read every turn to see who voted what.
+                estimated_status([], format_restart_vote_summary(session.turns, phase))
                 if tally_restart_votes(session.turns, phase) == "now":
                     checkpoint()
                 else:
@@ -4638,6 +4893,7 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
         return 0
     except SelfRestartRequired:
         preserve_prompt_board = True
+        session.restart_count += 1
         paths = save_session(session, Path(args.output_dir))
         ui.log(f"Source changed; restarting from {paths[0]}", kind="info")
         curses.endwin()
@@ -4685,10 +4941,23 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
 def verify_clis(mock: bool) -> None:
     if mock:
         return
-    missing = [name for name in ("codex", "claude", "agy", "aider", "grok", "qwen")
-              if not shutil.which(name)]
+    missing = [executable for executable in AGENT_EXECUTABLES.values() if not shutil.which(executable)]
     if missing:
         raise SystemExit(f"Missing required CLI(s): {', '.join(missing)}")
+
+
+def list_agents() -> str:
+    """Report which of the six known AI CLIs are actually installed on this machine.
+
+    Uses the same AGENT_EXECUTABLES lookup as verify_clis/log_run_context so this can never
+    disagree with what a real (non-mock) run actually requires or records.
+    """
+    lines = []
+    for name in AGENT_NAMES:
+        executable = AGENT_EXECUTABLES[name]
+        path = shutil.which(executable)
+        lines.append(f"{name:<11} {executable:<7} {path if path else 'not found'}")
+    return "\n".join(lines)
 
 
 def positive_finite_float(value: str) -> float:
@@ -4930,12 +5199,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--debug", action="store_true",
                         help="enable verbose diagnostic logging of agent sub-processes, PIDs, exit codes, and tracebacks")
     parser.add_argument("--mock", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--list-agents", action="store_true",
+                        help="print which of the six known AI CLIs (the other agents in the "
+                             "roundtable) are installed on this machine, then exit without "
+                             "starting a session")
     return parser
 
 
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    if args.list_agents:
+        print(list_agents())
+        return 0
     args.touch_mode = has_touchscreen() if args.touch is None else args.touch
     # A --self restart already carries the flags the user chose before the edit (restart_arguments
     # rebuilds the full invocation from args), so re-showing the toggle screen here would just be an
@@ -5108,6 +5384,7 @@ def main() -> int:
                 f"turns={len(session.turns)} final_chars={len(session.final)}")
         except SelfRestartRequired:
             preserve_prompt_board = True
+            session.restart_count += 1
             paths = save_session(session, Path(args.output_dir))
             run_log.write("info", f"Source changed; restarting from {paths[0]}")
             try:
