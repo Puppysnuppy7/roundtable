@@ -46,6 +46,20 @@ them yourself per each vendor's own instructions. `--skip-clis` links only the `
 `--only Codex Aider ...` restricts CLI installation to specific agents; `--dry-run` prints what
 would happen without changing anything. All still need authenticating after install — see below.
 
+The installer is platform-aware, not x86_64-only: it detects the OS and CPU architecture and
+prints them up front, symlinks where the platform supports it and falls back to a plain file copy
+where it doesn't (e.g. Windows without developer mode), and flags a CLI install it's about to
+attempt when that package has no verified prebuilt binary for the detected architecture (checked
+against each npm package's own `optionalDependencies`) instead of letting an opaque failure happen
+partway through. Concretely: Codex and Claude Code both publish `linux-arm64`/`darwin-arm64`
+binaries, so they install cleanly on 64-bit Arm (e.g. a 64-bit Raspberry Pi OS); neither publishes a
+32-bit Arm build, so this warns and skips attempting them there. Qwen Code depends on a native
+module with no `linux-arm64` prebuild, so an aarch64 Linux install is flagged as unverified and may
+need to compile from source. Aider is pure Python and installs the same way everywhere. On Windows,
+the script still links/copies `roundtable` and reports CLI status, but warns that actually running
+roundtable's GUI needs the third-party `windows-curses` package, which this installer does not
+manage.
+
 ## Run it
 
 All six CLIs must already be installed and authenticated (`codex`, `claude`, `agy`, `aider`, `grok`,

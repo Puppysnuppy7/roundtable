@@ -64,6 +64,17 @@ class InstallTests(unittest.TestCase):
             self.assertIn("would link", message)
             self.assertFalse(bin_dir.exists())
 
+    def test_install_roundtable_symlink_falls_back_to_copy_when_symlinks_unsupported(self):
+        with tempfile.TemporaryDirectory() as td:
+            bin_dir = Path(td) / "bin"
+            with mock.patch.object(Path, "symlink_to", side_effect=OSError("no symlink support")):
+                message = install.install_roundtable_symlink(bin_dir, dry_run=False)
+            target = bin_dir / "roundtable"
+            self.assertFalse(target.is_symlink())
+            self.assertTrue(target.is_file())
+            self.assertEqual(target.read_bytes(), (install.REPO_ROOT / "roundtable.py").read_bytes())
+            self.assertIn("copied", message)
+
     def test_install_cli_reports_already_installed_without_running_anything(self):
         with mock.patch.object(install.shutil, "which", return_value="/usr/bin/codex"), \
              mock.patch.object(install.subprocess, "run") as run:
@@ -74,8 +85,51 @@ class InstallTests(unittest.TestCase):
     def test_install_cli_reports_no_automated_installer_for_agy_and_grok(self):
         with mock.patch.object(install.shutil, "which", return_value=None):
             for name, executable in (("Antigravity", "agy"), ("Grok", "grok")):
-                message = install.install_cli(name, executable, dry_run=False)
+                message = install.install_cli(name, executable, dry_run=False,
+                                               current=("linux", "x86_64"))
                 self.assertIn("no automated installer", message)
+
+    def test_install_cli_grok_caveat_only_shown_off_x86_64(self):
+        with mock.patch.object(install.shutil, "which", return_value=None):
+            on_x64 = install.install_cli("Grok", "grok", dry_run=False, current=("linux", "x86_64"))
+            on_arm = install.install_cli("Grok", "grok", dry_run=False, current=("linux", "arm64"))
+        self.assertNotIn("observed shipping", on_x64)
+        self.assertIn("observed shipping", on_arm)
+
+    def test_current_platform_normalizes_known_architectures(self):
+        cases = {
+            "x86_64": "x86_64", "AMD64": "x86_64",
+            "aarch64": "arm64", "arm64": "arm64",
+            "armv7l": "arm32", "armv6l": "arm32",
+        }
+        for machine, expected_arch in cases.items():
+            with mock.patch.object(install.platform, "machine", return_value=machine):
+                _system, arch = install.current_platform()
+                self.assertEqual(arch, expected_arch, machine)
+
+    def test_npm_arch_support_only_covers_npm_installed_clis(self):
+        npm_executables = {executable for executable, req in install.CLI_INSTALLER_REQUIRES.items()
+                           if req == "npm"}
+        self.assertEqual(set(install.NPM_ARCH_SUPPORT), npm_executables)
+
+    def test_install_cli_flags_unsupported_architecture_but_still_attempts(self):
+        def fake_which(name):
+            return "/usr/bin/npm" if name == "npm" else None
+        with mock.patch.object(install.shutil, "which", side_effect=fake_which), \
+             mock.patch.object(install.subprocess, "run") as run:
+            message = install.install_cli("Qwen", "qwen", dry_run=False,
+                                          current=("linux", "arm64"))
+        run.assert_called_once()
+        self.assertIn("no verified prebuilt binary", message)
+
+    def test_install_cli_no_architecture_warning_when_supported(self):
+        def fake_which(name):
+            return "/usr/bin/npm" if name == "npm" else None
+        with mock.patch.object(install.shutil, "which", side_effect=fake_which), \
+             mock.patch.object(install.subprocess, "run"):
+            message = install.install_cli("Codex", "codex", dry_run=False,
+                                          current=("linux", "arm64"))
+        self.assertNotIn("no verified prebuilt binary", message)
 
     def test_install_cli_reports_missing_requirement_without_running_installer(self):
         def fake_which(name):
@@ -131,6 +185,32 @@ class InstallTests(unittest.TestCase):
             self.assertIn("Codex", body)
             self.assertIn("Aider", body)
             self.assertNotIn("Grok", body)
+
+    def test_main_prints_detected_platform_banner(self):
+        with tempfile.TemporaryDirectory() as td:
+            bin_dir = Path(td) / "bin"
+            printed = []
+            with mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
+                install.main(["--bin-dir", str(bin_dir), "--skip-clis", "--dry-run"])
+            self.assertTrue(any(line.startswith("Detected platform: ") for line in printed))
+
+    def test_main_warns_on_arm32(self):
+        with tempfile.TemporaryDirectory() as td:
+            bin_dir = Path(td) / "bin"
+            printed = []
+            with mock.patch.object(install, "current_platform", return_value=("linux", "arm32")), \
+                 mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
+                install.main(["--bin-dir", str(bin_dir), "--skip-clis", "--dry-run"])
+            self.assertTrue(any("32-bit ARM" in line for line in printed))
+
+    def test_main_warns_on_windows(self):
+        with tempfile.TemporaryDirectory() as td:
+            bin_dir = Path(td) / "bin"
+            printed = []
+            with mock.patch.object(install, "current_platform", return_value=("windows", "x86_64")), \
+                 mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
+                install.main(["--bin-dir", str(bin_dir), "--skip-clis", "--dry-run"])
+            self.assertTrue(any("curses" in line for line in printed))
 
     def test_main_skip_clis_only_links_roundtable(self):
         with tempfile.TemporaryDirectory() as td:
