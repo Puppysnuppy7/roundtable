@@ -78,21 +78,23 @@ class InstallTests(unittest.TestCase):
     def test_install_cli_reports_already_installed_without_running_anything(self):
         with mock.patch.object(install.shutil, "which", return_value="/usr/bin/codex"), \
              mock.patch.object(install.subprocess, "run") as run:
-            message = install.install_cli("Codex", "codex", dry_run=False)
+            message, ok = install.install_cli("Codex", "codex", dry_run=False)
         run.assert_not_called()
         self.assertIn("already installed", message)
+        self.assertTrue(ok)
 
     def test_install_cli_reports_no_automated_installer_for_agy_and_grok(self):
         with mock.patch.object(install.shutil, "which", return_value=None):
             for name, executable in (("Antigravity", "agy"), ("Grok", "grok")):
-                message = install.install_cli(name, executable, dry_run=False,
-                                               current=("linux", "x86_64"))
+                message, ok = install.install_cli(name, executable, dry_run=False,
+                                                  current=("linux", "x86_64"))
                 self.assertIn("no automated installer", message)
+                self.assertTrue(ok)  # informational, not a hard failure
 
     def test_install_cli_grok_caveat_only_shown_off_x86_64(self):
         with mock.patch.object(install.shutil, "which", return_value=None):
-            on_x64 = install.install_cli("Grok", "grok", dry_run=False, current=("linux", "x86_64"))
-            on_arm = install.install_cli("Grok", "grok", dry_run=False, current=("linux", "arm64"))
+            on_x64, _ = install.install_cli("Grok", "grok", dry_run=False, current=("linux", "x86_64"))
+            on_arm, _ = install.install_cli("Grok", "grok", dry_run=False, current=("linux", "arm64"))
         self.assertNotIn("observed shipping", on_x64)
         self.assertIn("observed shipping", on_arm)
 
@@ -117,37 +119,41 @@ class InstallTests(unittest.TestCase):
             return "/usr/bin/npm" if name == "npm" else None
         with mock.patch.object(install.shutil, "which", side_effect=fake_which), \
              mock.patch.object(install.subprocess, "run") as run:
-            message = install.install_cli("Qwen", "qwen", dry_run=False,
-                                          current=("linux", "arm64"))
+            message, ok = install.install_cli("Qwen", "qwen", dry_run=False,
+                                              current=("linux", "arm64"))
         run.assert_called_once()
         self.assertIn("no verified prebuilt binary", message)
+        self.assertTrue(ok)  # attempt succeeded (mocked); arch note is informational
 
     def test_install_cli_no_architecture_warning_when_supported(self):
         def fake_which(name):
             return "/usr/bin/npm" if name == "npm" else None
         with mock.patch.object(install.shutil, "which", side_effect=fake_which), \
              mock.patch.object(install.subprocess, "run"):
-            message = install.install_cli("Codex", "codex", dry_run=False,
-                                          current=("linux", "arm64"))
+            message, ok = install.install_cli("Codex", "codex", dry_run=False,
+                                              current=("linux", "arm64"))
         self.assertNotIn("no verified prebuilt binary", message)
+        self.assertTrue(ok)
 
     def test_install_cli_reports_missing_requirement_without_running_installer(self):
         def fake_which(name):
             return None if name in ("codex", "npm") else f"/usr/bin/{name}"
         with mock.patch.object(install.shutil, "which", side_effect=fake_which), \
              mock.patch.object(install.subprocess, "run") as run:
-            message = install.install_cli("Codex", "codex", dry_run=False)
+            message, ok = install.install_cli("Codex", "codex", dry_run=False)
         run.assert_not_called()
         self.assertIn("needs `npm`", message)
+        self.assertFalse(ok)
 
     def test_install_cli_dry_run_does_not_invoke_subprocess(self):
         def fake_which(name):
             return None if name == "codex" else f"/usr/bin/{name}"
         with mock.patch.object(install.shutil, "which", side_effect=fake_which), \
              mock.patch.object(install.subprocess, "run") as run:
-            message = install.install_cli("Codex", "codex", dry_run=True)
+            message, ok = install.install_cli("Codex", "codex", dry_run=True)
         run.assert_not_called()
         self.assertIn("would run", message)
+        self.assertTrue(ok)
 
     def test_install_cli_runs_installer_and_reports_success(self):
         which_calls = []
@@ -162,9 +168,10 @@ class InstallTests(unittest.TestCase):
 
         with mock.patch.object(install.shutil, "which", side_effect=fake_which), \
              mock.patch.object(install.subprocess, "run") as run:
-            message = install.install_cli("Codex", "codex", dry_run=False)
+            message, ok = install.install_cli("Codex", "codex", dry_run=False)
         run.assert_called_once_with(["npm", "install", "-g", "@openai/codex"], check=True)
         self.assertIn("installed", message)
+        self.assertTrue(ok)
 
     def test_install_cli_reports_subprocess_failure(self):
         def fake_which(name):
@@ -172,8 +179,9 @@ class InstallTests(unittest.TestCase):
         with mock.patch.object(install.shutil, "which", side_effect=fake_which), \
              mock.patch.object(install.subprocess, "run",
                                side_effect=install.subprocess.CalledProcessError(1, "npm")):
-            message = install.install_cli("Codex", "codex", dry_run=False)
+            message, ok = install.install_cli("Codex", "codex", dry_run=False)
         self.assertIn("install failed", message)
+        self.assertFalse(ok)
 
     def test_main_only_flag_restricts_cli_installs(self):
         with tempfile.TemporaryDirectory() as td:
@@ -220,6 +228,33 @@ class InstallTests(unittest.TestCase):
                 install.main(["--bin-dir", str(bin_dir), "--skip-clis"])
             self.assertTrue((bin_dir / "roundtable").is_symlink())
             self.assertFalse(any("already installed" in line or "not found" in line for line in printed))
+
+    def test_main_returns_nonzero_when_cli_install_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            bin_dir = Path(td) / "bin"
+
+            def fake_install_cli(name, executable, dry_run, current=None):
+                if executable == "codex":
+                    return f"{name} install failed: boom", False
+                return f"{name} already installed (/bin/{executable})", True
+
+            with mock.patch.object(install, "install_cli", side_effect=fake_install_cli), \
+                 mock.patch("builtins.print"):
+                result = install.main(["--bin-dir", str(bin_dir), "--only", "Codex", "Aider"])
+            self.assertEqual(result, 1)
+
+    def test_main_returns_zero_when_only_informational_missing_clis(self):
+        """agy/grok with no installer must not make the whole install fail."""
+        with tempfile.TemporaryDirectory() as td:
+            bin_dir = Path(td) / "bin"
+
+            def fake_install_cli(name, executable, dry_run, current=None):
+                return f"{name} not found -- no automated installer here", True
+
+            with mock.patch.object(install, "install_cli", side_effect=fake_install_cli), \
+                 mock.patch("builtins.print"):
+                result = install.main(["--bin-dir", str(bin_dir), "--only", "Grok"])
+            self.assertEqual(result, 0)
 
 
 if __name__ == "__main__":

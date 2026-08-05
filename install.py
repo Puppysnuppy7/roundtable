@@ -131,35 +131,40 @@ def install_roundtable_symlink(bin_dir: Path, dry_run: bool) -> str:
 
 
 def install_cli(name: str, executable: str, dry_run: bool,
-                current: tuple[str, str] | None = None) -> str:
-    """Ensure one agent's CLI is installed; return a one-line status message."""
+                current: tuple[str, str] | None = None) -> tuple[str, bool]:
+    """Ensure one agent's CLI is installed.
+
+    Returns (status_message, ok). ok is False when an install was attempted and failed, or when
+    the required package manager is missing so a needed auto-install cannot run. Informational
+    "no automated installer" cases (agy/grok) are ok=True -- they are not failures of this script.
+    """
     found = shutil.which(executable)
     if found:
-        return f"{name:<11} {executable:<7} already installed ({found})"
+        return f"{name:<11} {executable:<7} already installed ({found})", True
     current = current or current_platform()
     command = CLI_INSTALLERS.get(executable)
     if command is None:
         caveat = NO_INSTALLER_ARCH_CAVEATS.get(executable)
         note = f" ({caveat})" if caveat and current[1] != _X64 else ""
         return (f"{name:<11} {executable:<7} not found -- no automated installer here; "
-                 f"install it yourself per the vendor's own instructions{note}")
+                 f"install it yourself per the vendor's own instructions{note}", True)
     requirement = CLI_INSTALLER_REQUIRES.get(executable)
     if requirement and not shutil.which(requirement):
         return (f"{name:<11} {executable:<7} not found -- needs `{requirement}` on PATH to "
-                 f"auto-install; once available run: {' '.join(command)}")
+                 f"auto-install; once available run: {' '.join(command)}", False)
     supported = NPM_ARCH_SUPPORT.get(executable)
     arch_note = ""
     if supported is not None and current not in supported:
         arch_note = f" [no verified prebuilt binary for {current[0]}-{current[1]}; may fail]"
     if dry_run:
-        return f"{name:<11} {executable:<7} would run: {' '.join(command)}{arch_note}"
+        return f"{name:<11} {executable:<7} would run: {' '.join(command)}{arch_note}", True
     try:
         subprocess.run(command, check=True)
     except (subprocess.CalledProcessError, OSError) as exc:
-        return f"{name:<11} {executable:<7} install failed: {exc}{arch_note}"
+        return f"{name:<11} {executable:<7} install failed: {exc}{arch_note}", False
     found_after = shutil.which(executable)
     status = found_after if found_after else "not on PATH yet -- open a new shell"
-    return f"{name:<11} {executable:<7} installed ({status}){arch_note}"
+    return f"{name:<11} {executable:<7} installed ({status}){arch_note}", True
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -200,9 +205,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     print()
+    any_failed = False
     for name in (args.only or AGENT_NAMES):
-        print(install_cli(name, AGENT_EXECUTABLES[name], args.dry_run, current=current))
-    return 0
+        message, ok = install_cli(
+            name, AGENT_EXECUTABLES[name], args.dry_run, current=current)
+        print(message)
+        if not ok:
+            any_failed = True
+    return 1 if any_failed else 0
 
 
 if __name__ == "__main__":
