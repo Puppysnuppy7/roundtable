@@ -24,10 +24,20 @@ import subprocess
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from roundtable import AGENT_EXECUTABLES, AGENT_NAMES  # noqa: E402
-
 REPO_ROOT = Path(__file__).resolve().parent
+
+# Keep this small manifest local: importing roundtable.py would import curses, which is absent from
+# the Python standard-library build on Windows -- exactly where this installer must still be able to
+# start and explain that limitation. test_install.py checks this stays in sync with roundtable.
+AGENT_EXECUTABLES: dict[str, str] = {
+    "Codex": "codex",
+    "Claude": "claude",
+    "Antigravity": "agy",
+    "Aider": "aider",
+    "Grok": "grok",
+    "Qwen": "qwen",
+}
+AGENT_NAMES: tuple[str, ...] = tuple(AGENT_EXECUTABLES)
 
 # Verified install commands, keyed by the executable name (AGENT_EXECUTABLES's values).
 # None means: no automated installer available -- report status only, never invent one.
@@ -104,25 +114,110 @@ def default_bin_dir() -> Path:
     return preferred
 
 
-def install_roundtable_symlink(bin_dir: Path, dry_run: bool) -> str:
-    """Link roundtable.py onto bin_dir as `roundtable`, executable.
+# Distinctive marker used to recognize a prior *copy* install of roundtable.py so a later
+# re-run can refresh it without --force (the copy-fallback message invites exactly that).
+_ROUNDTABLE_COPY_MARKER = (
+    "Roundtable: a dependency-free terminal UI for collaborating coding agents."
+)
 
-    Symlinks where the platform allows it (every POSIX system); falls back to a plain copy where
-    it doesn't (e.g. Windows without developer mode / admin rights), since a copy still works, it
-    just needs re-running after a future `git pull` to pick up source changes.
+
+def _windows_launcher(source: Path) -> str:
+    """A cmd.exe launcher for an arbitrary Python/source path, including spaces and `%`."""
+    python = str(Path(sys.executable).resolve()).replace("%", "%%")
+    script = str(source).replace("%", "%%")
+    return f'@"{python}" "{script}" %*\r\n'
+
+
+def _is_our_windows_launcher(target: Path, launcher: str) -> bool:
+    """True when target is this installer's .cmd shim (current or stale python/script path)."""
+    if not target.is_file():
+        return False
+    try:
+        text = target.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    if text == launcher:
+        return True
+    # Stale shim we wrote earlier: still points at some roundtable.py.
+    stripped = text.lstrip("\ufeff").lstrip()
+    return stripped.startswith("@") and "roundtable.py" in text
+
+
+def _is_our_posix_install(target: Path, source: Path) -> bool:
+    """True when target is our symlink or a prior copy of roundtable.py."""
+    if target.is_symlink():
+        try:
+            return target.resolve() == source.resolve()
+        except OSError:
+            return False
+    if not target.is_file():
+        return False
+    try:
+        data = target.read_bytes()
+    except OSError:
+        return False
+    try:
+        if data == source.read_bytes():
+            return True
+    except OSError:
+        return False
+    # Stale copy from an older checkout: still our file if it carries the module docstring.
+    try:
+        head = data[:800].decode("utf-8", errors="replace")
+    except Exception:
+        return False
+    return head.startswith("#!/usr/bin/env python3") and _ROUNDTABLE_COPY_MARKER in head
+
+
+def install_roundtable_symlink(bin_dir: Path, dry_run: bool, force: bool = False,
+                               current: tuple[str, str] | None = None) -> str:
+    """Install roundtable.py onto PATH as `roundtable` (or `roundtable.cmd` on Windows).
+
+    POSIX uses a symlink and falls back to a copy if symlinks are unavailable. Windows gets a
+    `.cmd` shim because cmd.exe does not execute extensionless shebang scripts from PATH. Existing
+    unrelated commands are preserved unless --force was explicitly supplied. A prior install that
+    this script itself created (symlink, matching .cmd launcher, or copy of roundtable.py) is
+    refreshed without --force so `python3 install.py` stays idempotent across updates.
     """
     source = REPO_ROOT / "roundtable.py"
-    target = bin_dir / "roundtable"
+    is_windows = (current or current_platform())[0] == "windows"
+    target = bin_dir / ("roundtable.cmd" if is_windows else "roundtable")
+    launcher = _windows_launcher(source) if is_windows else None
     if dry_run:
-        return f"would link {target} -> {source}"
+        action = "write launcher" if is_windows else "link"
+        return f"would {action} {target} -> {source}"
     bin_dir.mkdir(parents=True, exist_ok=True)
-    if target.is_symlink() and target.resolve() == source.resolve():
+    if is_windows and launcher is not None and _is_our_windows_launcher(target, launcher):
+        if target.is_file() and target.read_text(encoding="utf-8", errors="replace") == launcher:
+            return f"already installed: {target} -> {source}"
+        target.write_text(launcher, encoding="utf-8", newline="")
+        return f"updated launcher {target} -> {source}"
+    if not is_windows and target.is_symlink() and _is_our_posix_install(target, source):
         return f"already linked: {target} -> {source}"
-    if target.is_symlink() or target.exists():
+    if not is_windows and not target.is_symlink() and _is_our_posix_install(target, source):
+        try:
+            if target.read_bytes() == source.read_bytes():
+                return f"already installed: {target} (copy of {source})"
+        except OSError:
+            pass
+        # Stale copy -- refresh in place (still our install; no --force required).
+        source.chmod(source.stat().st_mode | 0o111)
+        shutil.copy2(source, target)
+        target.chmod(target.stat().st_mode | 0o111)
+        return f"updated copy {source} -> {target}"
+    if target.exists() or target.is_symlink():
+        if target.is_dir():
+            raise IsADirectoryError(f"refusing to replace directory: {target}")
+        if not force:
+            raise FileExistsError(
+                f"refusing to replace existing command: {target} (pass --force to replace it)")
         target.unlink()
+    if is_windows:
+        target.write_text(launcher, encoding="utf-8", newline="")
+        return f"installed launcher {target} -> {source}"
+    source.chmod(source.stat().st_mode | 0o111)
     try:
         target.symlink_to(source)
-        source.chmod(source.stat().st_mode | 0o111)
         return f"linked {target} -> {source}"
     except OSError:
         shutil.copy2(source, target)
@@ -180,6 +275,8 @@ def build_parser() -> argparse.ArgumentParser:
                              f"(choices: {', '.join(AGENT_NAMES)})")
     parser.add_argument("--dry-run", action="store_true",
                         help="print what would happen without changing anything")
+    parser.add_argument("--force", action="store_true",
+                        help="replace an existing roundtable command in --bin-dir")
     return parser
 
 
@@ -196,7 +293,12 @@ def main(argv: list[str] | None = None) -> int:
               "be installable here even though the commands below will be attempted.")
 
     bin_dir = args.bin_dir or default_bin_dir()
-    print(install_roundtable_symlink(bin_dir, args.dry_run))
+    try:
+        print(install_roundtable_symlink(
+            bin_dir, args.dry_run, force=args.force, current=current))
+    except (FileExistsError, IsADirectoryError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     path_dirs = os.environ.get("PATH", "").split(os.pathsep)
     if str(bin_dir) not in path_dirs:
         print(f"warning: {bin_dir} is not on PATH -- add it to your shell profile")

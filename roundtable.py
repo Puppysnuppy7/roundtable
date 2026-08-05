@@ -3,6 +3,36 @@
 
 from __future__ import annotations
 
+import sys
+
+
+def _run_install_from_cli(argv: list[str] | None = None) -> int:
+    """Run install.py without importing the rest of this module.
+
+    Stock Windows Python has no stdlib `curses`, so `import roundtable` fails there even though
+    `install.py` deliberately avoids that import. When this file is executed as a script with
+    `--install`, dispatch here first so `python3 roundtable.py --install` works on the same
+    platforms as `python3 install.py`. Extra argv after stripping `--install` is forwarded.
+    """
+    import importlib.util
+    from pathlib import Path
+
+    args = list(sys.argv[1:] if argv is None else argv)
+    install_argv = [a for a in args if a != "--install"]
+    install_path = Path(__file__).resolve().parent / "install.py"
+    spec = importlib.util.spec_from_file_location("_roundtable_install", install_path)
+    if spec is None or spec.loader is None:
+        print(f"error: cannot load installer at {install_path}", file=sys.stderr)
+        return 1
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return int(module.main(install_argv))
+
+
+# Must run before `import curses` so stock Windows Python can still install.
+if __name__ == "__main__" and "--install" in sys.argv[1:]:
+    raise SystemExit(_run_install_from_cli())
+
 import argparse
 import contextlib
 import curses
@@ -16,7 +46,6 @@ import re
 import shutil
 import signal
 import subprocess
-import sys
 import tempfile
 import textwrap
 import threading
@@ -5203,12 +5232,20 @@ def build_parser() -> argparse.ArgumentParser:
                         help="print which of the six known AI CLIs (the other agents in the "
                              "roundtable) are installed on this machine, then exit without "
                              "starting a session")
+    parser.add_argument("--install", action="store_true",
+                        help="run the universal installer script (install.py) to link the "
+                             "roundtable command onto PATH and install available agent CLIs, then exit")
     return parser
 
 
 def main() -> int:
     parser = build_parser()
-    args = parser.parse_args()
+    args, remaining = parser.parse_known_args()
+    if args.install:
+        import install
+        return install.main(remaining)
+    if remaining:
+        parser.error(f"unrecognized arguments: {' '.join(remaining)}")
     if args.list_agents:
         print(list_agents())
         return 0

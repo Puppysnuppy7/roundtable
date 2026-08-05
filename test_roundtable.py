@@ -2829,10 +2829,46 @@ class RoundtableTests(unittest.TestCase):
             for action in parser._actions
             if isinstance(action, roundtable.argparse._StoreTrueAction)
             and action.help != roundtable.argparse.SUPPRESS
-            and action.dest not in ("plain", "list_agents")
+            and action.dest not in ("plain", "list_agents", "install")
         }
         toggle_names = {name for name, _ in roundtable.OPTION_TOGGLES}
         self.assertTrue(parser_flags <= toggle_names, f"Missing toggles for: {parser_flags - toggle_names}")
+
+    def test_install_flag_invokes_installer_main(self):
+        with mock.patch("install.main", return_value=0) as mock_install_main, \
+             mock.patch("sys.argv", ["roundtable", "--install"]):
+            exit_code = roundtable.main()
+            self.assertEqual(exit_code, 0)
+            mock_install_main.assert_called_once_with([])
+
+    def test_install_flag_forwards_installer_arguments(self):
+        with mock.patch("install.main", return_value=0) as mock_install_main, \
+             mock.patch("sys.argv", ["roundtable", "--install", "--dry-run", "--skip-clis"]):
+            exit_code = roundtable.main()
+            self.assertEqual(exit_code, 0)
+            mock_install_main.assert_called_once_with(["--dry-run", "--skip-clis"])
+
+    def test_install_cli_entry_is_defined_before_curses_import(self):
+        """`python3 roundtable.py --install` must not require curses (stock Windows)."""
+        source = Path(roundtable.__file__).read_text(encoding="utf-8")
+        gate = 'if __name__ == "__main__" and "--install" in sys.argv[1:]:'
+        self.assertIn(gate, source)
+        self.assertLess(source.index(gate), source.index("\nimport curses\n"))
+        self.assertIn("def _run_install_from_cli", source)
+        self.assertLess(
+            source.index("def _run_install_from_cli"),
+            source.index("\nimport curses\n"),
+        )
+
+    def test_run_install_from_cli_dry_run_forwards_flags(self):
+        # Same helper the script uses when launched as `python3 roundtable.py --install ...`.
+        with tempfile.TemporaryDirectory() as td:
+            bin_dir = Path(td) / "bin"
+            code = roundtable._run_install_from_cli(
+                ["--install", "--dry-run", "--skip-clis", "--bin-dir", str(bin_dir)])
+            self.assertEqual(code, 0)
+            self.assertFalse(bin_dir.exists())  # dry-run must not create bin_dir
+
 
     def test_self_toggle_flips_workspace_to_roundtables_own_source(self):
         # cwd must differ from roundtable's own source dir, or a broken --self would still resolve

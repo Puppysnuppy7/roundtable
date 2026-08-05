@@ -9,6 +9,10 @@ import roundtable
 
 
 class InstallTests(unittest.TestCase):
+    def test_local_agent_manifest_matches_roundtable_without_requiring_import_at_install_time(self):
+        self.assertEqual(install.AGENT_EXECUTABLES, roundtable.AGENT_EXECUTABLES)
+        self.assertEqual(install.AGENT_NAMES, roundtable.AGENT_NAMES)
+
     def test_cli_installers_and_requires_cover_exactly_the_agent_executables(self):
         executables = set(roundtable.AGENT_EXECUTABLES.values())
         self.assertEqual(set(install.CLI_INSTALLERS), executables)
@@ -74,6 +78,47 @@ class InstallTests(unittest.TestCase):
             self.assertTrue(target.is_file())
             self.assertEqual(target.read_bytes(), (install.REPO_ROOT / "roundtable.py").read_bytes())
             self.assertIn("copied", message)
+
+    def test_install_roundtable_writes_windows_cmd_launcher(self):
+        with tempfile.TemporaryDirectory() as td:
+            bin_dir = Path(td) / "bin"
+            message = install.install_roundtable_symlink(
+                bin_dir, dry_run=False, current=("windows", "x86_64"))
+            target = bin_dir / "roundtable.cmd"
+            self.assertTrue(target.is_file())
+            self.assertIn(str(install.REPO_ROOT / "roundtable.py"), target.read_text())
+            self.assertIn("%*", target.read_text())
+            self.assertIn("installed launcher", message)
+
+    def test_install_roundtable_preserves_unrelated_existing_command_without_force(self):
+        with tempfile.TemporaryDirectory() as td:
+            bin_dir = Path(td) / "bin"
+            bin_dir.mkdir()
+            target = bin_dir / "roundtable"
+            target.write_text("someone else's command")
+            with self.assertRaises(FileExistsError):
+                install.install_roundtable_symlink(
+                    bin_dir, dry_run=False, current=("linux", "x86_64"))
+            self.assertEqual(target.read_text(), "someone else's command")
+
+    def test_install_roundtable_force_replaces_existing_command(self):
+        with tempfile.TemporaryDirectory() as td:
+            bin_dir = Path(td) / "bin"
+            bin_dir.mkdir()
+            target = bin_dir / "roundtable"
+            target.write_text("old command")
+            install.install_roundtable_symlink(
+                bin_dir, dry_run=False, force=True, current=("linux", "x86_64"))
+            self.assertTrue(target.is_symlink())
+
+    def test_install_roundtable_never_replaces_directory(self):
+        with tempfile.TemporaryDirectory() as td:
+            bin_dir = Path(td) / "bin"
+            target = bin_dir / "roundtable"
+            target.mkdir(parents=True)
+            with self.assertRaises(IsADirectoryError):
+                install.install_roundtable_symlink(
+                    bin_dir, dry_run=False, force=True, current=("linux", "x86_64"))
 
     def test_install_cli_reports_already_installed_without_running_anything(self):
         with mock.patch.object(install.shutil, "which", return_value="/usr/bin/codex"), \
@@ -228,6 +273,67 @@ class InstallTests(unittest.TestCase):
                 install.main(["--bin-dir", str(bin_dir), "--skip-clis"])
             self.assertTrue((bin_dir / "roundtable").is_symlink())
             self.assertFalse(any("already installed" in line or "not found" in line for line in printed))
+
+    def test_main_existing_command_returns_failure_and_explains_force(self):
+        with tempfile.TemporaryDirectory() as td:
+            bin_dir = Path(td)
+            (bin_dir / "roundtable").write_text("existing")
+            stderr = []
+            with mock.patch.object(install, "current_platform",
+                                   return_value=("linux", "x86_64")), \
+                 mock.patch("builtins.print") as printed:
+                printed.side_effect = lambda *args, **kwargs: (
+                    stderr.append(" ".join(map(str, args)))
+                    if kwargs.get("file") is install.sys.stderr else None)
+                result = install.main(["--bin-dir", str(bin_dir), "--skip-clis"])
+            self.assertEqual(result, 1)
+            self.assertTrue(any("--force" in line for line in stderr))
+
+    def test_install_roundtable_copy_reinstall_is_idempotent_without_force(self):
+        """Copy-fallback installs must re-run cleanly (message invites re-run after git pull)."""
+        with tempfile.TemporaryDirectory() as td:
+            bin_dir = Path(td) / "bin"
+            with mock.patch.object(Path, "symlink_to", side_effect=OSError("no symlink support")):
+                first = install.install_roundtable_symlink(
+                    bin_dir, dry_run=False, current=("linux", "x86_64"))
+                second = install.install_roundtable_symlink(
+                    bin_dir, dry_run=False, current=("linux", "x86_64"))
+            self.assertIn("copied", first)
+            self.assertIn("already installed", second)
+            target = bin_dir / "roundtable"
+            self.assertTrue(target.is_file())
+            self.assertEqual(target.read_bytes(), (install.REPO_ROOT / "roundtable.py").read_bytes())
+
+    def test_install_roundtable_refreshes_stale_copy_without_force(self):
+        with tempfile.TemporaryDirectory() as td:
+            bin_dir = Path(td) / "bin"
+            bin_dir.mkdir()
+            target = bin_dir / "roundtable"
+            # Minimal stale copy that still carries the recognizable marker.
+            target.write_text(
+                "#!/usr/bin/env python3\n"
+                '"""Roundtable: a dependency-free terminal UI for collaborating coding agents."""\n'
+                "# old\n",
+                encoding="utf-8",
+            )
+            message = install.install_roundtable_symlink(
+                bin_dir, dry_run=False, current=("linux", "x86_64"))
+            self.assertIn("updated copy", message)
+            self.assertEqual(target.read_bytes(), (install.REPO_ROOT / "roundtable.py").read_bytes())
+
+    def test_install_roundtable_updates_stale_windows_launcher_without_force(self):
+        with tempfile.TemporaryDirectory() as td:
+            bin_dir = Path(td) / "bin"
+            bin_dir.mkdir()
+            target = bin_dir / "roundtable.cmd"
+            target.write_text('@ "C:\\OldPython\\python.exe" "C:\\old\\roundtable.py" %*\r\n',
+                              encoding="utf-8", newline="")
+            message = install.install_roundtable_symlink(
+                bin_dir, dry_run=False, current=("windows", "x86_64"))
+            self.assertIn("updated launcher", message)
+            text = target.read_text(encoding="utf-8")
+            self.assertIn("roundtable.py", text)
+            self.assertNotIn("OldPython", text)
 
     def test_main_returns_nonzero_when_cli_install_fails(self):
         with tempfile.TemporaryDirectory() as td:

@@ -35,7 +35,11 @@ python3 install.py
 
 Links `roundtable.py` onto `PATH` as the `roundtable` command (prefers `~/.local/bin` if it's
 already on `PATH`, else the first other writable directory under your home, else creates
-`~/.local/bin`; override with `--bin-dir`), then installs whichever of the six agent CLIs it has a
+`~/.local/bin`; override with `--bin-dir`). On Windows it writes a `roundtable.cmd` launcher so the
+command works with `PATHEXT`; elsewhere it uses a symlink with a copy fallback. An unrelated
+existing command is left untouched unless you pass `--force`; a previous install created by this
+script (symlink, matching `.cmd` shim, or copy of `roundtable.py`) is refreshed in place without
+`--force`. It then installs whichever of the six agent CLIs it has a
 verified command for: `npm install -g @openai/codex` (Codex), `npm install -g
 @anthropic-ai/claude-code` (Claude), `pipx install aider-chat` (Aider), and `npm install -g
 @qwen-code/qwen-code` (Qwen) — each skipped if already on `PATH`, and skipped with an explanation
@@ -44,21 +48,31 @@ publicly documented package-manager install command this script can verify, so f
 only reports whether the CLI is already present rather than guessing an install command; install
 them yourself per each vendor's own instructions. `--skip-clis` links only the `roundtable` command;
 `--only Codex Aider ...` restricts CLI installation to specific agents; `--dry-run` prints what
-would happen without changing anything. All still need authenticating after install — see below.
+would happen without changing anything. Exit status is non-zero if linking fails or any attempted
+CLI auto-install fails (or cannot run because its package manager is missing); missing agy/grok is
+informational and does not fail the install. All still need authenticating after install — see below.
+You can also run `roundtable --install` once the command is already on `PATH` (or
+`python3 roundtable.py --install` from the repo). Extra installer flags after `--install`
+(`--dry-run`, `--skip-clis`, `--only …`, `--bin-dir`, `--force`) are forwarded to
+`install.py`. When `roundtable.py` is launched as a script with `--install`, that path
+runs *before* importing `curses`, so stock Windows Python (no stdlib curses) can still
+install the launcher the same way `python3 install.py` does.
 
 The installer is platform-aware, not x86_64-only: it detects the OS and CPU architecture and
-prints them up front, symlinks where the platform supports it and falls back to a plain file copy
-where it doesn't (e.g. Windows without developer mode), and flags a CLI install it's about to
+prints them up front, uses a native command shim on Windows, symlinks on POSIX and falls back to a
+plain file copy where symlinks are unavailable, and flags a CLI install it's about to
 attempt when that package has no verified prebuilt binary for the detected architecture (checked
 against each npm package's own `optionalDependencies`) instead of letting an opaque failure happen
 partway through. Concretely: Codex and Claude Code both publish `linux-arm64`/`darwin-arm64`
 binaries, so they install cleanly on 64-bit Arm (e.g. a 64-bit Raspberry Pi OS); neither publishes a
-32-bit Arm build, so this warns and skips attempting them there. Qwen Code depends on a native
-module with no `linux-arm64` prebuild, so an aarch64 Linux install is flagged as unverified and may
-need to compile from source. Aider is pure Python and installs the same way everywhere. On Windows,
-the script still links/copies `roundtable` and reports CLI status, but warns that actually running
-roundtable's GUI needs the third-party `windows-curses` package, which this installer does not
-manage.
+32-bit Arm build, so this warns up front on arm32 (installs may still be attempted and then fail).
+Qwen Code depends on a native module with no `linux-arm64` prebuild, so an aarch64 Linux install is
+flagged as unverified and may need to compile from source. Aider is pure Python and installs the
+same way everywhere. On Windows, the script still installs the `roundtable.cmd` launcher and reports
+CLI status, but warns that actually running roundtable's GUI needs the third-party `windows-curses`
+package, which this installer does not manage. The installer deliberately does not `import
+roundtable` (it keeps a small local agent-name manifest, checked by tests against
+`AGENT_EXECUTABLES`) so it can still start on a Windows Python that lacks `curses`.
 
 ## Run it
 
