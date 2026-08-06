@@ -12,9 +12,21 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 from unittest import mock
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import roundtable
+
+# Windows ships no IANA tz database (unlike Linux/macOS, which usually have one on disk already);
+# resolving *any* named zone -- even "UTC" -- needs the third-party `tzdata` package there. This
+# isn't a roundtable.py dependency gap: parse_reset_time() already catches ZoneInfoNotFoundError
+# and safely falls back to None (see its docstring) rather than guessing the wrong offset. It's
+# only these tests, which need a real zone to verify that fallback's counterpart (the case where
+# the name *does* resolve), that can't run without one.
+try:
+    ZoneInfo("UTC")
+    _HAS_TZDATA = True
+except ZoneInfoNotFoundError:
+    _HAS_TZDATA = False
 
 
 class FailingAgent(roundtable.Agent):
@@ -668,6 +680,28 @@ class RoundtableTests(unittest.TestCase):
             title_row = "".join(display.s.grid[top])[left:right + 1]
             self.assertIn(f"↑{display.scroll['Final']}", title_row)
             self.assertIn("TASK OUTCOME", title_row)
+
+    def test_chat_mode_relabels_final_and_code_panels(self):
+        """Chat mode never edits files and its final answer isn't a Completed/Failed task-outcome
+        summary, so both panels must say so instead of showing coding-specific labels/placeholders
+        that would be misleading (or, for Code Monitor, permanently and confusingly empty)."""
+        display = make_test_display(h=48, w=160)
+        display.chat = True
+
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False):
+            display.draw()
+            final_top, final_left, _fb, final_right = display.hitboxes["final"]
+            final_title_row = "".join(display.s.grid[final_top])[final_left:final_right + 1]
+            self.assertIn("FINAL ANSWER", final_title_row)
+            self.assertNotIn("TASK OUTCOME", final_title_row)
+            self.assertIn("The group's discussion will be summarized", display.s.text())
+
+            code_top, code_left, _cb, code_right = display.hitboxes["code"]
+            code_title_row = "".join(display.s.grid[code_top])[code_left:code_right + 1]
+            self.assertIn("CHAT MODE", code_title_row)
+            self.assertNotIn("CODE MONITOR", code_title_row)
+            self.assertNotIn("No file changes yet", display.s.text())
 
     def test_compact_console_title_stays_inside_panel_border(self):
         """At the 72-column floor, long console filter names used to paint over the right border."""
@@ -1989,7 +2023,8 @@ class RoundtableTests(unittest.TestCase):
         args = roundtable.build_parser().parse_args([
             "Goal", "--self", "--plain", "--mock", "-r", "2", "-C", "custom_ws", "--collab", "mixed",
             "--synthesizer", "claude", "--synthesis-passes", "1", "--balance-load",
-            "--task-status-check", "--reassign-idle", "--dead-code-check", "--elevated", "codex",
+            "--task-status-check", "--reassign-idle", "--dead-code-check", "--chat",
+            "--elevated", "codex",
             "--codex-model", "model-a", "--reasoning-effort", "high", "--output-dir", "saved",
         ])
         command = roundtable.restart_arguments(args, Path("saved/session.json"), True)
@@ -1997,7 +2032,7 @@ class RoundtableTests(unittest.TestCase):
         self.assertIn("--continue-after-restart", command)
         self.assertIn("followup", command)
         for option in ("--plain", "--mock", "--balance-load", "--task-status-check",
-                       "--reassign-idle", "--dead-code-check", "--skip-preflight",
+                       "--reassign-idle", "--dead-code-check", "--chat", "--skip-preflight",
                        "--extended-preflight"):
             self.assertIn(option, command)
         self.assertEqual(command[command.index("--collab") + 1], "mixed")
@@ -2443,6 +2478,8 @@ class RoundtableTests(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             roundtable.read_followup_ui(display.s, display)
 
+    @unittest.skipUnless(_HAS_TZDATA, "no IANA tz database available on this platform "
+                                       "(Windows needs the third-party 'tzdata' package)")
     def test_wait_for_agent_availability_formats_reset_time_portably(self):
         agent = roundtable.MockAgent("Codex", Path("/tmp"))
         ticks = []
@@ -3533,6 +3570,8 @@ class RoundtableTests(unittest.TestCase):
         self.assertIn("elevated", roundtable.DANGEROUS_OPTIONS)
         self.assertIn("self", roundtable.DANGEROUS_OPTIONS)
 
+    @unittest.skipUnless(os.name == "posix", "os.chmod(0) doesn't block the owning process from "
+                                              "reading a file on Windows -- ACLs would, mode bits don't")
     def test_create_self_test_sandbox_records_per_file_errors(self):
         """A single unreadable source must not abort the refresh; it is recorded instead."""
         with tempfile.TemporaryDirectory() as workspace_dir, \
@@ -3554,6 +3593,8 @@ class RoundtableTests(unittest.TestCase):
             self.assertEqual((sandbox / "roundtable.py").read_text(), "print('ok')")
             self.assertTrue(any("test_roundtable.py" in msg for msg in errors), errors)
 
+    @unittest.skipUnless(os.name == "posix", "os.chmod(0o555) doesn't block the owning process "
+                                              "from writing on Windows -- ACLs would, mode bits don't")
     def test_create_self_test_sandbox_raises_when_output_not_writable(self):
         with tempfile.TemporaryDirectory() as workspace_dir, \
              tempfile.TemporaryDirectory() as output_dir:
@@ -4365,6 +4406,22 @@ class RoundtableTests(unittest.TestCase):
         self.assertEqual(len(roundtable.ROLE_HINTS_BY_SLOT), len(roundtable.AGENT_NAMES))
         self.assertEqual(len(set(roundtable.ROLE_HINTS_BY_SLOT)), len(roundtable.ROLE_HINTS_BY_SLOT))
 
+    def test_chat_role_hints_by_slot_has_exactly_one_role_per_agent(self):
+        """Same drift guard as ROLE_HINTS_BY_SLOT, for chat mode's parallel hint tuple."""
+        self.assertEqual(len(roundtable.CHAT_ROLE_HINTS_BY_SLOT), len(roundtable.AGENT_NAMES))
+        self.assertEqual(len(set(roundtable.CHAT_ROLE_HINTS_BY_SLOT)),
+                         len(roundtable.CHAT_ROLE_HINTS_BY_SLOT))
+
+    def test_role_hints_for_chat_uses_the_chat_hint_set(self):
+        coding_hints = roundtable.role_hints_for("Goal")
+        chat_hints = roundtable.role_hints_for("Goal", chat=True)
+        # Same rotation offset (same objective) -> same agent gets slot 0 in both, but the hint
+        # text itself must come from the chat-specific tuple, not the coding one.
+        self.assertEqual(set(coding_hints), set(chat_hints))
+        for name in roundtable.AGENT_NAMES:
+            self.assertIn(chat_hints[name], roundtable.CHAT_ROLE_HINTS_BY_SLOT)
+            self.assertNotEqual(chat_hints[name], coding_hints[name])
+
     def test_prompt_for_includes_each_agents_role_hint(self):
         hints = roundtable.role_hints_for("Goal")
         codex_prompt = roundtable.prompt_for("Goal", [], "proposal", "Codex")
@@ -4374,6 +4431,68 @@ class RoundtableTests(unittest.TestCase):
         self.assertIn(hints["Claude"], claude_prompt)
         self.assertIn(hints["Antigravity"], antigravity_prompt)
         self.assertNotIn(hints["Codex"], claude_prompt)
+
+    def test_prompt_for_chat_mode_reframes_the_task_as_a_discussion(self):
+        coding_prompt = roundtable.prompt_for("Question", [], "proposal", "Codex")
+        chat_prompt = roundtable.prompt_for("Question", [], "proposal", "Codex", chat=True)
+        self.assertIn("verification plan", coding_prompt)
+        self.assertNotIn("verification plan", chat_prompt)
+        self.assertNotIn("proposed solution", chat_prompt)
+        hints = roundtable.role_hints_for("Question", chat=True)
+        self.assertIn(hints["Codex"], chat_prompt)
+
+    def test_final_prompt_chat_mode_drops_the_task_outcome_format(self):
+        coding_prompt = roundtable.final_prompt("Question", [], speaker="Claude")
+        chat_prompt = roundtable.final_prompt("Question", [], speaker="Claude", chat=True)
+        self.assertIn("`Completed`", coding_prompt)
+        self.assertIn("`Failed / incomplete`", coding_prompt)
+        self.assertNotIn("`Completed`", chat_prompt)
+        self.assertNotIn("`Failed / incomplete`", chat_prompt)
+        self.assertIn("USER QUESTION", chat_prompt)
+
+    def test_refine_prompt_chat_mode_drops_the_task_outcome_format(self):
+        coding_prompt = roundtable.refine_prompt("Question", [], "draft text", speaker="Claude")
+        chat_prompt = roundtable.refine_prompt(
+            "Question", [], "draft text", speaker="Claude", chat=True)
+        self.assertIn("`Completed`", coding_prompt)
+        self.assertIn("`Failed / incomplete`", coding_prompt)
+        self.assertNotIn("`Completed`", chat_prompt)
+        self.assertNotIn("`Failed / incomplete`", chat_prompt)
+
+    def test_conduct_chat_mode_forces_dead_code_check_off(self):
+        """Chat mode never edits files, so a dead-code sweep (which needs edit rights to remove
+        anything it finds) has nothing to do -- it must be forced off even when explicitly
+        requested, not just left to whatever the caller happened to pass."""
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session("Question", td, 0, "now", [])
+            agents = [roundtable.MockAgent(name, Path(td)) for name in roundtable.AGENT_NAMES]
+            with mock.patch.object(
+                    roundtable, "run_dead_code_check",
+                    side_effect=AssertionError("dead-code check ran in chat mode")):
+                roundtable.conduct(session, *agents, lambda *_: None, lambda *_: None,
+                                   dead_code_check=True, chat=True)
+        self.assertNotIn("dead-code-check", [turn.phase for turn in session.turns])
+
+    def test_conduct_chat_mode_runs_every_agent_turn_no_edit(self):
+        """Chat mode must never give an agent edit rights -- proposal, review, and synthesis turns
+        alike -- since the whole point is a plain-text discussion, not file changes."""
+        no_edit_seen: list[bool] = []
+
+        class RecordingAgent(roundtable.MockAgent):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                no_edit_seen.append(no_edit)
+                return super().run(prompt, on_tick, cancel_event, no_edit)
+
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session("Question", td, 1, "now", [])
+            agents = [RecordingAgent(name, Path(td)) for name in roundtable.AGENT_NAMES]
+            roundtable.conduct(session, *agents, lambda *_: None, lambda *_: None, chat=True)
+        self.assertTrue(no_edit_seen)
+        self.assertTrue(all(no_edit_seen))
+
+    def test_chat_flag_defaults_off_and_parses_on(self):
+        self.assertFalse(roundtable.build_parser().parse_args(["Goal"]).chat)
+        self.assertTrue(roundtable.build_parser().parse_args(["Goal", "--chat"]).chat)
 
     def test_role_hints_rotate_across_agents_by_objective_but_stay_stable_per_objective(self):
         mappings = [roundtable.role_hints_for(f"Objective {i}") for i in range(12)]
@@ -5206,6 +5325,8 @@ class RoundtableTests(unittest.TestCase):
         self.assertEqual((reset_at.year, reset_at.month, reset_at.day), (2026, 7, 21))
         self.assertEqual((reset_at.hour, reset_at.minute), (17, 30))
 
+    @unittest.skipUnless(_HAS_TZDATA, "no IANA tz database available on this platform "
+                                       "(Windows needs the third-party 'tzdata' package)")
     def test_parse_reset_time_honors_named_timezone(self):
         now = datetime(2026, 7, 20, 17, 0, tzinfo=ZoneInfo("America/Chicago"))
         reset_at = roundtable.parse_reset_time("resets 5:30pm (America/Chicago)", now)
@@ -5834,7 +5955,7 @@ class RoundtableTests(unittest.TestCase):
         agent.log_diagnostic = logged.append
 
         with mock.patch.object(roundtable.subprocess, "Popen", return_value=proc), \
-             mock.patch.object(roundtable.os, "killpg"):
+             mock.patch.object(roundtable.os, "killpg", create=True):
             with self.assertRaisesRegex(RuntimeError, "Claude cancelled"):
                 agent.run("task", lambda _line: None, cancelled)
 

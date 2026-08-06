@@ -378,7 +378,25 @@ ROLE_HINTS_BY_SLOT: tuple[str, ...] = (
 )
 
 
-def role_hints_for(objective: str) -> dict[str, str]:
+# Chat mode's equivalent of ROLE_HINTS_BY_SLOT: the same six complementary lanes, reframed for an
+# open discussion/question instead of a coding task (no sandboxed execution, no diffs to land).
+CHAT_ROLE_HINTS_BY_SLOT: tuple[str, ...] = (
+    "Your edge here is grounding: back up claims with specifics rather than asserting something as "
+    "fact without support, and note plainly when you're not sure.",
+    "Your edge here is structured reasoning and clear writing: focus on the underlying logic, "
+    "tradeoffs, and nuance, and make sure the answer is well-explained and sound.",
+    "Your edge here is breadth: raise angles, counterexamples, or alternate framings the others "
+    "might miss.",
+    "Your edge here is concision: give a short, concrete, directly useful answer rather than a "
+    "sprawling survey of the topic.",
+    "Your edge here is skepticism: question claims made so far, check them against evidence, and "
+    "flag anything that looks unverified or overstated.",
+    "Your edge here is integration: reconcile the different views proposed so far into one coherent "
+    "answer, resolving disagreements between them explicitly rather than just picking a side.",
+)
+
+
+def role_hints_for(objective: str, chat: bool = False) -> dict[str, str]:
     """Assign the six role hints to the six agents, rotated by objective.
 
     Stable across follow-ups in the same session (same objective), but varies session to session so
@@ -387,7 +405,8 @@ def role_hints_for(objective: str) -> dict[str, str]:
     """
     offset = int(hashlib.sha256(("roles:" + objective).encode()).hexdigest(), 16) % len(AGENT_NAMES)
     rotated = AGENT_NAMES[offset:] + AGENT_NAMES[:offset]
-    return dict(zip(rotated, ROLE_HINTS_BY_SLOT))
+    hints = CHAT_ROLE_HINTS_BY_SLOT if chat else ROLE_HINTS_BY_SLOT
+    return dict(zip(rotated, hints))
 
 
 @dataclass
@@ -1479,12 +1498,12 @@ class PromptContext:
 
 
 def prepare_prompt_context(objective: str, turns: list[Turn],
-                           workspace: Path | str | None = None) -> PromptContext:
+                           workspace: Path | str | None = None, chat: bool = False) -> PromptContext:
     """Render and inspect a transcript once for prompts built from the same session state."""
     board_entries = extract_agent_prompt_entries(workspace) if workspace else ""
     return PromptContext(
         transcript(turns) or "(No contributions yet.)",
-        role_hints_for(objective),
+        role_hints_for(objective, chat=chat),
         extract_dibs(turns),
         board_entries,
     )
@@ -1492,9 +1511,9 @@ def prepare_prompt_context(objective: str, turns: list[Turn],
 
 def prompt_for(objective: str, turns: list[Turn], phase: str, speaker: str,
               sequential: bool = False, scope: str = "", task_status_check: bool = False,
-              restart_vote_pending: bool = False,
+              restart_vote_pending: bool = False, chat: bool = False,
               context: PromptContext | None = None) -> str:
-    context = context or prepare_prompt_context(objective, turns)
+    context = context or prepare_prompt_context(objective, turns, chat=chat)
     history = context.history
     collab_note = (
         "You are working in a live sequential relay: the shared transcript above already includes "
@@ -1503,7 +1522,18 @@ def prompt_for(objective: str, turns: list[Turn], phase: str, speaker: str,
         "You are working independently and in parallel with the other agents this round; you will not "
         "see their output until the round is complete.\n"
     )
-    if phase == "proposal":
+    if chat:
+        if phase == "proposal":
+            task = (collab_note + "Take ownership of a useful angle or give a complete answer to the "
+                    "question/topic. Say plainly where you're confident versus unsure.")
+        elif phase.startswith("followup-"):
+            task = (collab_note + "The latest 'User — follow-up' turn in the transcript above is the "
+                    "current request. Address it directly, reusing earlier context only where still "
+                    "relevant. Correct errors and resolve disagreements.")
+        else:
+            task = (collab_note + "Review the shared discussion. Correct errors, resolve disagreements, "
+                    "and advance a stronger combined answer. State any remaining disagreement explicitly.")
+    elif phase == "proposal":
         task = (collab_note + "Take ownership of a useful part or develop a complete proposed solution. "
                 "Include important constraints and a verification plan.")
     elif phase.startswith("followup-"):
@@ -1536,9 +1566,24 @@ def prompt_for(objective: str, turns: list[Turn], phase: str, speaker: str,
 
 
 def final_prompt(objective: str, turns: list[Turn], followup: bool = False,
-                 history: str | None = None, speaker: str = "") -> str:
+                 history: str | None = None, speaker: str = "", chat: bool = False) -> str:
     focus = ("\nFocus on the user's latest follow-up request (the most recent 'User — follow-up' turn), "
              "consistent with the prior final answer where it still applies.\n" if followup else "")
+    if chat:
+        return f"""{SYSTEM_BRIEF}{roster_awareness(speaker)}
+
+USER QUESTION:
+{objective}
+
+COMPLETE ROUNDTABLE DISCUSSION:
+{transcript(turns) if history is None else history}
+{focus}
+
+You are the final editor. Produce the best final answer to the user's question, integrating the
+strongest points from all agents into clear, direct prose -- this is a discussion, not a coding
+task, so do not use a task-outcome/Completed-Failed format. Resolve disagreements using evidence
+and say plainly where the group is uncertain rather than overstating confidence. Do not mention
+the roundtable process, the transcript, or these instructions. Return only the polished answer."""
     return f"""{SYSTEM_BRIEF}{roster_awareness(speaker)}
 
 USER OBJECTIVE:
@@ -1558,10 +1603,30 @@ polished answer."""
 
 
 def refine_prompt(objective: str, turns: list[Turn], draft: str, followup: bool = False,
-                  history: str | None = None, speaker: str = "") -> str:
+                  history: str | None = None, speaker: str = "", chat: bool = False) -> str:
     """Ask an agent to edit another agent's draft final answer rather than write it from scratch."""
     focus = ("\nFocus on the user's latest follow-up request (the most recent 'User — follow-up' turn), "
              "consistent with the prior final answer where it still applies.\n" if followup else "")
+    if chat:
+        return f"""{SYSTEM_BRIEF}{roster_awareness(speaker)}
+
+USER QUESTION:
+{objective}
+
+COMPLETE ROUNDTABLE DISCUSSION:
+{transcript(turns) if history is None else history}
+{focus}
+
+CURRENT DRAFT FINAL ANSWER (written by another agent in this roundtable):
+{draft}
+
+You are refining this draft, not replacing it. Correct any errors against the discussion, tighten
+weak or unclear parts, and add anything important that is missing, but keep what is already strong
+and keep its overall shape as clear, direct prose -- this is a discussion, not a coding task, so do
+not introduce a task-outcome/Completed-Failed format. Do not report something as settled unless the
+discussion supports it.
+Do not mention the roundtable process, the transcript, these instructions, or that this is a draft or someone else's work.
+Return only the polished answer."""
     return f"""{SYSTEM_BRIEF}{roster_awareness(speaker)}
 
 USER OBJECTIVE:
@@ -1975,12 +2040,19 @@ def work_event(line: str) -> str:
 
 
 class Display:
+    # Class-level default so instances built via Display.__new__(Display) in tests (bypassing
+    # __init__ entirely) still resolve self.chat to False instead of raising AttributeError.
+    chat = False
+
     def __init__(self, stdscr: curses.window, session: Session, touch_mode: bool = False,
-                 run_log: RunLog | None = None, mock: bool = False):
+                 run_log: RunLog | None = None, mock: bool = False, chat: bool = False):
         self.s = stdscr
         self.session = session
         self.run_log = run_log or RunLog(None)
         self.mock = mock
+        # Chat mode never edits files: skip the Code Monitor panel (always empty) and relabel the
+        # final-answer panel, which otherwise implies a task-outcome/Completed-Failed format.
+        self.chat = chat
         self.status = "Ready"
         self.activity: dict[str, str] = {}
         self.active: set[str] = set()
@@ -2922,7 +2994,9 @@ class Display:
         self._box(cy, 1, consensus_height, answer_width, final_box_attr)
 
         final_text = (self.session.final or
-                      "Completed and failed work will be summarized here after the task.")
+                      ("The group's discussion will be summarized into a final answer here."
+                       if self.chat else
+                       "Completed and failed work will be summarized here after the task."))
         all_final_lines = self._wrapped(final_text, answer_width - 4)
         available_final = consensus_height - 3
         final_rows = available_final
@@ -2932,9 +3006,10 @@ class Display:
         # at all that scroll["Final"] had moved you away from the live tail.
         final_scroll = f" · ↑{final_offset}" if final_offset else ""
         title_width = max(0, answer_width - 4)
-        final_title = f" ◆  TASK OUTCOME · COMPLETED / FAILED{final_scroll} "
+        final_title = (f" ◆  FINAL ANSWER{final_scroll} " if self.chat else
+                       f" ◆  TASK OUTCOME · COMPLETED / FAILED{final_scroll} ")
         if len(final_title) > title_width:
-            final_title = f" ◆ OUTCOME{final_scroll} "
+            final_title = f" ◆ ANSWER{final_scroll} " if self.chat else f" ◆ OUTCOME{final_scroll} "
         final_attr = curses.color_pair(3) | curses.A_BOLD
         if getattr(self, "focused_panel", None) == "Final":
             final_attr |= curses.A_REVERSE
@@ -2967,16 +3042,22 @@ class Display:
         summary = code_change_summary(changes)
         summary_bit = f" · {summary}" if summary else ""
         title_width = max(0, monitor_width - 4)
-        code_title = f" ⌁  CODE MONITOR · {len(changes)}{summary_bit}{code_scroll} "
-        if len(code_title) > title_width:
-            code_title = f" ⌁ CODE · {len(changes)}{summary_bit}{code_scroll} "
-        if len(code_title) > title_width:
-            code_title = f" ⌁ CODE · {len(changes)}{code_scroll} "
+        if self.chat:
+            code_title = f" ⌁  CHAT MODE{code_scroll} "
+        else:
+            code_title = f" ⌁  CODE MONITOR · {len(changes)}{summary_bit}{code_scroll} "
+            if len(code_title) > title_width:
+                code_title = f" ⌁ CODE · {len(changes)}{summary_bit}{code_scroll} "
+            if len(code_title) > title_width:
+                code_title = f" ⌁ CODE · {len(changes)}{code_scroll} "
         code_attr = curses.color_pair(2) | curses.A_BOLD
         if getattr(self, "focused_panel", None) == "Code":
             code_attr |= curses.A_REVERSE
         self._put(cy, mx + 2, code_title[:title_width], code_attr)
-        if changes:
+        if self.chat:
+            self._put(cy + 2, mx + 3, "No file changes — agents are", curses.A_DIM)
+            self._put(cy + 3, mx + 3, "discussing, not editing", curses.A_DIM)
+        elif changes:
             icons = {"added": "+", "modified": "~", "deleted": "−"}
             colors = {"added": curses.color_pair(3), "modified": curses.color_pair(5),
                       "deleted": curses.color_pair(4)}
@@ -3297,8 +3378,9 @@ class Display:
             scroll_label = f" · ↑{offset}" if offset else ""
             summary = code_change_summary(changes)
             summary_bit = f" · {summary}" if summary else ""
-            exp_title = (f" ⌁  CODE MONITOR (expanded) · {len(changes)}"
-                         f"{summary_bit}{scroll_label} ")
+            exp_title = (f" ⌁  CHAT MODE (expanded){scroll_label} " if self.chat else
+                        f" ⌁  CODE MONITOR (expanded) · {len(changes)}"
+                        f"{summary_bit}{scroll_label} ")
             self._put(top, 3, exp_title[:max(0, w - 6)], color | curses.A_BOLD)
             if changes:
                 icons = {"added": "+", "modified": "~", "deleted": "−"}
@@ -3310,6 +3392,9 @@ class Display:
                     label = textwrap.shorten(change.path, width=max(5, w - 8), placeholder="…")
                     self._put(top + 2 + row, 3, f"{icons[change.kind]} {label}",
                               colors[change.kind])
+            elif self.chat:
+                self._put(top + 2, 3, "No file changes — agents are discussing, not editing",
+                          curses.A_DIM)
             else:
                 self._put(top + 2, 3, "No file changes yet", curses.A_DIM)
                 if getattr(self.monitor, "truncated", False):
@@ -3319,13 +3404,16 @@ class Display:
             color = curses.color_pair(3)
             self._box(top, 1, height, w - 2, color)
             content = (self.session.final or
-                       "Completed and failed work will be summarized here after the task.")
+                       ("The group's discussion will be summarized into a final answer here."
+                        if self.chat else
+                        "Completed and failed work will be summarized here after the task."))
             lines = self._wrapped(content, w - 6)
             available = max(1, height - 3)
             offset = min(self.scroll.get("Final", 0), max(0, len(lines) - available))
             self.scroll["Final"] = offset
             scroll_label = f" · ↑{offset}" if offset else ""
-            title = f" ◆  TASK OUTCOME (expanded){scroll_label} "
+            title = (f" ◆  FINAL ANSWER (expanded){scroll_label} " if self.chat else
+                     f" ◆  TASK OUTCOME (expanded){scroll_label} ")
             self._put(top, 3, title[:max(0, w - 6)], color | curses.A_BOLD)
             end = len(lines) - offset if offset else len(lines)
             for row, line in enumerate(lines[max(0, end - available):end]):
@@ -3386,6 +3474,7 @@ OPTION_TOGGLES: tuple[tuple[str, str], ...] = (
     ("reassign_idle", "Reassign idle — a finished agent picks up other work instead of waiting"),
     ("debug", "Debug mode — enable verbose subprocess and diagnostic trace logging"),
     ("dead_code_check", "Dead code check — sweep for and remove unused code before the final answer"),
+    ("chat", "Chat mode — plain-text discussion/Q&A instead of code changes (forces dead code check off)"),
 )
 
 # Trust/safety posture flags: highlighted more strongly when enabled on the options screen.
@@ -3971,7 +4060,8 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
                         log_prompt: Callable[[str, str], None] = lambda *_: None,
                         agent_speed: dict[str, list[float]] | None = None,
                         task_status_check: bool = False, reassign_idle: bool = False,
-                        stagger: float | None = None, restart_vote_pending: bool = False) -> str | None:
+                        stagger: float | None = None, restart_vote_pending: bool = False,
+                        chat: bool = False) -> str | None:
     """Run one collaboration phase concurrently and record results deterministically.
 
     When agent_speed is provided, an agent running notably slower than the others (based on
@@ -4000,12 +4090,13 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
     names = [name for name, _ in agents]
     by_name = dict(agents)
     status(names, message)
-    context = prepare_prompt_context(session.objective, session.turns, workspace=session.workspace)
+    context = prepare_prompt_context(session.objective, session.turns, workspace=session.workspace,
+                                     chat=chat)
     prompts = {
         name: prompt_for(session.objective, session.turns, phase, name, sequential=False,
                          scope=scope_hint(name, agent_speed) if agent_speed is not None else "",
                          task_status_check=task_status_check,
-                         restart_vote_pending=restart_vote_pending, context=context)
+                         restart_vote_pending=restart_vote_pending, chat=chat, context=context)
         for name, _ in agents
     }
     for name in names:
@@ -4034,7 +4125,8 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
                 agent_started[speaker] = time.monotonic()
                 try:
                     content = _run_with_retry(
-                        agent, prompt, lambda line: events.put((speaker, line)), cancel_event)
+                        agent, prompt, lambda line: events.put((speaker, line)), cancel_event,
+                        no_edit=chat)
                 finally:
                     agent_finished[speaker] = time.monotonic()
                 # Independently verify this agent's turn against real, deterministic evidence
@@ -4224,7 +4316,7 @@ def _run_sequential_phase(session: Session, agents: list[tuple[str, Agent]], pha
                           status: Callable[[Iterable[str], str], None], message: str,
                           log_prompt: Callable[[str, str], None] = lambda *_: None,
                           task_status_check: bool = False,
-                          restart_vote_pending: bool = False) -> str | None:
+                          restart_vote_pending: bool = False, chat: bool = False) -> str | None:
     """Run one collaboration phase as a live relay: each agent reads and builds on the one before it.
 
     Unlike the parallel phase, each agent's prompt is built right before it runs, after the previous
@@ -4237,13 +4329,15 @@ def _run_sequential_phase(session: Session, agents: list[tuple[str, Agent]], pha
     """
     for name, agent in agents:
         status([name], message)
-        context = prepare_prompt_context(session.objective, session.turns, workspace=session.workspace)
+        context = prepare_prompt_context(session.objective, session.turns, workspace=session.workspace,
+                                         chat=chat)
         prompt = prompt_for(session.objective, session.turns, phase, name, sequential=True,
                             task_status_check=task_status_check,
                             restart_vote_pending=restart_vote_pending,
-                            context=context)
+                            chat=chat, context=context)
         log_prompt(name, prompt)
-        content = _run_with_retry(agent, prompt, lambda line, speaker=name: tick(speaker, line))
+        content = _run_with_retry(agent, prompt, lambda line, speaker=name: tick(speaker, line),
+                                  no_edit=chat)
         # Independently verify this agent's turn against real, deterministic evidence rather than
         # whatever it claimed -- a no-op outside a --self session.
         verify_self_edit_turn(session, agent, lambda line, speaker=name: tick(speaker, line))
@@ -4421,7 +4515,8 @@ def synthesize(session: Session, order: list[tuple[str, Agent]],
                tick: Callable[[str, str], None], status: Callable[[Iterable[str], str], None],
                log_prompt: Callable[[str, str], None] = lambda *_: None,
                followup: bool = False,
-               step_complete: Callable[[int], None] = lambda *_: None) -> str:
+               step_complete: Callable[[int], None] = lambda *_: None,
+               chat: bool = False) -> str:
     """Produce the final answer as a relay: one agent drafts it, the rest refine it in turn,
     so the result is a merge shaped by all of them rather than the output of a single agent."""
     draft = ""
@@ -4432,10 +4527,10 @@ def synthesize(session: Session, order: list[tuple[str, Agent]],
         status([name], f"{name} is {verb} the final answer")
         prompt = (
             final_prompt(
-                session.objective, session.turns, followup, history, speaker=name
+                session.objective, session.turns, followup, history, speaker=name, chat=chat
             ) if index == 0 else
             refine_prompt(
-                session.objective, session.turns, draft, followup, history, speaker=name
+                session.objective, session.turns, draft, followup, history, speaker=name, chat=chat
             )
         )
         log_prompt(name, prompt)
@@ -4598,7 +4693,8 @@ def _run_phase(runner: Callable[..., str | None], session: Session, agents: list
               log_prompt: Callable[[str, str], None],
               agent_speed: dict[str, list[float]] | None,
               task_status_check: bool = False, reassign_idle: bool = False,
-              stagger: float | None = None, restart_vote_pending: bool = False) -> str | None:
+              stagger: float | None = None, restart_vote_pending: bool = False,
+              chat: bool = False) -> str | None:
     """Dispatch to a phase runner, passing parallel-only knobs only to the parallel runner.
 
     Returns the name of an agent that marked TASK STATUS: complete this phase, if any — used by
@@ -4609,11 +4705,11 @@ def _run_phase(runner: Callable[..., str | None], session: Session, agents: list
         phase = f"followup-{phase}"
     if runner is _run_parallel_phase:
         return runner(session, agents, phase, tick, status, message, log_prompt, agent_speed,
-                      task_status_check, reassign_idle, stagger, restart_vote_pending)
+                      task_status_check, reassign_idle, stagger, restart_vote_pending, chat)
     if runner is _run_sequential_phase:
         return runner(session, agents, phase, tick, status, message, log_prompt,
                       task_status_check=task_status_check,
-                      restart_vote_pending=restart_vote_pending)
+                      restart_vote_pending=restart_vote_pending, chat=chat)
     return runner(session, agents, phase, tick, status, message, log_prompt)
 
 
@@ -4625,10 +4721,14 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
             log_prompt: Callable[[str, str], None] = lambda *_: None,
             balance_load: bool = False, task_status_check: bool = False,
             reassign_idle: bool = False, synthesis_passes: int = 6,
-            dead_code_check: bool = False,
+            dead_code_check: bool = False, chat: bool = False,
             checkpoint: Callable[[], None] = lambda: None,
             completed_phases: set[str] | None = None,
             stagger: float | None = None) -> None:
+    # Chat mode never edits files, so a dead-code sweep (which needs edit rights) has nothing to
+    # do; force it off regardless of what was requested/toggled rather than letting an agent get
+    # edit rights for a coding-specific step that makes no sense in a plain-text discussion.
+    dead_code_check = dead_code_check and not chat
     # completed_phases is only set for a --self restart continuing a run already in progress;
     # anything else (a brand-new objective, or a plain --resume of a run that already exited)
     # starts a fresh board. See start_agent_prompt_file.
@@ -4753,7 +4853,7 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
     if phase not in completed_phases:
         completed_by = _run_phase(
             proposal_runner, session, agents, phase, estimated_tick, estimated_status, message,
-            log_prompt, agent_speed, task_status_check, reassign_idle, stagger)
+            log_prompt, agent_speed, task_status_check, reassign_idle, stagger, chat=chat)
         estimator.complete(phase_work_units(proposal_runner))
         note_phase_completion(completed_by)
         if self_mode and session.rounds >= 1 and source_fingerprint() != restart_baseline:
@@ -4786,7 +4886,7 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
                 runner, session, agents, phase, estimated_tick, estimated_status,
                 f"Agents are reviewing {round_style} · round {round_no}/{session.rounds}",
                 log_prompt, agent_speed, task_status_check, reassign_idle, stagger,
-                restart_vote_pending=asking_vote_this_round,
+                restart_vote_pending=asking_vote_this_round, chat=chat,
             )
             estimator.complete(phase_work_units(runner))
             if task_status_check and completed_by:
@@ -4841,7 +4941,7 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
     order = synthesis_order(synthesizer, session, codex, claude, antigravity, aider, grok, qwen,
                             effective_passes, preferred_first=preferred_drafter)
     session.final = synthesize(session, order, estimated_tick, estimated_status, log_prompt, followup,
-                               estimator.complete)
+                               estimator.complete, chat=chat)
     session.turns.append(Turn("Final", "consensus", session.final))
     checkpoint()
 
@@ -4860,7 +4960,8 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
         touch_mode = getattr(args, "touch", None)
     if touch_mode is None:
         touch_mode = False
-    ui = Display(stdscr, session, touch_mode, run_log, mock=getattr(args, "mock", False))
+    ui = Display(stdscr, session, touch_mode, run_log, mock=getattr(args, "mock", False),
+                chat=getattr(args, "chat", False))
     ui.log(config_summary(args), kind="phase")
     preserve_prompt_board = False
     def status(active: Iterable[str], message: str) -> None:
@@ -4901,7 +5002,8 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
                    balance_load=args.balance_load, task_status_check=args.task_status_check,
                    reassign_idle=args.reassign_idle,
                    synthesis_passes=getattr(args, "synthesis_passes", 6),
-                   dead_code_check=args.dead_code_check, checkpoint=checkpoint,
+                   dead_code_check=args.dead_code_check, chat=getattr(args, "chat", False),
+                   checkpoint=checkpoint,
                    completed_phases=completed_phases)
             ui.busy = False
             paths = save_session(session, Path(args.output_dir))
@@ -5103,6 +5205,7 @@ def restart_arguments(args: argparse.Namespace, session_path: Path,
                             ("--task-status-check", args.task_status_check),
                             ("--reassign-idle", args.reassign_idle),
                             ("--dead-code-check", args.dead_code_check),
+                            ("--chat", getattr(args, "chat", False)),
                             ("--debug", getattr(args, "debug", False))):
         if enabled:
             command.append(option)
@@ -5192,7 +5295,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dead-code-check", action="store_true",
                         help="before the final answer is drafted, have one agent search this "
                              "session's code changes for now-unused functions/branches and remove "
-                             "any it finds, with edit rights (unlike the prose-only synthesis relay)")
+                             "any it finds, with edit rights (unlike the prose-only synthesis relay). "
+                             "Ignored (forced off) in --chat mode, which never edits files")
+    parser.add_argument("--chat", action="store_true",
+                        help="plain-text discussion mode: agents discuss/answer the objective as a "
+                             "question instead of editing code -- every turn runs read-only "
+                             "(no_edit), role hints and the final answer format are reframed for "
+                             "prose, and --dead-code-check is forced off")
     parser.add_argument("--elevated",
                         choices=["codex", "claude", "antigravity", "aider", "grok", "qwen", "all"],
                         action="append", default=[], metavar="AGENT",
@@ -5267,6 +5376,7 @@ def main() -> int:
                 "reassign_idle": args.reassign_idle,
                 "debug": args.debug,
                 "dead_code_check": args.dead_code_check,
+                "chat": args.chat,
             })
         except KeyboardInterrupt:
             # No session/run_log exists yet this early, so there is nothing to save -- just exit
@@ -5285,6 +5395,7 @@ def main() -> int:
         args.reassign_idle = toggled["reassign_idle"]
         args.debug = toggled["debug"]
         args.dead_code_check = toggled["dead_code_check"]
+        args.chat = toggled["chat"]
     if args.preflight_timeout is None:
         args.preflight_timeout = (EXTENDED_PREFLIGHT_TIMEOUT_SECONDS if args.extended_preflight
                                   else DEFAULT_PREFLIGHT_TIMEOUT_SECONDS)
@@ -5381,6 +5492,13 @@ def main() -> int:
     checkpoint = self_checkpoint(args.self)
 
     if args.plain or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        # This path's plain print()s carry glyphs (e.g. the mock-mode "⚠") that stock Windows
+        # consoles can't encode in their default codepage (cp1252) -- reconfigure defensively so an
+        # unencodable character degrades to a replacement mark instead of crashing the whole run.
+        try:
+            sys.stdout.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
         run_log = RunLog(log_path_for(session, Path(args.output_dir)))
         agents = (codex, claude, antigravity, aider, grok, qwen)
         attach_agent_diagnostics(run_log, agents)
@@ -5412,7 +5530,7 @@ def main() -> int:
                    collab=args.collab, synthesizer=args.synthesizer, log_prompt=log_prompt,
                    balance_load=args.balance_load, task_status_check=args.task_status_check,
                    reassign_idle=args.reassign_idle, synthesis_passes=args.synthesis_passes,
-                   dead_code_check=args.dead_code_check,
+                   dead_code_check=args.dead_code_check, chat=getattr(args, "chat", False),
                    checkpoint=checkpoint, completed_phases=completed_phases)
             successful_paths = save_session(session, Path(args.output_dir))
             run_log.write(
