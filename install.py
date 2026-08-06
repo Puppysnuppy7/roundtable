@@ -238,6 +238,32 @@ def install_roundtable_symlink(bin_dir: Path, dry_run: bool, force: bool = False
         return f"copied {source} -> {target} (symlinks unavailable on this platform; re-run this installer after updating roundtable.py)"
 
 
+def ensure_windows_dependencies(dry_run: bool, current: tuple[str, str] | None = None) -> str | None:
+    """Install the two packages Windows needs to run roundtable.py and its test suite at all --
+    neither is an agent CLI, so they don't belong in CLI_INSTALLERS, but without them the program
+    can't even start there. Returns a status message, or None on any other platform.
+
+    - `windows-curses`: the standard library's `curses` module isn't built for Windows at all;
+      importing roundtable.py fails immediately without this.
+    - `tzdata`: Windows ships no IANA time zone database (unlike Linux/macOS, which usually have
+      one on disk already), so `zoneinfo` can't resolve *any* named zone, not even "UTC", without
+      it. roundtable.py's own reset-time parsing already handles a missing zone gracefully
+      (falls back to safe polling rather than guessing), so this isn't required for correctness --
+      it only lets the corresponding tests exercise that path instead of skipping it.
+    """
+    current = current or current_platform()
+    if current[0] != "windows":
+        return None
+    packages = ["windows-curses", "tzdata"]
+    if dry_run:
+        return f"would run: {sys.executable} -m pip install {' '.join(packages)}"
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", *packages], check=True)
+    except (subprocess.CalledProcessError, OSError) as exc:
+        return f"windows-curses/tzdata install failed: {exc}"
+    return "installed windows-curses, tzdata (needed to run roundtable.py and its tests here)"
+
+
 def install_cli(name: str, executable: str, dry_run: bool,
                 current: tuple[str, str] | None = None) -> tuple[str, bool]:
     """Ensure one agent's CLI is installed.
@@ -305,10 +331,10 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     current = current_platform()
     print(f"Detected platform: {current[0]}-{current[1]}")
-    if current[0] == "windows":
-        print("warning: roundtable's GUI needs the `curses` module, which Windows does not ship "
-              "in its standard library -- you'll need the third-party `windows-curses` package "
-              "to actually run it; this installer does not manage that dependency.")
+    windows_deps_message = ensure_windows_dependencies(args.dry_run, current=current)
+    windows_deps_failed = bool(windows_deps_message) and "failed" in windows_deps_message
+    if windows_deps_message is not None:
+        print(windows_deps_message)
     if current[1] == "arm32":
         print("warning: Codex and Claude Code publish no 32-bit ARM build; those two will not "
               "be installable here even though the commands below will be attempted.")
@@ -325,10 +351,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"warning: {bin_dir} is not on PATH -- add it to your shell profile")
 
     if args.skip_clis:
-        return 0
+        return 1 if windows_deps_failed else 0
 
     print()
-    any_failed = False
+    any_failed = windows_deps_failed
     for name in (args.only or AGENT_NAMES):
         message, ok = install_cli(
             name, AGENT_EXECUTABLES[name], args.dry_run, current=current)

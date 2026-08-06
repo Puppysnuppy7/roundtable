@@ -152,6 +152,32 @@ class InstallTests(unittest.TestCase):
         self.assertNotIn("observed shipping", message)
         self.assertTrue(ok)
 
+    def test_ensure_windows_dependencies_is_a_noop_off_windows(self):
+        with mock.patch.object(install.subprocess, "run") as run:
+            message = install.ensure_windows_dependencies(dry_run=False, current=("linux", "x86_64"))
+        run.assert_not_called()
+        self.assertIsNone(message)
+
+    def test_ensure_windows_dependencies_dry_run_touches_nothing(self):
+        with mock.patch.object(install.subprocess, "run") as run:
+            message = install.ensure_windows_dependencies(dry_run=True, current=("windows", "x86_64"))
+        run.assert_not_called()
+        self.assertIn("windows-curses", message)
+        self.assertIn("tzdata", message)
+
+    def test_ensure_windows_dependencies_installs_via_the_running_interpreter(self):
+        with mock.patch.object(install.subprocess, "run") as run:
+            message = install.ensure_windows_dependencies(dry_run=False, current=("windows", "x86_64"))
+        run.assert_called_once_with(
+            [install.sys.executable, "-m", "pip", "install", "windows-curses", "tzdata"], check=True)
+        self.assertIn("installed", message)
+
+    def test_ensure_windows_dependencies_reports_failure(self):
+        with mock.patch.object(install.subprocess, "run",
+                               side_effect=install.subprocess.CalledProcessError(1, "pip")):
+            message = install.ensure_windows_dependencies(dry_run=False, current=("windows", "x86_64"))
+        self.assertIn("failed", message)
+
     def test_current_platform_normalizes_known_architectures(self):
         cases = {
             "x86_64": "x86_64", "AMD64": "x86_64",
@@ -405,6 +431,7 @@ class InstallTests(unittest.TestCase):
                 return f"{name} already installed (/bin/{executable})", True
 
             with mock.patch.object(install, "install_cli", side_effect=fake_install_cli), \
+                 mock.patch.object(install, "current_platform", return_value=("linux", "x86_64")), \
                  mock.patch("builtins.print"):
                 result = install.main(["--bin-dir", str(bin_dir), "--only", "Codex", "Aider"])
             self.assertEqual(result, 1)
@@ -418,6 +445,7 @@ class InstallTests(unittest.TestCase):
                 return f"{name} not found -- no automated installer here", True
 
             with mock.patch.object(install, "install_cli", side_effect=fake_install_cli), \
+                 mock.patch.object(install, "current_platform", return_value=("linux", "x86_64")), \
                  mock.patch("builtins.print"):
                 result = install.main(["--bin-dir", str(bin_dir), "--only", "Grok"])
             self.assertEqual(result, 0)
