@@ -48,7 +48,8 @@ class InstallTests(unittest.TestCase):
     def test_install_roundtable_symlink_creates_executable_link(self):
         with tempfile.TemporaryDirectory() as td:
             bin_dir = Path(td) / "bin"
-            message = install.install_roundtable_symlink(bin_dir, dry_run=False)
+            message = install.install_roundtable_symlink(bin_dir, dry_run=False,
+                                                          current=("linux", "x86_64"))
             target = bin_dir / "roundtable"
             self.assertTrue(target.is_symlink())
             self.assertEqual(target.resolve(), install.REPO_ROOT / "roundtable.py")
@@ -57,14 +58,16 @@ class InstallTests(unittest.TestCase):
     def test_install_roundtable_symlink_is_idempotent(self):
         with tempfile.TemporaryDirectory() as td:
             bin_dir = Path(td) / "bin"
-            install.install_roundtable_symlink(bin_dir, dry_run=False)
-            second = install.install_roundtable_symlink(bin_dir, dry_run=False)
+            install.install_roundtable_symlink(bin_dir, dry_run=False, current=("linux", "x86_64"))
+            second = install.install_roundtable_symlink(bin_dir, dry_run=False,
+                                                         current=("linux", "x86_64"))
             self.assertIn("already linked", second)
 
     def test_install_roundtable_symlink_dry_run_touches_nothing(self):
         with tempfile.TemporaryDirectory() as td:
             bin_dir = Path(td) / "bin"
-            message = install.install_roundtable_symlink(bin_dir, dry_run=True)
+            message = install.install_roundtable_symlink(bin_dir, dry_run=True,
+                                                          current=("linux", "x86_64"))
             self.assertIn("would link", message)
             self.assertFalse(bin_dir.exists())
 
@@ -72,7 +75,8 @@ class InstallTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             bin_dir = Path(td) / "bin"
             with mock.patch.object(Path, "symlink_to", side_effect=OSError("no symlink support")):
-                message = install.install_roundtable_symlink(bin_dir, dry_run=False)
+                message = install.install_roundtable_symlink(bin_dir, dry_run=False,
+                                                              current=("linux", "x86_64"))
             target = bin_dir / "roundtable"
             self.assertFalse(target.is_symlink())
             self.assertTrue(target.is_file())
@@ -128,20 +132,25 @@ class InstallTests(unittest.TestCase):
         self.assertIn("already installed", message)
         self.assertTrue(ok)
 
-    def test_install_cli_reports_no_automated_installer_for_agy_and_grok(self):
+    def test_install_cli_reports_no_automated_installer_for_agy(self):
         with mock.patch.object(install.shutil, "which", return_value=None):
-            for name, executable in (("Antigravity", "agy"), ("Grok", "grok")):
-                message, ok = install.install_cli(name, executable, dry_run=False,
-                                                  current=("linux", "x86_64"))
-                self.assertIn("no automated installer", message)
-                self.assertTrue(ok)  # informational, not a hard failure
+            message, ok = install.install_cli("Antigravity", "agy", dry_run=False,
+                                              current=("linux", "x86_64"))
+        self.assertIn("no automated installer", message)
+        self.assertTrue(ok)  # informational, not a hard failure
 
-    def test_install_cli_grok_caveat_only_shown_off_x86_64(self):
-        with mock.patch.object(install.shutil, "which", return_value=None):
-            on_x64, _ = install.install_cli("Grok", "grok", dry_run=False, current=("linux", "x86_64"))
-            on_arm, _ = install.install_cli("Grok", "grok", dry_run=False, current=("linux", "arm64"))
-        self.assertNotIn("observed shipping", on_x64)
-        self.assertIn("observed shipping", on_arm)
+    def test_install_cli_grok_installs_via_npm_with_full_arch_support(self):
+        def fake_which(name):
+            return "/usr/bin/npm" if name == "npm" else None
+        with mock.patch.object(install.shutil, "which", side_effect=fake_which), \
+             mock.patch.object(install.subprocess, "run") as run:
+            message, ok = install.install_cli("Grok", "grok", dry_run=False,
+                                              current=("linux", "arm64"))
+        run.assert_called_once_with(["/usr/bin/npm", "install", "-g", "@xai-official/grok"],
+                                    check=True)
+        self.assertNotIn("no verified prebuilt binary", message)
+        self.assertNotIn("observed shipping", message)
+        self.assertTrue(ok)
 
     def test_current_platform_normalizes_known_architectures(self):
         cases = {
@@ -214,9 +223,59 @@ class InstallTests(unittest.TestCase):
         with mock.patch.object(install.shutil, "which", side_effect=fake_which), \
              mock.patch.object(install.subprocess, "run") as run:
             message, ok = install.install_cli("Codex", "codex", dry_run=False)
-        run.assert_called_once_with(["npm", "install", "-g", "@openai/codex"], check=True)
+        run.assert_called_once_with(["/usr/bin/npm", "install", "-g", "@openai/codex"], check=True)
         self.assertIn("installed", message)
         self.assertTrue(ok)
+
+    def test_install_cli_resolves_launcher_to_its_full_path_before_running(self):
+        """Regression: on Windows, npm/pipx resolve to a .cmd/.exe wrapper that shutil.which()
+        finds fine, but subprocess.run(shell=False) can't launch by the bare unqualified name
+        ("npm") the way a shell can -- it needs the exact resolved path, extension included."""
+        def fake_which(name):
+            return r"C:\Program Files\nodejs\npm.CMD" if name == "npm" else None
+        with mock.patch.object(install.shutil, "which", side_effect=fake_which), \
+             mock.patch.object(install.subprocess, "run") as run:
+            install.install_cli("Codex", "codex", dry_run=False)
+        called_command = run.call_args.args[0]
+        self.assertEqual(called_command[0], r"C:\Program Files\nodejs\npm.CMD")
+        self.assertNotEqual(called_command[0], "npm")
+
+    def test_install_cli_runs_multi_step_installer_in_sequence(self):
+        """Aider's entry isn't a single command: pipx installs aider-install, which is then run
+        to do the actual (uv-resolved) aider install. Both steps must run, in order."""
+        def fake_which(name):
+            return f"/usr/bin/{name}" if name in ("pipx", "aider-install") else None
+        with mock.patch.object(install.shutil, "which", side_effect=fake_which), \
+             mock.patch.object(install.subprocess, "run") as run:
+            message, ok = install.install_cli("Aider", "aider", dry_run=False)
+        self.assertEqual(run.call_count, 2)
+        first_call, second_call = run.call_args_list
+        self.assertEqual(first_call.args[0], ["/usr/bin/pipx", "install", "aider-install"])
+        self.assertEqual(second_call.args[0], ["/usr/bin/aider-install"])
+        self.assertIn("installed", message)
+        self.assertTrue(ok)
+
+    def test_install_cli_multi_step_installer_dry_run_shows_both_steps(self):
+        def fake_which(name):
+            return "/usr/bin/pipx" if name == "pipx" else None
+        with mock.patch.object(install.shutil, "which", side_effect=fake_which), \
+             mock.patch.object(install.subprocess, "run") as run:
+            message, ok = install.install_cli("Aider", "aider", dry_run=True)
+        run.assert_not_called()
+        self.assertIn("pipx install aider-install", message)
+        self.assertIn("aider-install", message)
+        self.assertTrue(ok)
+
+    def test_install_cli_multi_step_installer_stops_after_failing_step(self):
+        def fake_which(name):
+            return f"/usr/bin/{name}" if name in ("pipx", "aider-install") else None
+        with mock.patch.object(install.shutil, "which", side_effect=fake_which), \
+             mock.patch.object(install.subprocess, "run",
+                               side_effect=install.subprocess.CalledProcessError(1, "pipx")) as run:
+            message, ok = install.install_cli("Aider", "aider", dry_run=False)
+        run.assert_called_once()
+        self.assertIn("install failed", message)
+        self.assertFalse(ok)
 
     def test_install_cli_reports_subprocess_failure(self):
         def fake_which(name):
@@ -269,7 +328,8 @@ class InstallTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             bin_dir = Path(td) / "bin"
             printed = []
-            with mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
+            with mock.patch.object(install, "current_platform", return_value=("linux", "x86_64")), \
+                 mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
                 install.main(["--bin-dir", str(bin_dir), "--skip-clis"])
             self.assertTrue((bin_dir / "roundtable").is_symlink())
             self.assertFalse(any("already installed" in line or "not found" in line for line in printed))
@@ -350,7 +410,7 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(result, 1)
 
     def test_main_returns_zero_when_only_informational_missing_clis(self):
-        """agy/grok with no installer must not make the whole install fail."""
+        """A CLI with no automated installer (e.g. agy) must not make the whole install fail."""
         with tempfile.TemporaryDirectory() as td:
             bin_dir = Path(td) / "bin"
 

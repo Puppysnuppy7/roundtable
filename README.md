@@ -41,15 +41,16 @@ existing command is left untouched unless you pass `--force`; a previous install
 script (symlink, matching `.cmd` shim, or copy of `roundtable.py`) is refreshed in place without
 `--force`. It then installs whichever of the six agent CLIs it has a
 verified command for: `npm install -g @openai/codex` (Codex), `npm install -g
-@anthropic-ai/claude-code` (Claude), `pipx install aider-chat` (Aider), and `npm install -g
-@qwen-code/qwen-code` (Qwen) — each skipped if already on `PATH`, and skipped with an explanation
-if the required package manager (`npm`/`pipx`) isn't. Antigravity (`agy`) and Grok (`grok`) have no
-publicly documented package-manager install command this script can verify, so for those two it
-only reports whether the CLI is already present rather than guessing an install command; install
-them yourself per each vendor's own instructions. `--skip-clis` links only the `roundtable` command;
+@anthropic-ai/claude-code` (Claude), `pipx install aider-chat` (Aider), `npm install -g
+@xai-official/grok` (Grok), and `npm install -g @qwen-code/qwen-code` (Qwen) — each skipped if
+already on `PATH`, and skipped with an explanation if the required package manager (`npm`/`pipx`)
+isn't. Antigravity (`agy`) has no package-manager install command this script can verify (its
+official installer is a `curl | bash` / `irm | iex` script, not a registry package), so it only
+reports whether the CLI is already present rather than guessing an install command; install it
+yourself per the vendor's own instructions. `--skip-clis` links only the `roundtable` command;
 `--only Codex Aider ...` restricts CLI installation to specific agents; `--dry-run` prints what
 would happen without changing anything. Exit status is non-zero if linking fails or any attempted
-CLI auto-install fails (or cannot run because its package manager is missing); missing agy/grok is
+CLI auto-install fails (or cannot run because its package manager is missing); missing agy is
 informational and does not fail the install. All still need authenticating after install — see below.
 You can also run `roundtable --install` once the command is already on `PATH` (or
 `python3 roundtable.py --install` from the repo). Extra installer flags after `--install`
@@ -142,7 +143,13 @@ Useful options:
                        on their primary turn gets one extra prompt to pick up unclaimed work or help
                        a still-running agent; later finishers stay idle (one concurrent bonus max)
 --dead-code-check      Before the final answer is drafted, have one agent search this session's
-                       code changes for now-unused functions/branches and remove any it finds
+                       code changes for now-unused functions/branches and remove any it finds.
+                       Forced off in --chat mode, which never edits files
+--chat                 Plain-text discussion mode: agents discuss/answer the objective as a
+                       question instead of editing code. Every turn runs read-only (the same
+                       no_edit mode the final-answer relay always uses), role hints and the final
+                       answer format are reframed for prose instead of a task-outcome summary, and
+                       the Code Monitor panel is replaced with a plain "chat mode" label
 --preflight-timeout S  Set the positive timeout in seconds for each startup connectivity check
                        (default: 90, or 25 with --no-extended-preflight)
 --skip-preflight       Skip startup connectivity checks

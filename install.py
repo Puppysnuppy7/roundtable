@@ -2,10 +2,11 @@
 """Installer for roundtable and the six AI CLIs it drives.
 
 Links `roundtable.py` onto PATH as `roundtable`, then installs whichever of the
-AGENT_EXECUTABLES entries (see roundtable.py) it has a verified install command for. Two of
-the six -- Antigravity (`agy`) and Grok (`grok`) -- have no publicly documented package-manager
-install command known to this script, so it only reports whether they are present; it never
-guesses a curl/npm/pip command for them.
+AGENT_EXECUTABLES entries (see roundtable.py) it has a verified install command for. One of
+the six -- Antigravity (`agy`) -- has no package-manager install command known to this script
+(its official installer is a `curl | bash` / `irm | iex` script, not a registry package -- see
+the note above CLI_INSTALLERS), so it only reports whether it is present; it never guesses a
+curl/npm/pip command for it.
 
 Usage:
     python3 install.py                 # link roundtable + install all installable CLIs
@@ -39,14 +40,24 @@ AGENT_EXECUTABLES: dict[str, str] = {
 }
 AGENT_NAMES: tuple[str, ...] = tuple(AGENT_EXECUTABLES)
 
-# Verified install commands, keyed by the executable name (AGENT_EXECUTABLES's values).
-# None means: no automated installer available -- report status only, never invent one.
-CLI_INSTALLERS: dict[str, list[str] | None] = {
+# Verified install commands, keyed by the executable name (AGENT_EXECUTABLES's values). Most are
+# a single command (list[str]); a few need more than one step run in sequence (list[list[str]]).
+# None means: no automated installer available -- report status only, never invent one. agy is
+# None deliberately: its official installer (curl -fsSL https://antigravity.google/cli/install.sh
+# | bash, or the PowerShell irm/iex equivalent on Windows) pulls and executes a remote script
+# rather than installing from a package registry, which is a different trust/reversibility
+# profile than every other command in this dict -- wiring that in as a silent default here is a
+# call for whoever owns this script's security posture, not something to add unprompted.
+CLI_INSTALLERS: dict[str, list[str] | list[list[str]] | None] = {
     "codex": ["npm", "install", "-g", "@openai/codex"],
     "claude": ["npm", "install", "-g", "@anthropic-ai/claude-code"],
     "agy": None,
-    "aider": ["pipx", "install", "aider-chat"],
-    "grok": None,
+    # Not `pipx install aider-chat` directly: aider-chat hard-pins numpy==1.26.4, which has no
+    # cp313 wheel on any platform (verified via PyPI's own JSON API, not just observed on one
+    # machine) -- pip's naive resolver chokes on it. aider-install's own installer uses uv's
+    # resolver instead, which handles this correctly; verified working end-to-end.
+    "aider": [["pipx", "install", "aider-install"], ["aider-install"]],
+    "grok": ["npm", "install", "-g", "@xai-official/grok"],
     "qwen": ["npm", "install", "-g", "@qwen-code/qwen-code"],
 }
 
@@ -55,16 +66,19 @@ CLI_INSTALLER_REQUIRES: dict[str, str] = {
     "codex": "npm",
     "claude": "npm",
     "aider": "pipx",
+    "grok": "npm",
     "qwen": "npm",
 }
 
 # (system, arch) pairs each npm package has a verified prebuilt binary for, per its own
-# `optionalDependencies` on the npm registry (checked 2026-07-27; re-verify with
-# `npm view <package> optionalDependencies` if a vendor adds platform support later). Aider is
+# `optionalDependencies` on the npm registry (checked 2026-07-27, grok added 2026-08-06; re-verify
+# with `npm view <package> optionalDependencies` if a vendor adds platform support later). Aider is
 # pure Python and needs no entry here -- pip/pipx wheels are architecture-agnostic. Qwen's set is
 # narrower than its own package's platforms because one of its native deps (`@lydell/node-pty`)
 # publishes no linux-arm64 prebuild, so an aarch64 Linux install may fall back to compiling from
-# source (needs a C toolchain) or fail outright.
+# source (needs a C toolchain) or fail outright. Grok has no such caveat -- its own os/cpu and
+# optionalDependencies fields cover all six combinations below with dedicated native packages
+# (verified working end-to-end on linux-arm64, not just declared).
 _X64 = "x86_64"
 _ARM64 = "arm64"
 NPM_ARCH_SUPPORT: dict[str, set[tuple[str, str]]] = {
@@ -72,6 +86,8 @@ NPM_ARCH_SUPPORT: dict[str, set[tuple[str, str]]] = {
               ("windows", _X64), ("windows", _ARM64)},
     "claude": {("linux", _X64), ("linux", _ARM64), ("darwin", _X64), ("darwin", _ARM64),
                ("windows", _X64), ("windows", _ARM64)},
+    "grok": {("linux", _X64), ("linux", _ARM64), ("darwin", _X64), ("darwin", _ARM64),
+             ("windows", _X64), ("windows", _ARM64)},
     "qwen": {("linux", _X64), ("darwin", _X64), ("darwin", _ARM64),
              ("windows", _X64), ("windows", _ARM64)},
 }
@@ -79,10 +95,7 @@ NPM_ARCH_SUPPORT: dict[str, set[tuple[str, str]]] = {
 # Caveats about CLIs this script cannot auto-install (see CLI_INSTALLERS), surfaced only when the
 # current machine isn't the common case (x86_64) they were observed on -- an inference from the
 # actual binary shipped to one real machine, not a documented vendor guarantee.
-NO_INSTALLER_ARCH_CAVEATS: dict[str, str] = {
-    "grok": "this vendor's Linux build has been observed shipping as an x86_64-only binary; "
-            "unconfirmed for other architectures",
-}
+NO_INSTALLER_ARCH_CAVEATS: dict[str, str] = {}
 
 
 def current_platform() -> tuple[str, str]:
@@ -230,8 +243,8 @@ def install_cli(name: str, executable: str, dry_run: bool,
     """Ensure one agent's CLI is installed.
 
     Returns (status_message, ok). ok is False when an install was attempted and failed, or when
-    the required package manager is missing so a needed auto-install cannot run. Informational
-    "no automated installer" cases (agy/grok) are ok=True -- they are not failures of this script.
+    the required package manager is missing so a needed auto-install cannot run. The informational
+    "no automated installer" case (agy) is ok=True -- it is not a failure of this script.
     """
     found = shutil.which(executable)
     if found:
@@ -243,18 +256,26 @@ def install_cli(name: str, executable: str, dry_run: bool,
         note = f" ({caveat})" if caveat and current[1] != _X64 else ""
         return (f"{name:<11} {executable:<7} not found -- no automated installer here; "
                  f"install it yourself per the vendor's own instructions{note}", True)
+    steps = command if isinstance(command[0], list) else [command]
+    joined = " && ".join(" ".join(step) for step in steps)
     requirement = CLI_INSTALLER_REQUIRES.get(executable)
     if requirement and not shutil.which(requirement):
         return (f"{name:<11} {executable:<7} not found -- needs `{requirement}` on PATH to "
-                 f"auto-install; once available run: {' '.join(command)}", False)
+                 f"auto-install; once available run: {joined}", False)
     supported = NPM_ARCH_SUPPORT.get(executable)
     arch_note = ""
     if supported is not None and current not in supported:
         arch_note = f" [no verified prebuilt binary for {current[0]}-{current[1]}; may fail]"
     if dry_run:
-        return f"{name:<11} {executable:<7} would run: {' '.join(command)}{arch_note}", True
+        return f"{name:<11} {executable:<7} would run: {joined}{arch_note}", True
     try:
-        subprocess.run(command, check=True)
+        for step in steps:
+            # Resolve the launcher to its real path before handing it to subprocess. On Windows,
+            # npm/pipx are .cmd/.exe wrappers that shutil.which() finds fine, but a bare "npm"
+            # passed to subprocess.run(shell=False) fails with WinError 2 -- unlike a shell,
+            # CreateProcess does not search PATHEXT for an unqualified name, only an exact path.
+            resolved = shutil.which(step[0]) or step[0]
+            subprocess.run([resolved, *step[1:]], check=True)
     except (subprocess.CalledProcessError, OSError) as exc:
         return f"{name:<11} {executable:<7} install failed: {exc}{arch_note}", False
     found_after = shutil.which(executable)
