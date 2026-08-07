@@ -5522,7 +5522,9 @@ def build_parser() -> argparse.ArgumentParser:
                              "roundtable command onto PATH and install available agent CLIs, then exit")
     parser.add_argument("--update", action="store_true",
                         help="like --install, but also re-run each agent CLI's install command "
-                             "even if already present, to pick up a newer version, then exit")
+                             "even if already present, to pick up a newer version, and (if this "
+                             "is a git checkout with no local changes) fast-forward roundtable "
+                             "itself to the latest commit first, then exit")
     parser.add_argument("--bugsend", action="store_true",
                         help="collect platform info, installed agent CLIs, and the "
                              "diagnostic-safe (never prompt/output) lines of the most recent run "

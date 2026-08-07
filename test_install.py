@@ -566,6 +566,7 @@ class InstallTests(unittest.TestCase):
             with mock.patch.object(install, "current_platform", return_value=("linux", "x86_64")), \
                  mock.patch.object(install, "is_musl_libc", return_value=False), \
                  mock.patch.object(install, "install_cli", return_value=("Codex ok", True)), \
+                 mock.patch.object(install, "update_roundtable_repo", return_value=None), \
                  mock.patch.object(install, "check_python_update", return_value="Python ok"), \
                  mock.patch.object(install, "check_npm_update", return_value=None), \
                  mock.patch("builtins.input", side_effect=AssertionError("should not prompt")), \
@@ -580,6 +581,7 @@ class InstallTests(unittest.TestCase):
             with mock.patch.object(install, "current_platform", return_value=("linux", "x86_64")), \
                  mock.patch.object(install, "is_musl_libc", return_value=False), \
                  mock.patch.object(install, "install_cli", return_value=("Codex ok", True)), \
+                 mock.patch.object(install, "update_roundtable_repo", return_value=None), \
                  mock.patch.object(install, "_confirm", return_value=False), \
                  mock.patch.object(install.subprocess, "run") as run, \
                  mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
@@ -593,6 +595,7 @@ class InstallTests(unittest.TestCase):
             with mock.patch.object(install, "current_platform", return_value=("linux", "x86_64")), \
                  mock.patch.object(install, "is_musl_libc", return_value=False), \
                  mock.patch.object(install, "install_cli", return_value=("Codex ok", True)), \
+                 mock.patch.object(install, "update_roundtable_repo", return_value=None), \
                  mock.patch.object(install, "_confirm", return_value=True) as confirm, \
                  mock.patch.object(install, "check_python_update", return_value="Python ok"), \
                  mock.patch.object(install.shutil, "which", return_value=None), \
@@ -825,6 +828,7 @@ class InstallTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             bin_dir = Path(td) / "bin"
             with mock.patch.object(install, "install_cli", side_effect=fake_install_cli), \
+            mock.patch.object(install, "update_roundtable_repo", return_value=None), \
                  mock.patch.object(install, "current_platform", return_value=("linux", "x86_64")), \
                  mock.patch("builtins.print"):
                 install.main(["--bin-dir", str(bin_dir), "--update", "--only", "Codex"])
@@ -1205,6 +1209,128 @@ class InstallTests(unittest.TestCase):
              mock.patch("builtins.print"):
             install.main(["--bugsend", "--message", "bug", "--dry-run"])
         self.assertTrue(send.call_args.args[2])
+
+    def test_update_roundtable_repo_returns_none_when_not_a_git_checkout(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(install, "REPO_ROOT", Path(td)):
+                self.assertIsNone(install.update_roundtable_repo(dry_run=False))
+
+    def test_update_roundtable_repo_reports_missing_git(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / ".git").mkdir()
+            with mock.patch.object(install, "REPO_ROOT", Path(td)), \
+                 mock.patch.object(install.shutil, "which", return_value=None):
+                message = install.update_roundtable_repo(dry_run=False)
+        self.assertIn("git", message)
+        self.assertIn("not found", message)
+
+    def test_update_roundtable_repo_dry_run_never_touches_anything(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / ".git").mkdir()
+            with mock.patch.object(install, "REPO_ROOT", Path(td)), \
+                 mock.patch.object(install.shutil, "which", return_value="/usr/bin/git"), \
+                 mock.patch.object(install.subprocess, "run") as run:
+                message = install.update_roundtable_repo(dry_run=True)
+        run.assert_not_called()
+        self.assertIn("would run", message)
+        self.assertIn("git pull", message)
+
+    def test_update_roundtable_repo_skips_dirty_tree(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / ".git").mkdir()
+            with mock.patch.object(install, "REPO_ROOT", Path(td)), \
+                 mock.patch.object(install.shutil, "which", return_value="/usr/bin/git"), \
+                 mock.patch.object(install.subprocess, "run") as run:
+                run.return_value = mock.Mock(returncode=0, stdout=" M roundtable.py\n")
+                message = install.update_roundtable_repo(dry_run=False)
+        run.assert_called_once()  # only the status check, never a pull
+        self.assertIn("local changes present", message)
+        self.assertNotIn("failed", message)
+
+    def test_update_roundtable_repo_pulls_on_clean_tree(self):
+        def fake_run(cmd, **kwargs):
+            if cmd[-2:] == ["status", "--porcelain"]:
+                return mock.Mock(returncode=0, stdout="")
+            return mock.Mock(returncode=0, stdout="Updating abc123..def456\nFast-forward\n",
+                             stderr="")
+
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / ".git").mkdir()
+            with mock.patch.object(install, "REPO_ROOT", Path(td)), \
+                 mock.patch.object(install.shutil, "which", return_value="/usr/bin/git"), \
+                 mock.patch.object(install.subprocess, "run", side_effect=fake_run):
+                message = install.update_roundtable_repo(dry_run=False)
+        self.assertIn("updated", message)
+        self.assertNotIn("failed", message)
+
+    def test_update_roundtable_repo_reports_already_up_to_date(self):
+        def fake_run(cmd, **kwargs):
+            if cmd[-2:] == ["status", "--porcelain"]:
+                return mock.Mock(returncode=0, stdout="")
+            return mock.Mock(returncode=0, stdout="Already up to date.\n", stderr="")
+
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / ".git").mkdir()
+            with mock.patch.object(install, "REPO_ROOT", Path(td)), \
+                 mock.patch.object(install.shutil, "which", return_value="/usr/bin/git"), \
+                 mock.patch.object(install.subprocess, "run", side_effect=fake_run):
+                message = install.update_roundtable_repo(dry_run=False)
+        self.assertIn("already up to date", message)
+        self.assertNotIn("failed", message)
+
+    def test_update_roundtable_repo_reports_pull_failure_without_merging(self):
+        def fake_run(cmd, **kwargs):
+            if cmd[-2:] == ["status", "--porcelain"]:
+                return mock.Mock(returncode=0, stdout="")
+            return mock.Mock(returncode=1, stdout="",
+                             stderr="fatal: Not possible to fast-forward, aborting.")
+
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / ".git").mkdir()
+            with mock.patch.object(install, "REPO_ROOT", Path(td)), \
+                 mock.patch.object(install.shutil, "which", return_value="/usr/bin/git"), \
+                 mock.patch.object(install.subprocess, "run", side_effect=fake_run):
+                message = install.update_roundtable_repo(dry_run=False)
+        self.assertIn("failed", message)
+        self.assertIn("fast-forward", message)
+
+    def test_main_update_calls_update_roundtable_repo(self):
+        with tempfile.TemporaryDirectory() as td:
+            bin_dir = Path(td) / "bin"
+            with mock.patch.object(install, "current_platform", return_value=("linux", "x86_64")), \
+                 mock.patch.object(install, "is_musl_libc", return_value=False), \
+                 mock.patch.object(install, "install_cli", return_value=("Codex ok", True)), \
+                 mock.patch.object(install, "update_roundtable_repo",
+                                   return_value=None) as repo_update, \
+                 mock.patch.object(install, "_confirm", return_value=False), \
+                 mock.patch("builtins.print"):
+                install.main(["--bin-dir", str(bin_dir), "--update", "--only", "Codex"])
+        repo_update.assert_called_once_with(False)
+
+    def test_main_install_without_update_never_calls_update_roundtable_repo(self):
+        with tempfile.TemporaryDirectory() as td:
+            bin_dir = Path(td) / "bin"
+            with mock.patch.object(install, "current_platform", return_value=("linux", "x86_64")), \
+                 mock.patch.object(install, "is_musl_libc", return_value=False), \
+                 mock.patch.object(install, "install_cli", return_value=("Codex ok", True)), \
+                 mock.patch.object(install, "update_roundtable_repo") as repo_update, \
+                 mock.patch("builtins.print"):
+                install.main(["--bin-dir", str(bin_dir), "--only", "Codex"])
+        repo_update.assert_not_called()
+
+    def test_main_update_treats_repo_update_failure_as_overall_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            bin_dir = Path(td) / "bin"
+            with mock.patch.object(install, "current_platform", return_value=("linux", "x86_64")), \
+                 mock.patch.object(install, "is_musl_libc", return_value=False), \
+                 mock.patch.object(install, "install_cli", return_value=("Codex ok", True)), \
+                 mock.patch.object(install, "update_roundtable_repo",
+                                   return_value="roundtable repo: update failed: boom"), \
+                 mock.patch.object(install, "_confirm", return_value=False), \
+                 mock.patch("builtins.print"):
+                result = install.main(["--bin-dir", str(bin_dir), "--update", "--only", "Codex"])
+        self.assertEqual(result, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -460,7 +460,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--update", action="store_true",
                         help="re-run each CLI's install command even if already present, to pick "
                              "up a newer version (also refreshes PATH from the registry on "
-                             "Windows first, in case an earlier install just isn't visible yet)")
+                             "Windows first, in case an earlier install just isn't visible yet); "
+                             "if this is a git checkout with no local changes, also fast-forwards "
+                             "it to the latest commit on its current branch before re-linking "
+                             "roundtable onto PATH -- skipped (not a failure) if local changes "
+                             "are present or this isn't a git checkout at all")
     parser.add_argument("--bugsend", action="store_true",
                         help="collect platform info, installed agent CLIs, and the "
                              "diagnostic-safe (never prompt/output) lines of the most recent run "
@@ -705,6 +709,45 @@ def send_bug_report(description: str, log_path: Path | None, dry_run: bool,
     return result.stdout.strip(), True
 
 
+def update_roundtable_repo(dry_run: bool) -> str | None:
+    """Fast-forward this checkout to the latest commit on its current branch.
+
+    Never touches a dirty tree -- --update should refresh things, not risk merging over or
+    discarding work in progress -- and only ever fast-forwards (--ff-only), never creating a
+    merge commit in an unattended run. Returns None (nothing to report, not a failure) when
+    REPO_ROOT isn't a git checkout at all -- e.g. a plain file copy like this project's own
+    installer test box uses, walked over by hand rather than git-cloned.
+    """
+    if not (REPO_ROOT / ".git").exists():
+        return None
+    git = shutil.which("git")
+    if not git:
+        return "roundtable repo: `git` not found on PATH -- skipping self-update"
+    if dry_run:
+        return "would run: git pull --ff-only (in the roundtable checkout)"
+    try:
+        status = subprocess.run([git, "-C", str(REPO_ROOT), "status", "--porcelain"],
+                                capture_output=True, text=True, timeout=15, check=True)
+    except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired) as exc:
+        return f"roundtable repo: couldn't check status ({exc}) -- skipping self-update"
+    if status.stdout.strip():
+        return ("roundtable repo: local changes present -- skipping self-update (commit or "
+                "stash them first, then re-run --update)")
+    try:
+        pull = subprocess.run([git, "-C", str(REPO_ROOT), "pull", "--ff-only"],
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"roundtable repo: update failed: {exc}"
+    if pull.returncode != 0:
+        detail = (pull.stderr or pull.stdout).strip()
+        tail = "\n".join(detail.splitlines()[-5:]) if detail else str(pull.returncode)
+        return f"roundtable repo: update failed:\n{tail}"
+    output = pull.stdout.strip()
+    if "up to date" in output.lower():
+        return "roundtable repo: already up to date"
+    return f"roundtable repo: updated\n{output}"
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     current = current_platform()
@@ -748,6 +791,16 @@ def main(argv: list[str] | None = None) -> int:
         print("warning: Codex and Claude Code publish no 32-bit ARM build; those two will not "
               "be installable here even though the commands below will be attempted.")
 
+    repo_update_failed = False
+    if args.update:
+        # Before re-linking below, so a freshly-pulled roundtable.py is what actually gets
+        # linked onto PATH -- pulling after would leave this run using the stale copy anyway
+        # (Python doesn't hot-reload), but at least the *next* invocation picks up the update.
+        repo_update_message = update_roundtable_repo(args.dry_run)
+        if repo_update_message is not None:
+            print(repo_update_message)
+            repo_update_failed = "failed" in repo_update_message
+
     bin_dir = args.bin_dir or default_bin_dir()
     try:
         print(install_roundtable_symlink(
@@ -760,10 +813,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"warning: {bin_dir} is not on PATH -- add it to your shell profile")
 
     if args.skip_clis:
-        return 1 if windows_deps_failed else 0
+        return 1 if (windows_deps_failed or repo_update_failed) else 0
 
     print()
-    any_failed = windows_deps_failed
+    any_failed = windows_deps_failed or repo_update_failed
     for name in (args.only or AGENT_NAMES):
         message, ok = install_cli(
             name, AGENT_EXECUTABLES[name], args.dry_run, current=current, musl=musl,
