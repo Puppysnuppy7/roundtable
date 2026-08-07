@@ -183,6 +183,52 @@ class InstallTests(unittest.TestCase):
         self.assertIn("no automated installer", message)
         self.assertTrue(ok)  # informational, not a hard failure
 
+    def test_install_cli_agy_not_found_includes_auth_hint(self):
+        """agy is never installed by this script at all, so its auth hint has to show every time
+        it's reported missing, not just on a fresh install -- otherwise a user who does install it
+        by hand (per the message right next to this) never learns it also needs a browser login."""
+        with mock.patch.object(install.shutil, "which", return_value=None):
+            message, _ok = install.install_cli("Antigravity", "agy", dry_run=False,
+                                                current=("linux", "x86_64"))
+        self.assertIn("browser-based Google login", message)
+
+    def test_install_cli_fresh_install_includes_auth_hint_for_known_agent(self):
+        """Regression: the auth-status gap that caught agy live -- being on PATH isn't the same as
+        being authenticated. A genuinely new install of an agent this script has specific,
+        verified auth gotchas for (aider's model API key) should say so right away."""
+        def fake_which(name):
+            return "/usr/bin/pipx" if name in ("pipx", "aider-install") else None
+        with mock.patch.object(install.shutil, "which", side_effect=fake_which), \
+             mock.patch.object(install.subprocess, "run"):
+            message, ok = install.install_cli("Aider", "aider", dry_run=False)
+        self.assertIn("installed", message)
+        self.assertIn("MISTRAL_API_KEY", message)
+        self.assertTrue(ok)
+
+    def test_install_cli_uses_generic_auth_hint_for_unlisted_agent(self):
+        """Codex/Claude/Grok have no specific verified auth gotcha recorded here -- still get a
+        hint, just an honestly generic one, rather than inventing vendor-specific steps this
+        script has never actually confirmed."""
+        def fake_which(name):
+            return "/usr/bin/npm" if name == "npm" else None
+        with mock.patch.object(install.shutil, "which", side_effect=fake_which), \
+             mock.patch.object(install.subprocess, "run"):
+            message, ok = install.install_cli("Codex", "codex", dry_run=False)
+        self.assertIn("vendor's own login/authentication instructions", message)
+        self.assertTrue(ok)
+
+    def test_install_cli_update_of_already_present_agent_omits_auth_hint(self):
+        """An --update of a CLI that was already there presumably already got authenticated once
+        -- re-showing the hint on every routine update would just be noise."""
+        def fake_which(name):
+            return f"/usr/bin/{name}" if name in ("aider", "pipx", "aider-install") else None
+        with mock.patch.object(install.shutil, "which", side_effect=fake_which), \
+             mock.patch.object(install.subprocess, "run"):
+            message, ok = install.install_cli("Aider", "aider", dry_run=False, update=True)
+        self.assertIn("updated", message)
+        self.assertNotIn("MISTRAL_API_KEY", message)
+        self.assertTrue(ok)
+
     def test_install_cli_grok_installs_via_npm_with_full_arch_support(self):
         def fake_which(name):
             return "/usr/bin/npm" if name == "npm" else None

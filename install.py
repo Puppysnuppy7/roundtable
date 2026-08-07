@@ -108,6 +108,25 @@ NPM_ARCH_SUPPORT: dict[str, set[tuple[str, str]]] = {
 # actual binary shipped to one real machine, not a documented vendor guarantee.
 NO_INSTALLER_ARCH_CAVEATS: dict[str, str] = {}
 
+# Being on PATH (what install_cli/verify_clis actually check) isn't the same as being usable --
+# every agent still needs its own vendor login/API key before it can do real work, and a session
+# that gets this far only to fail mid-run on an unauthenticated agent wastes the other five agents'
+# work discovering that. Surfaced once, right when a CLI is genuinely new here (see install_cli),
+# not on every "already installed" report. Specific, verified gotchas where we have them; a
+# deliberately generic fallback everywhere else rather than inventing a vendor's login flow this
+# script has never actually exercised -- most of these are interactive browser OAuth or a
+# user-supplied API key, neither safe to script blindly.
+AGENT_AUTH_HINTS: dict[str, str] = {
+    "agy": "once installed, run `agy` by hand and complete the browser-based Google login it "
+           "opens -- a fresh install has no session yet, and this can need redoing occasionally "
+           "even after the first login.",
+    "aider": "needs an API key for whichever model you point it at (roundtable's default is "
+             "Mistral's Codestral, so MISTRAL_API_KEY) -- it has no login flow of its own.",
+    "qwen": "needs `--auth-type openai` explicitly (env vars alone are silently ignored) plus an "
+            "explicit `-m <model>`, and the matching API key env var for your provider.",
+}
+_GENERIC_AUTH_HINT = "check the vendor's own login/authentication instructions before first use."
+
 
 def current_platform() -> tuple[str, str]:
     """(os family, cpu arch) normalized to the vocabulary vendors publish prebuilt binaries under."""
@@ -378,8 +397,9 @@ def install_cli(name: str, executable: str, dry_run: bool, current: tuple[str, s
             return (f"{name:<11} {executable:<7} already installed ({found}) -- no automated "
                      f"update available; update it yourself per the vendor's own instructions"
                      f"{note}", True)
+        auth_hint = AGENT_AUTH_HINTS.get(executable, _GENERIC_AUTH_HINT)
         return (f"{name:<11} {executable:<7} not found -- no automated installer here; "
-                 f"install it yourself per the vendor's own instructions{note}", True)
+                 f"install it yourself per the vendor's own instructions{note}. {auth_hint}", True)
     steps = command if isinstance(command[0], list) else [command]
     joined = " && ".join(" ".join(step) for step in steps)
     requirement = CLI_INSTALLER_REQUIRES.get(executable)
@@ -411,7 +431,10 @@ def install_cli(name: str, executable: str, dry_run: bool, current: tuple[str, s
         return f"{name:<11} {executable:<7} {verb} failed: {exc}{arch_note}", False
     found_after = shutil.which(executable)
     status = found_after if found_after else "not on PATH yet -- open a new shell"
-    return f"{name:<11} {executable:<7} {verb_past} ({status}){arch_note}", True
+    # Only for a genuine first-time install (not an --update of something already present and
+    # presumably already authenticated) -- `found` still holds its original pre-action value here.
+    auth_note = f" -- {AGENT_AUTH_HINTS.get(executable, _GENERIC_AUTH_HINT)}" if not found else ""
+    return f"{name:<11} {executable:<7} {verb_past} ({status}){arch_note}{auth_note}", True
 
 
 def build_parser() -> argparse.ArgumentParser:
