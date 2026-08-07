@@ -25,6 +25,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    import winreg
+except ImportError:
+    winreg = None  # not Windows -- refresh_windows_path() is a no-op there
+
 REPO_ROOT = Path(__file__).resolve().parent
 
 # Keep this small manifest local: importing roundtable.py would import curses, which is absent from
@@ -141,6 +146,44 @@ def is_musl_libc(current: tuple[str, str] | None = None) -> bool:
         return "musl" in result.stdout.lower()
     except (OSError, subprocess.TimeoutExpired):
         return False
+
+
+def refresh_windows_path(current: tuple[str, str] | None = None) -> None:
+    """Re-read PATH from the registry and merge any new entries into this process's own
+    os.environ before checking anything with shutil.which().
+
+    An installer this script just ran (Node's MSI, Antigravity's setup step, etc.) updates PATH by
+    writing the registry and broadcasting WM_SETTINGCHANGE -- but that broadcast only reaches
+    already-running programs that listen for it (like Explorer), not an existing terminal's
+    inherited environment block. A Command Prompt opened before those installs ran keeps reporting
+    a just-installed CLI as "not found" even though it's genuinely on PATH for any new process.
+    Re-reading the registry directly here means `roundtable --install` doesn't require the user to
+    close and reopen their terminal just to see what it itself installed a moment ago.
+    """
+    if (current or current_platform())[0] != "windows" or winreg is None:
+        return
+    def read_reg_path(hive: int, subkey: str) -> str:
+        try:
+            with winreg.OpenKey(hive, subkey) as key:
+                value, _ = winreg.QueryValueEx(key, "Path")
+                return value
+        except OSError:
+            return ""
+    registry_dirs = (
+        read_reg_path(winreg.HKEY_LOCAL_MACHINE,
+                     r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment")
+        + ";" + read_reg_path(winreg.HKEY_CURRENT_USER, "Environment")
+    ).split(";")
+    # Windows' PATH separator is always ';', regardless of what platform is actually running this
+    # code (this function only does anything when `current` is windows -- but that can be a
+    # simulated value in a test on a POSIX runner, where os.pathsep would wrongly be ':').
+    current_dirs = os.environ.get("PATH", "").split(";")
+    seen = {d.lower() for d in current_dirs if d}
+    for d in registry_dirs:
+        if d and d.lower() not in seen:
+            current_dirs.append(d)
+            seen.add(d.lower())
+    os.environ["PATH"] = ";".join(d for d in current_dirs if d)
 
 
 def default_bin_dir() -> Path:
@@ -371,6 +414,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     current = current_platform()
+    refresh_windows_path(current)
     print(f"Detected platform: {current[0]}-{current[1]} (Python {platform.python_version()})")
     if is_wsl(current):
         print("note: running inside WSL -- PATH/binary interop with any Windows-side install of "

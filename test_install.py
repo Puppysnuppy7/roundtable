@@ -178,6 +178,88 @@ class InstallTests(unittest.TestCase):
             message = install.ensure_windows_dependencies(dry_run=False, current=("windows", "x86_64"))
         self.assertIn("failed", message)
 
+    def test_refresh_windows_path_is_noop_off_windows(self):
+        with mock.patch.dict(os.environ, {"PATH": "/usr/bin"}, clear=False):
+            install.refresh_windows_path(current=("linux", "x86_64"))
+            self.assertEqual(os.environ["PATH"], "/usr/bin")
+
+    def test_refresh_windows_path_is_noop_when_winreg_unavailable(self):
+        with mock.patch.object(install, "winreg", None), \
+             mock.patch.dict(os.environ, {"PATH": r"C:\existing"}, clear=False):
+            install.refresh_windows_path(current=("windows", "x86_64"))
+            self.assertEqual(os.environ["PATH"], r"C:\existing")
+
+    def test_refresh_windows_path_merges_new_registry_entries(self):
+        class FakeKey:
+            def __init__(self, value):
+                self.value = value
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        class FakeWinreg:
+            HKEY_LOCAL_MACHINE = 1
+            HKEY_CURRENT_USER = 2
+
+            def OpenKey(self, hive, subkey):
+                if hive == self.HKEY_LOCAL_MACHINE:
+                    return FakeKey(r"C:\Windows;C:\Windows\System32")
+                return FakeKey(r"C:\Users\User\.local\bin;C:\Program Files\nodejs")
+
+            def QueryValueEx(self, key, name):
+                return key.value, 1
+
+        with mock.patch.object(install, "winreg", FakeWinreg()), \
+             mock.patch.dict(os.environ, {"PATH": r"C:\existing"}, clear=False):
+            install.refresh_windows_path(current=("windows", "x86_64"))
+            dirs = os.environ["PATH"].split(";")
+        self.assertEqual(dirs[0], r"C:\existing")
+        self.assertIn(r"C:\Program Files\nodejs", dirs)
+        self.assertIn(r"C:\Users\User\.local\bin", dirs)
+
+    def test_refresh_windows_path_dedupes_case_insensitively(self):
+        class FakeKey:
+            def __init__(self, value):
+                self.value = value
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        class FakeWinreg:
+            HKEY_LOCAL_MACHINE = 1
+            HKEY_CURRENT_USER = 2
+
+            def OpenKey(self, hive, subkey):
+                return FakeKey(r"c:\existing;C:\NewDir")
+
+            def QueryValueEx(self, key, name):
+                return key.value, 1
+
+        with mock.patch.object(install, "winreg", FakeWinreg()), \
+             mock.patch.dict(os.environ, {"PATH": r"C:\existing"}, clear=False):
+            install.refresh_windows_path(current=("windows", "x86_64"))
+            dirs = os.environ["PATH"].split(";")
+        self.assertEqual(dirs.count(r"C:\existing"), 1)
+        self.assertIn(r"C:\NewDir", dirs)
+
+    def test_refresh_windows_path_tolerates_missing_registry_keys(self):
+        class FakeWinreg:
+            HKEY_LOCAL_MACHINE = 1
+            HKEY_CURRENT_USER = 2
+
+            def OpenKey(self, hive, subkey):
+                raise OSError("key not found")
+
+            def QueryValueEx(self, key, name):
+                raise AssertionError("unreachable")
+
+        with mock.patch.object(install, "winreg", FakeWinreg()), \
+             mock.patch.dict(os.environ, {"PATH": r"C:\existing"}, clear=False):
+            install.refresh_windows_path(current=("windows", "x86_64"))
+            self.assertEqual(os.environ["PATH"], r"C:\existing")
+
     def test_current_platform_normalizes_known_architectures(self):
         cases = {
             "x86_64": "x86_64", "AMD64": "x86_64",
