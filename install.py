@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ntpath
 import os
 import platform
 import shutil
@@ -166,7 +167,13 @@ def refresh_windows_path(current: tuple[str, str] | None = None) -> None:
         try:
             with winreg.OpenKey(hive, subkey) as key:
                 value, _ = winreg.QueryValueEx(key, "Path")
-                return value
+                # PATH is commonly stored as REG_EXPAND_SZ with literal tokens like
+                # %LOCALAPPDATA% (e.g. Antigravity's own installer writes exactly that).
+                # ntpath.expandvars specifically (not os.path.expandvars) -- Windows env-var
+                # syntax is always %VAR%, regardless of what platform is actually running this
+                # code; os.path.expandvars would follow the real host's rules instead (no-op for
+                # %VAR% syntax on POSIX, where os.path is posixpath).
+                return ntpath.expandvars(value)
         except OSError:
             return ""
     registry_dirs = (

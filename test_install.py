@@ -260,6 +260,39 @@ class InstallTests(unittest.TestCase):
             install.refresh_windows_path(current=("windows", "x86_64"))
             self.assertEqual(os.environ["PATH"], r"C:\existing")
 
+    def test_refresh_windows_path_expands_registry_env_var_tokens(self):
+        """Regression: Antigravity's own installer writes its PATH entry as the literal,
+        unexpanded '%LOCALAPPDATA%\\agy\\bin' (a REG_EXPAND_SZ token) -- QueryValueEx returns
+        that raw string as-is; only os.path.expandvars actually resolves it."""
+        class FakeKey:
+            def __init__(self, value):
+                self.value = value
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        class FakeWinreg:
+            HKEY_LOCAL_MACHINE = 1
+            HKEY_CURRENT_USER = 2
+
+            def OpenKey(self, hive, subkey):
+                if hive == self.HKEY_CURRENT_USER:
+                    return FakeKey(r"%LOCALAPPDATA%\agy\bin")
+                raise OSError("not set")
+
+            def QueryValueEx(self, key, name):
+                return key.value, 2  # REG_EXPAND_SZ
+
+        with mock.patch.object(install, "winreg", FakeWinreg()), \
+             mock.patch.dict(os.environ,
+                             {"PATH": r"C:\existing", "LOCALAPPDATA": r"C:\Users\User\AppData\Local"},
+                             clear=False):
+            install.refresh_windows_path(current=("windows", "x86_64"))
+            dirs = os.environ["PATH"].split(";")
+        self.assertIn(r"C:\Users\User\AppData\Local\agy\bin", dirs)
+        self.assertNotIn(r"%LOCALAPPDATA%\agy\bin", dirs)
+
     def test_current_platform_normalizes_known_architectures(self):
         cases = {
             "x86_64": "x86_64", "AMD64": "x86_64",
