@@ -391,6 +391,22 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(failed)
         self.assertTrue(any("pip upgrade failed" in m for m in messages))
 
+    def test_update_package_managers_explains_externally_managed_environment_without_failing(self):
+        """Regression: found by actually running --update live on a real Debian-based box (the
+        Pi) -- pip refuses to touch its own system install there (PEP 668), --user included. This
+        is the OS correctly protecting itself, not a bug in this script, so it must not count as
+        a failure -- just an honest, actionable explanation instead of a bare exit-status message."""
+        error = install.subprocess.CalledProcessError(
+            1, ["pip", "install", "--upgrade", "pip"],
+            output="", stderr="error: externally-managed-environment\n\n"
+                              "× This environment is externally managed\n")
+        with mock.patch.object(install.shutil, "which", return_value=None), \
+             mock.patch.object(install.subprocess, "run", side_effect=error):
+            messages, failed = install.update_package_managers(dry_run=False)
+        self.assertFalse(failed)
+        self.assertTrue(any("externally managed" in m and "upgrade skipped" in m for m in messages))
+        self.assertFalse(any("upgrade failed" in m for m in messages))
+
     def test_main_update_dry_run_shows_package_manager_plan_without_prompting(self):
         with tempfile.TemporaryDirectory() as td:
             bin_dir = Path(td) / "bin"

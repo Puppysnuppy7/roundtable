@@ -473,9 +473,25 @@ def update_package_managers(dry_run: bool) -> tuple[list[str], bool]:
             messages.append(f"would run: {' '.join(command)}")
             continue
         try:
-            subprocess.run(command, check=True)
+            # Captured (unlike install_cli's live-streamed subprocess calls) specifically so a
+            # PEP 668 "externally-managed-environment" refusal (common on Debian/Ubuntu -- pip
+            # blocks *any* direct install/upgrade against the system Python, --user included) can
+            # be told apart from a genuine failure and explained, instead of just "exit status 1".
+            subprocess.run(command, check=True, capture_output=True, text=True)
             messages.append(f"{label} upgraded")
-        except (subprocess.CalledProcessError, OSError) as exc:
+        except subprocess.CalledProcessError as exc:
+            output = exc.stderr or exc.stdout or ""
+            if "externally-managed-environment" in output:
+                messages.append(
+                    f"{label} upgrade skipped: this system's Python is externally managed (PEP "
+                    f"668, e.g. Debian/Ubuntu) -- pip refuses to touch it directly, --user "
+                    f"included. Use your OS package manager instead (e.g. `apt install "
+                    f"--only-upgrade python3-pip`), or pass --break-system-packages yourself if "
+                    f"you understand the risk; this script won't do that automatically.")
+            else:
+                messages.append(f"{label} upgrade failed: {exc}")
+                any_failed = True
+        except OSError as exc:
             messages.append(f"{label} upgrade failed: {exc}")
             any_failed = True
     return messages, any_failed
