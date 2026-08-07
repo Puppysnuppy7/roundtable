@@ -21,9 +21,11 @@ import argparse
 import ntpath
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 
 try:
@@ -448,18 +450,64 @@ def _confirm(prompt: str) -> bool:
     return answer.strip().lower() in ("y", "yes")
 
 
+def check_python_update() -> str:
+    """Query python.org's official release index (its ftp directory listing, e.g. `3.13.15/`) for
+    the latest patch release in the running major.minor series, and report if a newer one exists.
+    Read-only network check; never installs anything -- see update_package_managers' docstring
+    for why upgrading the interpreter itself is out of scope for this script. Best-effort: any
+    network/parsing problem just says so rather than failing loudly.
+    """
+    major, minor, patch = platform.python_version_tuple()
+    major_minor = f"{major}.{minor}"
+    try:
+        with urllib.request.urlopen("https://www.python.org/ftp/python/", timeout=5) as response:
+            html = response.read().decode("utf-8", errors="replace")
+    except (OSError, ValueError):
+        return f"Python {platform.python_version()} (couldn't reach python.org to check for a newer release)"
+    patches = [int(m) for m in re.findall(rf'href="{re.escape(major_minor)}\.(\d+)/"', html)]
+    if not patches:
+        return f"Python {platform.python_version()} (couldn't find {major_minor}.x releases on python.org)"
+    latest = max(patches)
+    if latest > int(patch):
+        return (f"Python {platform.python_version()} -- {major_minor}.{latest} is available "
+                f"(python.org); update via your OS package manager, pyenv, or python.org's own "
+                f"installer if you want it -- this script won't touch the interpreter itself.")
+    return f"Python {platform.python_version()} is already the latest {major_minor}.x release."
+
+
+def check_npm_update() -> str | None:
+    """Query npm's own registry for the latest published npm version and compare to what's
+    installed. Returns None if npm isn't on PATH at all (nothing to check). Read-only -- the
+    actual upgrade attempt (and its own EBADENGINE handling) stays in update_package_managers.
+    """
+    npm = shutil.which("npm")
+    if not npm:
+        return None
+    try:
+        current = subprocess.run([npm, "--version"], capture_output=True, text=True,
+                                 timeout=10, check=True).stdout.strip()
+        latest = subprocess.run([npm, "view", "npm", "version"], capture_output=True, text=True,
+                                timeout=10, check=True).stdout.strip()
+    except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired):
+        return "npm: couldn't check the registry for the latest version"
+    if current == latest:
+        return f"npm {current} is already the latest version"
+    return f"npm {current} installed; {latest} is available"
+
+
 def update_package_managers(dry_run: bool) -> tuple[list[str], bool]:
     """Upgrade pip, and npm/pipx if present. Returns (status_messages, any_failed).
 
     Deliberately does not touch the Python interpreter itself -- upgrading Python is a much
     bigger, install-method-specific operation (the Windows .msi, apt/dnf, pyenv, python.org's own
     installer all do this differently, and getting it wrong risks breaking every venv on the
-    machine) that this installer has no business attempting. Just report the running version so
-    the user can decide whether to go update it themselves.
+    machine) that this installer has no business attempting. Just checks (and reports) whether a
+    newer release exists, same as the npm version check below, so the user can decide.
     """
-    messages = [f"Python {platform.python_version()} -- update this yourself via your OS package "
-                "manager, pyenv, or python.org's installer if you want a newer one; this script "
-                "won't touch the interpreter itself."]
+    messages = [check_python_update()]
+    npm_check = check_npm_update()
+    if npm_check:
+        messages.append(npm_check)
     steps: list[tuple[str, list[str]]] = [
         ("pip", [sys.executable, "-m", "pip", "install", "--upgrade", "pip"]),
     ]

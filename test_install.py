@@ -364,7 +364,9 @@ class InstallTests(unittest.TestCase):
     def test_update_package_managers_dry_run_lists_commands_without_running_them(self):
         def fake_which(name):
             return f"/usr/bin/{name}" if name in ("npm", "pipx") else None
-        with mock.patch.object(install.shutil, "which", side_effect=fake_which), \
+        with mock.patch.object(install, "check_python_update", return_value="Python ok"), \
+             mock.patch.object(install, "check_npm_update", return_value=None), \
+             mock.patch.object(install.shutil, "which", side_effect=fake_which), \
              mock.patch.object(install.subprocess, "run") as run:
             messages, failed = install.update_package_managers(dry_run=True)
         run.assert_not_called()
@@ -376,7 +378,9 @@ class InstallTests(unittest.TestCase):
         self.assertIn("pip install --upgrade pipx", joined)
 
     def test_update_package_managers_only_upgrades_whats_present(self):
-        with mock.patch.object(install.shutil, "which", return_value=None), \
+        with mock.patch.object(install, "check_python_update", return_value="Python ok"), \
+             mock.patch.object(install, "check_npm_update", return_value=None), \
+             mock.patch.object(install.shutil, "which", return_value=None), \
              mock.patch.object(install.subprocess, "run") as run:
             messages, failed = install.update_package_managers(dry_run=False)
         run.assert_called_once()  # just pip -- npm/pipx aren't on PATH here
@@ -384,7 +388,9 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(any("pip upgraded" in m for m in messages))
 
     def test_update_package_managers_reports_a_failed_upgrade(self):
-        with mock.patch.object(install.shutil, "which", return_value=None), \
+        with mock.patch.object(install, "check_python_update", return_value="Python ok"), \
+             mock.patch.object(install, "check_npm_update", return_value=None), \
+             mock.patch.object(install.shutil, "which", return_value=None), \
              mock.patch.object(install.subprocess, "run",
                                side_effect=install.subprocess.CalledProcessError(1, "pip")):
             messages, failed = install.update_package_managers(dry_run=False)
@@ -400,7 +406,9 @@ class InstallTests(unittest.TestCase):
             1, ["pip", "install", "--upgrade", "pip"],
             output="", stderr="error: externally-managed-environment\n\n"
                               "× This environment is externally managed\n")
-        with mock.patch.object(install.shutil, "which", return_value=None), \
+        with mock.patch.object(install, "check_python_update", return_value="Python ok"), \
+             mock.patch.object(install, "check_npm_update", return_value=None), \
+             mock.patch.object(install.shutil, "which", return_value=None), \
              mock.patch.object(install.subprocess, "run", side_effect=error):
             messages, failed = install.update_package_managers(dry_run=False)
         self.assertFalse(failed)
@@ -418,7 +426,9 @@ class InstallTests(unittest.TestCase):
             output="", stderr="npm error code EBADENGINE\nnpm error engine Unsupported engine\n"
                               "npm error notsup Required: {\"node\":\"^22.22.2\"}\n"
                               "npm error notsup Actual:   {\"npm\":\"10.9.2\",\"node\":\"v22.14.0\"}\n")
-        with mock.patch.object(install.shutil, "which", side_effect=fake_which), \
+        with mock.patch.object(install, "check_python_update", return_value="Python ok"), \
+             mock.patch.object(install, "check_npm_update", return_value=None), \
+             mock.patch.object(install.shutil, "which", side_effect=fake_which), \
              mock.patch.object(install.subprocess, "run", side_effect=error):
             messages, failed = install.update_package_managers(dry_run=False)
         self.assertFalse(failed)
@@ -429,11 +439,79 @@ class InstallTests(unittest.TestCase):
         error = install.subprocess.CalledProcessError(
             1, ["pip", "install", "--upgrade", "pip"],
             output="", stderr="some genuinely unexpected pip error\nwith a second line\n")
-        with mock.patch.object(install.shutil, "which", return_value=None), \
+        with mock.patch.object(install, "check_python_update", return_value="Python ok"), \
+             mock.patch.object(install, "check_npm_update", return_value=None), \
+             mock.patch.object(install.shutil, "which", return_value=None), \
              mock.patch.object(install.subprocess, "run", side_effect=error):
             messages, failed = install.update_package_managers(dry_run=False)
         self.assertTrue(failed)
         self.assertTrue(any("genuinely unexpected pip error" in m for m in messages))
+
+    def test_check_python_update_reports_available_release(self):
+        html = '<a href="3.13.5/">3.13.5/</a>\n<a href="3.13.15/">3.13.15/</a>\n'
+        fake_response = mock.MagicMock()
+        fake_response.read.return_value = html.encode("utf-8")
+        fake_response.__enter__.return_value = fake_response
+        with mock.patch.object(install.platform, "python_version_tuple",
+                               return_value=("3", "13", "5")), \
+             mock.patch.object(install.platform, "python_version", return_value="3.13.5"), \
+             mock.patch.object(install.urllib.request, "urlopen", return_value=fake_response):
+            message = install.check_python_update()
+        self.assertIn("3.13.15 is available", message)
+
+    def test_check_python_update_reports_already_latest(self):
+        html = '<a href="3.13.5/">3.13.5/</a>\n<a href="3.13.2/">3.13.2/</a>\n'
+        fake_response = mock.MagicMock()
+        fake_response.read.return_value = html.encode("utf-8")
+        fake_response.__enter__.return_value = fake_response
+        with mock.patch.object(install.platform, "python_version_tuple",
+                               return_value=("3", "13", "5")), \
+             mock.patch.object(install.platform, "python_version", return_value="3.13.5"), \
+             mock.patch.object(install.urllib.request, "urlopen", return_value=fake_response):
+            message = install.check_python_update()
+        self.assertIn("already the latest", message)
+
+    def test_check_python_update_handles_network_failure(self):
+        with mock.patch.object(install.platform, "python_version_tuple",
+                               return_value=("3", "13", "5")), \
+             mock.patch.object(install.platform, "python_version", return_value="3.13.5"), \
+             mock.patch.object(install.urllib.request, "urlopen",
+                               side_effect=OSError("no network")):
+            message = install.check_python_update()
+        self.assertIn("3.13.5", message)
+        self.assertIn("couldn't reach python.org", message)
+
+    def test_check_npm_update_returns_none_when_npm_absent(self):
+        with mock.patch.object(install.shutil, "which", return_value=None):
+            self.assertIsNone(install.check_npm_update())
+
+    def test_check_npm_update_reports_available_version(self):
+        def fake_run(command, **kwargs):
+            result = mock.Mock()
+            result.stdout = "12.0.2\n" if "view" in command else "10.9.2\n"
+            return result
+        with mock.patch.object(install.shutil, "which", return_value="/usr/bin/npm"), \
+             mock.patch.object(install.subprocess, "run", side_effect=fake_run):
+            message = install.check_npm_update()
+        self.assertIn("10.9.2 installed", message)
+        self.assertIn("12.0.2 is available", message)
+
+    def test_check_npm_update_reports_already_latest(self):
+        def fake_run(command, **kwargs):
+            result = mock.Mock()
+            result.stdout = "12.0.2\n"
+            return result
+        with mock.patch.object(install.shutil, "which", return_value="/usr/bin/npm"), \
+             mock.patch.object(install.subprocess, "run", side_effect=fake_run):
+            message = install.check_npm_update()
+        self.assertIn("already the latest", message)
+
+    def test_check_npm_update_handles_registry_failure(self):
+        with mock.patch.object(install.shutil, "which", return_value="/usr/bin/npm"), \
+             mock.patch.object(install.subprocess, "run",
+                               side_effect=install.subprocess.TimeoutExpired("npm", 10)):
+            message = install.check_npm_update()
+        self.assertIn("couldn't check", message)
 
     def test_main_update_dry_run_shows_package_manager_plan_without_prompting(self):
         with tempfile.TemporaryDirectory() as td:
@@ -442,6 +520,8 @@ class InstallTests(unittest.TestCase):
             with mock.patch.object(install, "current_platform", return_value=("linux", "x86_64")), \
                  mock.patch.object(install, "is_musl_libc", return_value=False), \
                  mock.patch.object(install, "install_cli", return_value=("Codex ok", True)), \
+                 mock.patch.object(install, "check_python_update", return_value="Python ok"), \
+                 mock.patch.object(install, "check_npm_update", return_value=None), \
                  mock.patch("builtins.input", side_effect=AssertionError("should not prompt")), \
                  mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
                 install.main(["--bin-dir", str(bin_dir), "--update", "--dry-run", "--only", "Codex"])
@@ -468,6 +548,7 @@ class InstallTests(unittest.TestCase):
                  mock.patch.object(install, "is_musl_libc", return_value=False), \
                  mock.patch.object(install, "install_cli", return_value=("Codex ok", True)), \
                  mock.patch.object(install, "_confirm", return_value=True) as confirm, \
+                 mock.patch.object(install, "check_python_update", return_value="Python ok"), \
                  mock.patch.object(install.shutil, "which", return_value=None), \
                  mock.patch.object(install.subprocess, "run") as run, \
                  mock.patch("builtins.print"):
