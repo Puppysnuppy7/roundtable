@@ -25,6 +25,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.request
 from pathlib import Path
 
@@ -34,6 +35,10 @@ except ImportError:
     winreg = None  # not Windows -- refresh_windows_path() is a no-op there
 
 REPO_ROOT = Path(__file__).resolve().parent
+
+# The repo --bugsend files issues against. Single-owner personal tool, so this is hardcoded (not
+# derived from a remote URL) and always uses whatever `gh` account is already logged in locally.
+_BUGSEND_REPO = "Puppysnuppy7/roundtable"
 
 # Keep this small manifest local: importing roundtable.py would import curses, which is absent from
 # the Python standard-library build on Windows -- exactly where this installer must still be able to
@@ -456,6 +461,20 @@ def build_parser() -> argparse.ArgumentParser:
                         help="re-run each CLI's install command even if already present, to pick "
                              "up a newer version (also refreshes PATH from the registry on "
                              "Windows first, in case an earlier install just isn't visible yet)")
+    parser.add_argument("--bugsend", action="store_true",
+                        help="collect platform info, installed agent CLIs, and the "
+                             "diagnostic-safe (never prompt/output) lines of the most recent run "
+                             "log, show you the exact content, and file it as a GitHub issue "
+                             "after explicit confirmation")
+    parser.add_argument("--message", "-m", default=None,
+                        help="short description of the problem for --bugsend; prompted for if "
+                             "omitted")
+    parser.add_argument("--log", type=Path, default=None,
+                        help="specific run log to attach for --bugsend (default: most recent "
+                             "log in --output-dir)")
+    parser.add_argument("--output-dir", type=Path, default=Path(".roundtable"),
+                        help="where --bugsend looks for the most recent run log "
+                             "(default: .roundtable)")
     return parser
 
 
@@ -579,10 +598,139 @@ def update_package_managers(dry_run: bool) -> tuple[list[str], bool]:
     return messages, any_failed
 
 
+_LOG_LINE_RE = re.compile(r"^\+\s*[\d.]+s\s+(\S+)\s+(.*)$")
+# roundtable's RunLog tags every line with a kind (see roundtable.py's RunLog.write() call
+# sites): error/debug/phase/info/artifact are pure roundtable-internal diagnostics. "prompt"
+# carries the full text sent to each agent, "board" the final objective file, "tick" raw agent
+# output, and "config" a full run config dump -- any of those can hold proprietary code, personal
+# information, or anything else the user was actually working on, which has no business in a
+# --bugsend report filed to a public GitHub repo. This is a hard allow-list, not a proximity
+# heuristic, so a diagnostic line can't drag in a neighboring sensitive one just by sitting near
+# an error.
+_LOG_SAFE_KINDS = frozenset({"error", "debug", "phase", "info", "artifact"})
+
+
+def find_recent_log(output_dir: Path) -> Path | None:
+    """Most recently modified roundtable run log in output_dir, or None if there isn't one."""
+    if not output_dir.is_dir():
+        return None
+    logs = sorted(output_dir.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return logs[0] if logs else None
+
+
+def extract_safe_log_lines(log_path: Path, max_lines: int = 60) -> str:
+    """Pull only the diagnostic-safe lines out of a run log for a --bugsend report.
+
+    See _LOG_SAFE_KINDS for why this is a hard kind allow-list rather than an error-proximity
+    window: the latter could still capture an adjacent "prompt"/"tick"/"board"/"config" line.
+    """
+    try:
+        raw_lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        return f"(couldn't read {log_path}: {exc})"
+    safe_lines = []
+    for line in raw_lines:
+        match = _LOG_LINE_RE.match(line)
+        if match and match.group(1).lower() in _LOG_SAFE_KINDS:
+            safe_lines.append(line)
+    if not safe_lines:
+        return (f"(no diagnostic-safe lines found in {log_path.name} -- it may only contain "
+                f"prompt/output content, which is excluded here by design)")
+    return "\n".join(safe_lines[-max_lines:])
+
+
+def build_bug_report_body(description: str, log_path: Path | None,
+                          current: tuple[str, str]) -> str:
+    """Assemble the full --bugsend issue body: the user's own description plus safe diagnostics
+    only -- see extract_safe_log_lines for why the log excerpt is filtered rather than raw.
+    """
+    lines = [
+        description.strip(),
+        "",
+        "---",
+        f"Platform: {current[0]}-{current[1]} (Python {platform.python_version()})",
+        "Agent CLIs on PATH: " + (", ".join(
+            sorted(exe for exe in AGENT_EXECUTABLES.values() if shutil.which(exe)))
+            or "(none found)"),
+    ]
+    if log_path is not None:
+        lines += ["", f"Diagnostic lines from {log_path.name}:", "```",
+                  extract_safe_log_lines(log_path), "```"]
+    else:
+        lines += ["", "(no recent run log found)"]
+    return "\n".join(lines)
+
+
+def send_bug_report(description: str, log_path: Path | None, dry_run: bool,
+                    current: tuple[str, str] | None = None) -> tuple[str, bool]:
+    """Preview, then (only after explicit confirmation) file description + safe diagnostics as a
+    GitHub issue via `gh issue create`.
+
+    This is the one thing this installer does that isn't local and reversible -- it posts to a
+    public, permanent, shared destination -- so unlike every other action here, it always shows
+    the exact body to the user first and never sends without an explicit yes. --dry-run stops
+    right after the preview and never prompts at all (nothing pending to confirm if nothing is
+    going to be sent).
+    """
+    if shutil.which("gh") is None:
+        return ("error: the `gh` CLI is required for --bugsend (https://cli.github.com/), and "
+                "must be logged in (`gh auth login`)", False)
+    auth = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
+    if auth.returncode != 0:
+        return "error: `gh` is installed but not logged in -- run `gh auth login` first", False
+
+    body = build_bug_report_body(description, log_path, current or current_platform())
+    print("--- bug report preview (will be filed as a PUBLIC GitHub issue) ---")
+    print(body)
+    print("--- end preview ---")
+    if dry_run:
+        return "(--dry-run: preview only, nothing sent)", True
+    if not _confirm("Send this bug report to GitHub now?"):
+        return "cancelled -- nothing was sent", True
+
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False,
+                                     encoding="utf-8") as handle:
+        handle.write(body)
+        body_file = handle.name
+    try:
+        title = f"[bug report] {description.strip().splitlines()[0][:80]}"
+        result = subprocess.run(
+            ["gh", "issue", "create", "--repo", _BUGSEND_REPO, "--title", title,
+             "--body-file", body_file],
+            capture_output=True, text=True)
+    finally:
+        Path(body_file).unlink(missing_ok=True)
+    if result.returncode != 0:
+        return f"error: gh issue create failed: {result.stderr.strip()}", False
+    return result.stdout.strip(), True
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     current = current_platform()
     refresh_windows_path(current)
+
+    if args.bugsend:
+        description = args.message.strip() if args.message is not None else None
+        if description is None:
+            if not sys.stdin.isatty():
+                print("error: --bugsend needs a description; pass --message/-m in a "
+                      "non-interactive context", file=sys.stderr)
+                return 1
+            try:
+                description = input("Briefly describe the problem: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\ncancelled -- nothing was sent")
+                return 0
+        if not description:
+            print("error: --bugsend needs a non-empty description (--message/-m)",
+                  file=sys.stderr)
+            return 1
+        log_path = args.log or find_recent_log(args.output_dir)
+        message, ok = send_bug_report(description, log_path, args.dry_run, current=current)
+        print(message)
+        return 0 if ok else 1
+
     print(f"Detected platform: {current[0]}-{current[1]} (Python {platform.python_version()})")
     if is_wsl(current):
         print("note: running inside WSL -- PATH/binary interop with any Windows-side install of "

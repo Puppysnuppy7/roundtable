@@ -11,10 +11,12 @@ def _run_install_from_cli(argv: list[str] | None = None) -> int:
 
     Stock Windows Python has no stdlib `curses`, so `import roundtable` fails there even though
     `install.py` deliberately avoids that import. When this file is executed as a script with
-    `--install` or `--update`, dispatch here first so `python3 roundtable.py --install`/`--update`
-    works on the same platforms as `python3 install.py`. Extra argv (including `--update` itself,
-    which install.py's own parser understands) is forwarded as-is; only `--install` is stripped,
-    since that's a roundtable.py-level flag install.py doesn't recognize.
+    `--install`, `--update`, or `--bugsend`, dispatch here first so `python3 roundtable.py
+    --install`/`--update`/`--bugsend` works on the same platforms as `python3 install.py` (in
+    particular, --bugsend needs to work even if curses itself is what's broken -- that's exactly
+    when you'd want to report a bug). Extra argv (including `--update`/`--bugsend`/`--message`/
+    `-m`/`--log`, which install.py's own parser understands) is forwarded as-is; only `--install`
+    is stripped, since that's a roundtable.py-level flag install.py doesn't recognize.
     """
     import importlib.util
     from pathlib import Path
@@ -31,8 +33,9 @@ def _run_install_from_cli(argv: list[str] | None = None) -> int:
     return int(module.main(install_argv))
 
 
-# Must run before `import curses` so stock Windows Python can still install/update.
-if __name__ == "__main__" and ("--install" in sys.argv[1:] or "--update" in sys.argv[1:]):
+# Must run before `import curses` so stock Windows Python can still install/update/bugsend.
+if __name__ == "__main__" and ("--install" in sys.argv[1:] or "--update" in sys.argv[1:]
+                               or "--bugsend" in sys.argv[1:]):
     raise SystemExit(_run_install_from_cli())
 
 import argparse
@@ -5358,6 +5361,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--update", action="store_true",
                         help="like --install, but also re-run each agent CLI's install command "
                              "even if already present, to pick up a newer version, then exit")
+    parser.add_argument("--bugsend", action="store_true",
+                        help="collect platform info, installed agent CLIs, and the "
+                             "diagnostic-safe (never prompt/output) lines of the most recent run "
+                             "log, show you the exact content, and file it as a GitHub issue "
+                             "after explicit confirmation, then exit")
+    parser.add_argument("--message", "-m", default=None,
+                        help="short description of the problem for --bugsend; prompted for if "
+                             "omitted")
+    parser.add_argument("--log", type=Path, default=None,
+                        help="specific run log to attach for --bugsend (default: most recent "
+                             "log in --output-dir)")
     return parser
 
 
@@ -5370,11 +5384,23 @@ def main() -> int:
     install.refresh_windows_path()
     parser = build_parser()
     args, remaining = parser.parse_known_args()
-    if args.install or args.update:
-        # --update was already parsed (and consumed) by this parser above, so it's not in
-        # `remaining` the way it would be coming from the pre-curses script dispatch -- re-add it
-        # so install.py's own parser (which is what actually understands --update) sees it.
-        return install.main(remaining + (["--update"] if args.update else []))
+    if args.install or args.update or args.bugsend:
+        # --update/--message/--log were already parsed (and consumed) by this parser above, so
+        # they're not in `remaining` the way they would be coming from the pre-curses script
+        # dispatch -- re-add them so install.py's own parser (which actually understands them)
+        # sees them.
+        extra: list[str] = []
+        if args.update:
+            extra.append("--update")
+        if args.bugsend:
+            extra.append("--bugsend")
+            if args.message is not None:
+                extra += ["--message", args.message]
+            if args.log is not None:
+                extra += ["--log", str(args.log)]
+            if args.output_dir:
+                extra += ["--output-dir", str(args.output_dir)]
+        return install.main(remaining + extra)
     if remaining:
         parser.error(f"unrecognized arguments: {' '.join(remaining)}")
     if args.list_agents:

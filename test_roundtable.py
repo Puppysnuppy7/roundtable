@@ -2879,7 +2879,7 @@ class RoundtableTests(unittest.TestCase):
             for action in parser._actions
             if isinstance(action, roundtable.argparse._StoreTrueAction)
             and action.help != roundtable.argparse.SUPPRESS
-            and action.dest not in ("plain", "list_agents", "install", "update")
+            and action.dest not in ("plain", "list_agents", "install", "update", "bugsend")
         }
         toggle_names = {name for name, _ in roundtable.OPTION_TOGGLES}
         self.assertTrue(parser_flags <= toggle_names, f"Missing toggles for: {parser_flags - toggle_names}")
@@ -2901,8 +2901,11 @@ class RoundtableTests(unittest.TestCase):
     def test_install_cli_entry_is_defined_before_curses_import(self):
         """`python3 roundtable.py --install` must not require curses (stock Windows)."""
         source = Path(roundtable.__file__).read_text(encoding="utf-8")
-        gate = 'if __name__ == "__main__" and ("--install" in sys.argv[1:] or "--update" in sys.argv[1:]):'
-        self.assertIn(gate, source)
+        gate_start = 'if __name__ == "__main__" and ("--install" in sys.argv[1:]'
+        self.assertIn(gate_start, source)
+        self.assertIn('"--update" in sys.argv[1:]', source)
+        self.assertIn('"--bugsend" in sys.argv[1:]', source)
+        gate = gate_start
         self.assertLess(source.index(gate), source.index("\nimport curses\n"))
         self.assertIn("def _run_install_from_cli", source)
         self.assertLess(
@@ -2927,9 +2930,38 @@ class RoundtableTests(unittest.TestCase):
     def test_update_cli_entry_is_defined_before_curses_import(self):
         """`python3 roundtable.py --update` must not require curses (stock Windows) either."""
         source = Path(roundtable.__file__).read_text(encoding="utf-8")
-        gate = 'if __name__ == "__main__" and ("--install" in sys.argv[1:] or "--update" in sys.argv[1:]):'
-        self.assertIn(gate, source)
+        gate_start = 'if __name__ == "__main__" and ("--install" in sys.argv[1:]'
+        self.assertIn(gate_start, source)
+        self.assertIn('"--update" in sys.argv[1:]', source)
+        self.assertIn('"--bugsend" in sys.argv[1:]', source)
+        gate = gate_start
         self.assertLess(source.index(gate), source.index("\nimport curses\n"))
+
+    def test_bugsend_flag_invokes_installer_main_with_bugsend(self):
+        with mock.patch("install.main", return_value=0) as mock_install_main, \
+             mock.patch("sys.argv", ["roundtable", "--bugsend", "--message", "it broke"]):
+            exit_code = roundtable.main()
+            self.assertEqual(exit_code, 0)
+            mock_install_main.assert_called_once_with(
+                ["--bugsend", "--message", "it broke"])
+
+    def test_bugsend_flag_forwards_message_and_log(self):
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "custom.log"
+            with mock.patch("install.main", return_value=0) as mock_install_main, \
+                 mock.patch("sys.argv", ["roundtable", "--bugsend", "-m", "it broke",
+                                        "--log", str(log_path)]):
+                exit_code = roundtable.main()
+                self.assertEqual(exit_code, 0)
+                mock_install_main.assert_called_once_with(
+                    ["--bugsend", "--message", "it broke", "--log", str(log_path)])
+
+    def test_bugsend_flag_without_message_or_log_forwards_bare(self):
+        with mock.patch("install.main", return_value=0) as mock_install_main, \
+             mock.patch("sys.argv", ["roundtable", "--bugsend"]):
+            exit_code = roundtable.main()
+            self.assertEqual(exit_code, 0)
+            mock_install_main.assert_called_once_with(["--bugsend"])
 
     def test_run_install_from_cli_dry_run_forwards_flags(self):
         # Same helper the script uses when launched as `python3 roundtable.py --install ...`.

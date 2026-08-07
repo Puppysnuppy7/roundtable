@@ -977,5 +977,234 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(install.run([]), 0)
 
 
+    # -- --bugsend --------------------------------------------------------------------
+
+    def test_find_recent_log_returns_none_when_dir_missing(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertIsNone(install.find_recent_log(Path(td) / "nope"))
+
+    def test_find_recent_log_returns_none_when_no_logs(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertIsNone(install.find_recent_log(Path(td)))
+
+    def test_find_recent_log_picks_most_recently_modified(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            older = base / "roundtable-1.log"
+            newer = base / "roundtable-2.log"
+            older.write_text("old\n")
+            newer.write_text("new\n")
+            older_time = os.path.getmtime(older) - 100
+            os.utime(older, (older_time, older_time))
+            self.assertEqual(install.find_recent_log(base), newer)
+
+    def test_extract_safe_log_lines_keeps_only_safe_kinds(self):
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "roundtable-1.log"
+            log_path.write_text(
+                "+     0.1s  PHASE   starting up\n"
+                "+     0.2s  PROMPT  [Codex] PROMPT:\nfix the secret bug in auth.py\n"
+                "+     0.3s  TICK    [Codex] here is my proprietary solution\n"
+                "+     0.4s  ERROR   Cancelled by user\n"
+                "+     0.5s  BOARD   Final AGENT_PROMPT.md at exit:\nsecret objective\n"
+                "+     0.6s  CONFIG  {\"objective\": \"secret\"}\n"
+                "+     0.7s  DEBUG   Traceback (most recent call last):\n"
+            )
+            result = install.extract_safe_log_lines(log_path)
+        self.assertIn("starting up", result)
+        self.assertIn("Cancelled by user", result)
+        self.assertIn("Traceback (most recent call last):", result)
+        self.assertNotIn("secret bug", result)
+        self.assertNotIn("proprietary solution", result)
+        self.assertNotIn("secret objective", result)
+        self.assertNotIn("secret\"", result)
+
+    def test_extract_safe_log_lines_reports_when_nothing_safe_found(self):
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "roundtable-1.log"
+            log_path.write_text("+     0.1s  PROMPT  [Codex] PROMPT:\nsomething private\n")
+            result = install.extract_safe_log_lines(log_path)
+        self.assertIn("no diagnostic-safe lines found", result)
+        self.assertNotIn("something private", result)
+
+    def test_extract_safe_log_lines_handles_unreadable_file(self):
+        result = install.extract_safe_log_lines(Path("/nonexistent/roundtable-1.log"))
+        self.assertIn("couldn't read", result)
+
+    def test_extract_safe_log_lines_caps_to_max_lines(self):
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "roundtable-1.log"
+            log_path.write_text("".join(f"+     {i}.0s  INFO    line {i}\n" for i in range(100)))
+            result = install.extract_safe_log_lines(log_path, max_lines=5)
+        self.assertEqual(len(result.splitlines()), 5)
+        self.assertIn("line 99", result)
+        self.assertNotIn("line 50", result)
+
+    def test_build_bug_report_body_includes_description_and_platform(self):
+        body = install.build_bug_report_body("it crashed", None, ("linux", "x86_64"))
+        self.assertIn("it crashed", body)
+        self.assertIn("linux-x86_64", body)
+        self.assertIn("no recent run log found", body)
+
+    def test_build_bug_report_body_includes_installed_agent_clis(self):
+        def fake_which(name):
+            return f"/usr/bin/{name}" if name == "codex" else None
+        with mock.patch.object(install.shutil, "which", side_effect=fake_which):
+            body = install.build_bug_report_body("bug", None, ("linux", "x86_64"))
+        self.assertIn("codex", body)
+
+    def test_build_bug_report_body_includes_log_excerpt(self):
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "roundtable-1.log"
+            log_path.write_text("+     0.1s  ERROR   boom\n")
+            body = install.build_bug_report_body("bug", log_path, ("linux", "x86_64"))
+        self.assertIn("boom", body)
+        self.assertIn(log_path.name, body)
+
+    def test_send_bug_report_requires_gh_on_path(self):
+        with mock.patch.object(install.shutil, "which", return_value=None):
+            message, ok = install.send_bug_report("bug", None, dry_run=False)
+        self.assertIn("gh", message)
+        self.assertFalse(ok)
+
+    def test_send_bug_report_requires_gh_authenticated(self):
+        with mock.patch.object(install.shutil, "which", return_value="/usr/bin/gh"), \
+             mock.patch.object(install.subprocess, "run",
+                               return_value=mock.Mock(returncode=1)):
+            message, ok = install.send_bug_report("bug", None, dry_run=False,
+                                                   current=("linux", "x86_64"))
+        self.assertIn("not logged in", message)
+        self.assertFalse(ok)
+
+    def test_send_bug_report_dry_run_never_prompts_or_sends(self):
+        with mock.patch.object(install.shutil, "which", return_value="/usr/bin/gh"), \
+             mock.patch.object(install.subprocess, "run",
+                               return_value=mock.Mock(returncode=0)) as run, \
+             mock.patch.object(install, "_confirm") as confirm, \
+             mock.patch("builtins.print"):
+            message, ok = install.send_bug_report("bug", None, dry_run=True,
+                                                   current=("linux", "x86_64"))
+        confirm.assert_not_called()
+        run.assert_called_once()  # only the auth-status check, never issue create
+        self.assertIn("nothing sent", message)
+        self.assertTrue(ok)
+
+    def test_send_bug_report_declined_confirmation_sends_nothing(self):
+        with mock.patch.object(install.shutil, "which", return_value="/usr/bin/gh"), \
+             mock.patch.object(install.subprocess, "run",
+                               return_value=mock.Mock(returncode=0)) as run, \
+             mock.patch.object(install, "_confirm", return_value=False), \
+             mock.patch("builtins.print"):
+            message, ok = install.send_bug_report("bug", None, dry_run=False,
+                                                   current=("linux", "x86_64"))
+        self.assertEqual(run.call_count, 1)  # only the auth-status check
+        self.assertIn("cancelled", message)
+        self.assertTrue(ok)
+
+    def test_send_bug_report_confirmed_creates_issue_via_body_file(self):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[:2] == ["gh", "auth"]:
+                return mock.Mock(returncode=0)
+            return mock.Mock(returncode=0, stdout="https://github.com/x/y/issues/1\n", stderr="")
+
+        with mock.patch.object(install.shutil, "which", return_value="/usr/bin/gh"), \
+             mock.patch.object(install.subprocess, "run", side_effect=fake_run), \
+             mock.patch.object(install, "_confirm", return_value=True), \
+             mock.patch("builtins.print"):
+            message, ok = install.send_bug_report("bug", None, dry_run=False,
+                                                   current=("linux", "x86_64"))
+        self.assertTrue(ok)
+        self.assertIn("github.com", message)
+        issue_call = calls[-1]
+        self.assertIn("--repo", issue_call)
+        self.assertIn(install._BUGSEND_REPO, issue_call)
+        self.assertIn("--body-file", issue_call)
+        body_file = Path(issue_call[issue_call.index("--body-file") + 1])
+        self.assertFalse(body_file.exists())  # cleaned up after the call
+
+    def test_send_bug_report_gh_issue_create_failure_is_reported(self):
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["gh", "auth"]:
+                return mock.Mock(returncode=0)
+            return mock.Mock(returncode=1, stdout="", stderr="network error")
+
+        with mock.patch.object(install.shutil, "which", return_value="/usr/bin/gh"), \
+             mock.patch.object(install.subprocess, "run", side_effect=fake_run), \
+             mock.patch.object(install, "_confirm", return_value=True), \
+             mock.patch("builtins.print"):
+            message, ok = install.send_bug_report("bug", None, dry_run=False,
+                                                   current=("linux", "x86_64"))
+        self.assertFalse(ok)
+        self.assertIn("network error", message)
+
+    def test_main_bugsend_uses_explicit_message_without_prompting(self):
+        with mock.patch.object(install, "send_bug_report",
+                               return_value=("ok", True)) as send, \
+             mock.patch("builtins.input", side_effect=AssertionError("should not prompt")), \
+             mock.patch("builtins.print"):
+            result = install.main(["--bugsend", "--message", "it broke"])
+        self.assertEqual(result, 0)
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[0], "it broke")
+
+    def test_main_bugsend_without_message_prompts_when_interactive(self):
+        with mock.patch.object(install, "send_bug_report",
+                               return_value=("ok", True)) as send, \
+             mock.patch.object(install.sys.stdin, "isatty", return_value=True), \
+             mock.patch("builtins.input", return_value="typed description"), \
+             mock.patch("builtins.print"):
+            result = install.main(["--bugsend"])
+        self.assertEqual(result, 0)
+        self.assertEqual(send.call_args.args[0], "typed description")
+
+    def test_main_bugsend_without_message_non_interactive_errors(self):
+        with mock.patch.object(install, "send_bug_report") as send, \
+             mock.patch.object(install.sys.stdin, "isatty", return_value=False), \
+             mock.patch("builtins.print"):
+            result = install.main(["--bugsend"])
+        self.assertEqual(result, 1)
+        send.assert_not_called()
+
+    def test_main_bugsend_empty_message_errors(self):
+        with mock.patch.object(install, "send_bug_report") as send, \
+             mock.patch("builtins.print"):
+            result = install.main(["--bugsend", "--message", "   "])
+        self.assertEqual(result, 1)
+        send.assert_not_called()
+
+    def test_main_bugsend_uses_explicit_log_over_discovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            explicit_log = Path(td) / "explicit.log"
+            explicit_log.write_text("+ 0.1s ERROR boom\n")
+            with mock.patch.object(install, "send_bug_report",
+                                   return_value=("ok", True)) as send, \
+                 mock.patch.object(install, "find_recent_log") as find_recent, \
+                 mock.patch("builtins.print"):
+                install.main(["--bugsend", "--message", "bug", "--log", str(explicit_log)])
+            find_recent.assert_not_called()
+            self.assertEqual(send.call_args.args[1], explicit_log)
+
+    def test_main_bugsend_discovers_log_from_output_dir(self):
+        with tempfile.TemporaryDirectory() as td:
+            output_dir = Path(td) / ".roundtable"
+            output_dir.mkdir()
+            log_path = output_dir / "roundtable-1.log"
+            log_path.write_text("+ 0.1s ERROR boom\n")
+            with mock.patch.object(install, "send_bug_report",
+                                   return_value=("ok", True)) as send, \
+                 mock.patch("builtins.print"):
+                install.main(["--bugsend", "--message", "bug", "--output-dir", str(output_dir)])
+            self.assertEqual(send.call_args.args[1], log_path)
+
+    def test_main_bugsend_forwards_dry_run(self):
+        with mock.patch.object(install, "send_bug_report",
+                               return_value=("ok", True)) as send, \
+             mock.patch("builtins.print"):
+            install.main(["--bugsend", "--message", "bug", "--dry-run"])
+        self.assertTrue(send.call_args.args[2])
+
 if __name__ == "__main__":
     unittest.main()
