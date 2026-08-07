@@ -434,6 +434,53 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _confirm(prompt: str) -> bool:
+    """Ask a yes/no question on stdin. Defaults to No whenever it can't meaningfully be answered
+    (not a tty, EOF, Ctrl-C) -- an update prompt should never block a non-interactive run or
+    silently assume "yes" just because input() came up empty.
+    """
+    if not sys.stdin.isatty():
+        return False
+    try:
+        answer = input(f"{prompt} [y/N]: ")
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
+def update_package_managers(dry_run: bool) -> tuple[list[str], bool]:
+    """Upgrade pip, and npm/pipx if present. Returns (status_messages, any_failed).
+
+    Deliberately does not touch the Python interpreter itself -- upgrading Python is a much
+    bigger, install-method-specific operation (the Windows .msi, apt/dnf, pyenv, python.org's own
+    installer all do this differently, and getting it wrong risks breaking every venv on the
+    machine) that this installer has no business attempting. Just report the running version so
+    the user can decide whether to go update it themselves.
+    """
+    messages = [f"Python {platform.python_version()} -- update this yourself via your OS package "
+                "manager, pyenv, or python.org's installer if you want a newer one; this script "
+                "won't touch the interpreter itself."]
+    steps: list[tuple[str, list[str]]] = [
+        ("pip", [sys.executable, "-m", "pip", "install", "--upgrade", "pip"]),
+    ]
+    if shutil.which("npm"):
+        steps.append(("npm", [shutil.which("npm"), "install", "-g", "npm@latest"]))
+    if shutil.which("pipx"):
+        steps.append(("pipx", [sys.executable, "-m", "pip", "install", "--upgrade", "pipx"]))
+    any_failed = False
+    for label, command in steps:
+        if dry_run:
+            messages.append(f"would run: {' '.join(command)}")
+            continue
+        try:
+            subprocess.run(command, check=True)
+            messages.append(f"{label} upgraded")
+        except (subprocess.CalledProcessError, OSError) as exc:
+            messages.append(f"{label} upgrade failed: {exc}")
+            any_failed = True
+    return messages, any_failed
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     current = current_platform()
@@ -478,6 +525,18 @@ def main(argv: list[str] | None = None) -> int:
         print(message)
         if not ok:
             any_failed = True
+
+    if args.update:
+        print()
+        if args.dry_run:
+            pkg_messages, pkg_failed = update_package_managers(dry_run=True)
+        elif _confirm("Also update pip/npm/pipx?"):
+            pkg_messages, pkg_failed = update_package_managers(dry_run=False)
+        else:
+            pkg_messages, pkg_failed = ["skipped pip/npm/pipx update"], False
+        for message in pkg_messages:
+            print(message)
+        any_failed = any_failed or pkg_failed
     return 1 if any_failed else 0
 
 

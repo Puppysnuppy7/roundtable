@@ -337,6 +337,111 @@ class InstallTests(unittest.TestCase):
         self.assertIn(r"C:\Users\User\AppData\Local\agy\bin", dirs)
         self.assertNotIn(r"%LOCALAPPDATA%\agy\bin", dirs)
 
+    def test_confirm_defaults_no_when_stdin_is_not_a_tty(self):
+        with mock.patch.object(install.sys.stdin, "isatty", return_value=False), \
+             mock.patch("builtins.input", side_effect=AssertionError("should not prompt")):
+            self.assertFalse(install._confirm("Update?"))
+
+    def test_confirm_accepts_y_variants(self):
+        with mock.patch.object(install.sys.stdin, "isatty", return_value=True):
+            for reply in ("y", "Y", "yes", "YES", "  y  "):
+                with mock.patch("builtins.input", return_value=reply):
+                    self.assertTrue(install._confirm("Update?"), reply)
+
+    def test_confirm_rejects_anything_else(self):
+        with mock.patch.object(install.sys.stdin, "isatty", return_value=True):
+            for reply in ("n", "no", "", "sure"):
+                with mock.patch("builtins.input", return_value=reply):
+                    self.assertFalse(install._confirm("Update?"), reply)
+
+    def test_confirm_defaults_no_on_eof_or_interrupt(self):
+        with mock.patch.object(install.sys.stdin, "isatty", return_value=True):
+            with mock.patch("builtins.input", side_effect=EOFError):
+                self.assertFalse(install._confirm("Update?"))
+            with mock.patch("builtins.input", side_effect=KeyboardInterrupt):
+                self.assertFalse(install._confirm("Update?"))
+
+    def test_update_package_managers_dry_run_lists_commands_without_running_them(self):
+        def fake_which(name):
+            return f"/usr/bin/{name}" if name in ("npm", "pipx") else None
+        with mock.patch.object(install.shutil, "which", side_effect=fake_which), \
+             mock.patch.object(install.subprocess, "run") as run:
+            messages, failed = install.update_package_managers(dry_run=True)
+        run.assert_not_called()
+        self.assertFalse(failed)
+        joined = "\n".join(messages)
+        self.assertIn("Python", joined)
+        self.assertIn("pip install --upgrade pip", joined)
+        self.assertIn("npm install -g npm@latest", joined)
+        self.assertIn("pip install --upgrade pipx", joined)
+
+    def test_update_package_managers_only_upgrades_whats_present(self):
+        with mock.patch.object(install.shutil, "which", return_value=None), \
+             mock.patch.object(install.subprocess, "run") as run:
+            messages, failed = install.update_package_managers(dry_run=False)
+        run.assert_called_once()  # just pip -- npm/pipx aren't on PATH here
+        self.assertFalse(failed)
+        self.assertTrue(any("pip upgraded" in m for m in messages))
+
+    def test_update_package_managers_reports_a_failed_upgrade(self):
+        with mock.patch.object(install.shutil, "which", return_value=None), \
+             mock.patch.object(install.subprocess, "run",
+                               side_effect=install.subprocess.CalledProcessError(1, "pip")):
+            messages, failed = install.update_package_managers(dry_run=False)
+        self.assertTrue(failed)
+        self.assertTrue(any("pip upgrade failed" in m for m in messages))
+
+    def test_main_update_dry_run_shows_package_manager_plan_without_prompting(self):
+        with tempfile.TemporaryDirectory() as td:
+            bin_dir = Path(td) / "bin"
+            printed = []
+            with mock.patch.object(install, "current_platform", return_value=("linux", "x86_64")), \
+                 mock.patch.object(install, "is_musl_libc", return_value=False), \
+                 mock.patch.object(install, "install_cli", return_value=("Codex ok", True)), \
+                 mock.patch("builtins.input", side_effect=AssertionError("should not prompt")), \
+                 mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
+                install.main(["--bin-dir", str(bin_dir), "--update", "--dry-run", "--only", "Codex"])
+            self.assertTrue(any("pip install --upgrade pip" in line for line in printed))
+
+    def test_main_update_skips_package_managers_when_declined(self):
+        with tempfile.TemporaryDirectory() as td:
+            bin_dir = Path(td) / "bin"
+            printed = []
+            with mock.patch.object(install, "current_platform", return_value=("linux", "x86_64")), \
+                 mock.patch.object(install, "is_musl_libc", return_value=False), \
+                 mock.patch.object(install, "install_cli", return_value=("Codex ok", True)), \
+                 mock.patch.object(install, "_confirm", return_value=False), \
+                 mock.patch.object(install.subprocess, "run") as run, \
+                 mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
+                install.main(["--bin-dir", str(bin_dir), "--update", "--only", "Codex"])
+            run.assert_not_called()
+            self.assertTrue(any("skipped pip/npm/pipx update" in line for line in printed))
+
+    def test_main_update_runs_package_managers_when_confirmed(self):
+        with tempfile.TemporaryDirectory() as td:
+            bin_dir = Path(td) / "bin"
+            with mock.patch.object(install, "current_platform", return_value=("linux", "x86_64")), \
+                 mock.patch.object(install, "is_musl_libc", return_value=False), \
+                 mock.patch.object(install, "install_cli", return_value=("Codex ok", True)), \
+                 mock.patch.object(install, "_confirm", return_value=True) as confirm, \
+                 mock.patch.object(install.shutil, "which", return_value=None), \
+                 mock.patch.object(install.subprocess, "run") as run, \
+                 mock.patch("builtins.print"):
+                install.main(["--bin-dir", str(bin_dir), "--update", "--only", "Codex"])
+            confirm.assert_called_once()
+            run.assert_called_once()  # just pip, since which() is mocked to find nothing else
+
+    def test_main_install_without_update_never_touches_package_managers(self):
+        with tempfile.TemporaryDirectory() as td:
+            bin_dir = Path(td) / "bin"
+            with mock.patch.object(install, "current_platform", return_value=("linux", "x86_64")), \
+                 mock.patch.object(install, "is_musl_libc", return_value=False), \
+                 mock.patch.object(install, "install_cli", return_value=("Codex ok", True)), \
+                 mock.patch.object(install, "_confirm",
+                                   side_effect=AssertionError("should not be asked")), \
+                 mock.patch("builtins.print"):
+                install.main(["--bin-dir", str(bin_dir), "--only", "Codex"])
+
     def test_current_platform_normalizes_known_architectures(self):
         cases = {
             "x86_64": "x86_64", "AMD64": "x86_64",
