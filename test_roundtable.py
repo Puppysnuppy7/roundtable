@@ -353,7 +353,8 @@ class RoundtableTests(unittest.TestCase):
 
     def test_suppress_focus_reporting_writes_the_disable_sequence(self):
         buffer = io.StringIO()
-        with mock.patch.object(sys, "stdout", buffer):
+        with mock.patch.object(roundtable.os, "name", "posix"), \
+             mock.patch.object(sys, "stdout", buffer):
             roundtable.suppress_focus_reporting()
         self.assertEqual(buffer.getvalue(), "\x1b[?1004l")
 
@@ -362,7 +363,8 @@ class RoundtableTests(unittest.TestCase):
             def write(self, _):
                 raise OSError("broken pipe")
 
-        with mock.patch.object(sys, "stdout", BrokenStdout()):
+        with mock.patch.object(roundtable.os, "name", "posix"), \
+             mock.patch.object(sys, "stdout", BrokenStdout()):
             roundtable.suppress_focus_reporting()  # must not raise
 
     def test_curses_entry_points_suppress_focus_reporting_before_reading_input(self):
@@ -377,6 +379,17 @@ class RoundtableTests(unittest.TestCase):
             with self.subTest(entry_point=name):
                 source = inspect.getsource(getattr(roundtable, name))
                 self.assertIn("suppress_focus_reporting()", source)
+
+    def test_suppress_focus_reporting_is_a_noop_on_windows(self):
+        """Regression: found live via a Command Prompt screenshot -- the raw escape sequence
+        (`ESC [ ? 1 0 0 4 l`) was printed as garbage text at startup instead of being interpreted.
+        windows-curses doesn't emit/interpret VT escapes (it uses direct Win32 console calls), and
+        DECSET 1004 (POSIX-terminal focus reporting) has no Windows console equivalent to begin
+        with -- so this should just do nothing there, not write anything to stdout at all."""
+        with mock.patch.object(roundtable.os, "name", "nt"), \
+             mock.patch.object(roundtable.sys.stdout, "write") as write:
+            roundtable.suppress_focus_reporting()
+        write.assert_not_called()
 
     def test_expand_keys_toggle_and_collapse_key_clears(self):
         display = roundtable.Display.__new__(roundtable.Display)

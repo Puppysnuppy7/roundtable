@@ -829,7 +829,16 @@ def suppress_focus_reporting() -> None:
     silently ends the whole session. curses.wrapper's endwin() can also reassert a terminal's default
     modes between screens, so this needs to run at the start of every fresh curses session, not just
     once for the whole process.
+
+    No-op on Windows: found live (a Command Prompt screenshot showed the raw escape sequence
+    printed as garbage text, `[?1004l` and all, right at startup). `windows-curses` doesn't emit
+    or interpret VT/ANSI escapes at all -- it renders via direct Win32 console API calls -- and a
+    legacy conhost.exe window doesn't process them either unless virtual terminal mode was
+    explicitly enabled, which this script never does. DECSET 1004 is a POSIX-terminal concept with
+    no Windows console equivalent to suppress in the first place, so there's nothing to do here.
     """
+    if os.name == "nt":
+        return
     try:
         sys.stdout.write("\x1b[?1004l")
         sys.stdout.flush()
