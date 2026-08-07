@@ -110,6 +110,39 @@ def current_platform() -> tuple[str, str]:
     return system, arch
 
 
+def is_wsl(current: tuple[str, str] | None = None) -> bool:
+    """True inside Windows Subsystem for Linux. platform.system() reports 'Linux' there like any
+    other Linux box, but WSL has its own PATH/interop quirks (e.g. Windows binaries reachable on
+    PATH, a separate Windows-side npm/Node install easy to confuse with the Linux-side one) worth
+    flagging rather than silently treating identically to bare-metal Linux. Accepts the same
+    `current` override as the rest of this module so a test simulating a non-Linux platform
+    doesn't fall through to checking the real host.
+    """
+    if (current or current_platform())[0] != "linux":
+        return False
+    try:
+        return "microsoft" in Path("/proc/version").read_text(errors="replace").lower()
+    except OSError:
+        return False
+
+
+def is_musl_libc(current: tuple[str, str] | None = None) -> bool:
+    """True on Linux systems using musl libc (e.g. Alpine) instead of glibc. Several of the npm
+    packages this installer drives ship separate glibc/musl native binaries (see NPM_ARCH_SUPPORT)
+    -- an (os, arch) pair "supported" there can still fail to actually run here if the vendor's
+    package has no musl build. Same detection Antigravity's own official installer script uses.
+    """
+    if (current or current_platform())[0] != "linux":
+        return False
+    if any(Path("/lib").glob("libc.musl-*.so.1")):
+        return True
+    try:
+        result = subprocess.run(["ldd", "/bin/ls"], capture_output=True, text=True, timeout=5)
+        return "musl" in result.stdout.lower()
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def default_bin_dir() -> Path:
     """~/.local/bin if it's on PATH (the conventional place for user-installed CLIs); otherwise
     the first other writable, PATH-listed directory under the user's home; otherwise
@@ -265,12 +298,17 @@ def ensure_windows_dependencies(dry_run: bool, current: tuple[str, str] | None =
 
 
 def install_cli(name: str, executable: str, dry_run: bool,
-                current: tuple[str, str] | None = None) -> tuple[str, bool]:
+                current: tuple[str, str] | None = None, musl: bool = False) -> tuple[str, bool]:
     """Ensure one agent's CLI is installed.
 
     Returns (status_message, ok). ok is False when an install was attempted and failed, or when
     the required package manager is missing so a needed auto-install cannot run. The informational
     "no automated installer" case (agy) is ok=True -- it is not a failure of this script.
+
+    `musl` is a plain bool, not auto-detected here: detecting it shells out to `ldd` (see
+    is_musl_libc), and this function is called once per agent, so the caller (main()) detects it
+    once up front and passes the result through -- same reason `current` is threaded in rather
+    than recomputed.
     """
     found = shutil.which(executable)
     if found:
@@ -292,6 +330,9 @@ def install_cli(name: str, executable: str, dry_run: bool,
     arch_note = ""
     if supported is not None and current not in supported:
         arch_note = f" [no verified prebuilt binary for {current[0]}-{current[1]}; may fail]"
+    elif supported is not None and current[0] == "linux" and musl:
+        arch_note = (" [running on musl libc (e.g. Alpine); this vendor's npm package may not "
+                     "publish a musl build even though it covers this arch on glibc]")
     if dry_run:
         return f"{name:<11} {executable:<7} would run: {joined}{arch_note}", True
     try:
@@ -330,7 +371,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     current = current_platform()
-    print(f"Detected platform: {current[0]}-{current[1]}")
+    print(f"Detected platform: {current[0]}-{current[1]} (Python {platform.python_version()})")
+    if is_wsl(current):
+        print("note: running inside WSL -- PATH/binary interop with any Windows-side install of "
+              "the same tools (npm, git, etc.) can be confusing; this installer only manages the "
+              "Linux-side ones on this PATH.")
+    musl = is_musl_libc(current)
+    if musl:
+        print("note: musl libc detected (e.g. Alpine) -- some agent CLIs' npm packages may only "
+              "publish glibc-linked native binaries; see per-CLI notes below if one fails to run.")
     windows_deps_message = ensure_windows_dependencies(args.dry_run, current=current)
     windows_deps_failed = bool(windows_deps_message) and "failed" in windows_deps_message
     if windows_deps_message is not None:
@@ -357,12 +406,26 @@ def main(argv: list[str] | None = None) -> int:
     any_failed = windows_deps_failed
     for name in (args.only or AGENT_NAMES):
         message, ok = install_cli(
-            name, AGENT_EXECUTABLES[name], args.dry_run, current=current)
+            name, AGENT_EXECUTABLES[name], args.dry_run, current=current, musl=musl)
         print(message)
         if not ok:
             any_failed = True
     return 1 if any_failed else 0
 
 
+def run(argv: list[str] | None = None) -> int:
+    """Entry point wrapper: a bug anywhere in this installer should never dump a raw traceback on
+    someone just trying to install roundtable -- always exit with a clean one-line message.
+    """
+    try:
+        return main(argv)
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return 130
+    except Exception as exc:  # noqa: BLE001 -- intentionally broad, see docstring
+        print(f"error: unexpected failure in installer: {exc}", file=sys.stderr)
+        return 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run())

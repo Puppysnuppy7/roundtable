@@ -189,6 +189,62 @@ class InstallTests(unittest.TestCase):
                 _system, arch = install.current_platform()
                 self.assertEqual(arch, expected_arch, machine)
 
+    def test_is_wsl_false_off_linux_without_touching_proc_version(self):
+        with mock.patch("builtins.open", side_effect=AssertionError("should not be reached")):
+            self.assertFalse(install.is_wsl(current=("windows", "x86_64")))
+            self.assertFalse(install.is_wsl(current=("darwin", "arm64")))
+
+    def test_is_wsl_true_when_proc_version_names_microsoft(self):
+        with mock.patch.object(install.Path, "read_text",
+                               return_value="Linux version 5.15.90.1-microsoft-standard-WSL2"):
+            self.assertTrue(install.is_wsl(current=("linux", "x86_64")))
+
+    def test_is_wsl_false_on_bare_metal_linux(self):
+        with mock.patch.object(install.Path, "read_text",
+                               return_value="Linux version 6.1.0-amd64 (Debian)"):
+            self.assertFalse(install.is_wsl(current=("linux", "x86_64")))
+
+    def test_is_musl_libc_false_off_linux_without_shelling_out(self):
+        with mock.patch.object(install.subprocess, "run",
+                               side_effect=AssertionError("should not be reached")):
+            self.assertFalse(install.is_musl_libc(current=("windows", "x86_64")))
+
+    def test_is_musl_libc_true_via_musl_loader_file(self):
+        with mock.patch.object(install.Path, "glob", return_value=[Path("libc.musl-x86_64.so.1")]):
+            self.assertTrue(install.is_musl_libc(current=("linux", "x86_64")))
+
+    def test_is_musl_libc_true_via_ldd_fallback(self):
+        fake_result = mock.Mock(stdout="linux-vdso.so.1\n\t/lib/ld-musl-x86_64.so.1 (0x7f...)\n")
+        with mock.patch.object(install.Path, "glob", return_value=[]), \
+             mock.patch.object(install.subprocess, "run", return_value=fake_result):
+            self.assertTrue(install.is_musl_libc(current=("linux", "x86_64")))
+
+    def test_is_musl_libc_false_on_glibc(self):
+        fake_result = mock.Mock(stdout="linux-vdso.so.1\n\t/lib/x86_64-linux-gnu/libc.so.6\n")
+        with mock.patch.object(install.Path, "glob", return_value=[]), \
+             mock.patch.object(install.subprocess, "run", return_value=fake_result):
+            self.assertFalse(install.is_musl_libc(current=("linux", "x86_64")))
+
+    def test_install_cli_notes_musl_when_arch_pair_is_otherwise_supported(self):
+        def fake_which(name):
+            return "/usr/bin/npm" if name == "npm" else None
+        with mock.patch.object(install.shutil, "which", side_effect=fake_which):
+            message, ok = install.install_cli("Grok", "grok", dry_run=True,
+                                              current=("linux", "x86_64"), musl=True)
+        self.assertIn("musl", message)
+        self.assertTrue(ok)
+
+    def test_install_cli_does_not_probe_musl_itself(self):
+        """musl is an explicit param, not auto-detected here -- is_musl_libc() shells out to ldd,
+        and doing that once per agent (instead of once, in main()) would be six ldd calls for no
+        reason, and would also collide with subprocess.run mocks in every other install_cli test."""
+        def fake_which(name):
+            return "/usr/bin/npm" if name == "npm" else None
+        with mock.patch.object(install.shutil, "which", side_effect=fake_which), \
+             mock.patch.object(install, "is_musl_libc",
+                               side_effect=AssertionError("should not be called")):
+            install.install_cli("Grok", "grok", dry_run=True, current=("linux", "x86_64"))
+
     def test_npm_arch_support_only_covers_npm_installed_clis(self):
         npm_executables = {executable for executable, req in install.CLI_INSTALLER_REQUIRES.items()
                            if req == "npm"}
@@ -425,7 +481,7 @@ class InstallTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             bin_dir = Path(td) / "bin"
 
-            def fake_install_cli(name, executable, dry_run, current=None):
+            def fake_install_cli(name, executable, dry_run, current=None, musl=False):
                 if executable == "codex":
                     return f"{name} install failed: boom", False
                 return f"{name} already installed (/bin/{executable})", True
@@ -441,7 +497,7 @@ class InstallTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             bin_dir = Path(td) / "bin"
 
-            def fake_install_cli(name, executable, dry_run, current=None):
+            def fake_install_cli(name, executable, dry_run, current=None, musl=False):
                 return f"{name} not found -- no automated installer here", True
 
             with mock.patch.object(install, "install_cli", side_effect=fake_install_cli), \
@@ -449,6 +505,26 @@ class InstallTests(unittest.TestCase):
                  mock.patch("builtins.print"):
                 result = install.main(["--bin-dir", str(bin_dir), "--only", "Grok"])
             self.assertEqual(result, 0)
+
+    def test_run_reports_unexpected_exception_instead_of_a_raw_traceback(self):
+        stderr = []
+        with mock.patch.object(install, "main", side_effect=RuntimeError("boom")), \
+             mock.patch.object(install.sys, "stderr") as fake_stderr:
+            fake_stderr.write.side_effect = lambda s: stderr.append(s)
+            result = install.run([])
+        self.assertEqual(result, 1)
+        self.assertTrue(any("boom" in line for line in stderr))
+        self.assertTrue(any("unexpected failure" in line for line in stderr))
+
+    def test_run_reports_keyboard_interrupt_as_130(self):
+        with mock.patch.object(install, "main", side_effect=KeyboardInterrupt), \
+             mock.patch("builtins.print"):
+            result = install.run([])
+        self.assertEqual(result, 130)
+
+    def test_run_passes_through_normal_exit_code(self):
+        with mock.patch.object(install, "main", return_value=0):
+            self.assertEqual(install.run([]), 0)
 
 
 if __name__ == "__main__":
