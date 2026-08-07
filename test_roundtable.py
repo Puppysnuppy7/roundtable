@@ -1020,6 +1020,91 @@ class RoundtableTests(unittest.TestCase):
                 lambda name, line: ticks.append((name, line)), lambda *_: None)
         self.assertTrue(any("usage-limited; will wait" in line for _, line in ticks))
 
+    def test_auth_required_detail_matches_agy_live_output(self):
+        """Regression: exact text captured live from an unauthenticated `agy --print` run."""
+        text = (
+            "Authentication required. Please visit the URL to log in:\n"
+            "  https://accounts.google.com/o/oauth2/auth?client_id=...\n"
+            "Waiting for authentication (timeout 60s)...\n"
+            "Or, paste the authorization code here and press Enter:\n"
+            "Error: authentication timed out.\n"
+            "Error: authentication failed or timed out"
+        )
+        detail = roundtable.auth_required_detail(text)
+        self.assertIsNotNone(detail)
+        self.assertIn("Authentication required", detail)
+
+    def test_auth_required_detail_none_for_unrelated_text(self):
+        self.assertIsNone(roundtable.auth_required_detail(
+            "Codex exited with status 1\nsome other error"))
+
+    def test_agent_run_cancellation_includes_partial_captured_output(self):
+        """Regression: found live via agy -- an unauthenticated run prints its auth prompt almost
+        immediately, then hangs waiting on stdin no automated caller can ever supply. Before this
+        fix, a cancelled run's exception was a bare "{name} cancelled" with no trace of why; this
+        confirms whatever was captured before cancellation now survives into the message."""
+        class SlowAuthAgent(roundtable.Agent):
+            def command(self, prompt, output_file=None, no_edit=False):
+                return [sys.executable, "-c",
+                       "import sys, time; "
+                       "print('Authentication required. Please visit the URL to log in:'); "
+                       "sys.stdout.flush(); time.sleep(30)"]
+
+        with tempfile.TemporaryDirectory() as td:
+            agent = SlowAuthAgent("Antigravity", Path(td))
+            cancel_event = threading.Event()
+            timer = threading.Timer(0.3, cancel_event.set)
+            timer.start()
+            agent.cancel_event = cancel_event
+            try:
+                with self.assertRaises(RuntimeError) as raised:
+                    agent.run("prompt", lambda line: None, no_edit=True)
+            finally:
+                timer.cancel()
+        message = str(raised.exception)
+        self.assertIn("cancelled", message)
+        self.assertIn("Authentication required", message)
+
+    def test_agent_run_cancellation_without_output_stays_bare(self):
+        """The "{name} cancelled" fast-path (no captured output yet) must still be recognized as
+        a deliberate cancellation, not mislogged as an unexpected error -- see the startswith
+        check this pairs with."""
+        class SlowAgent(roundtable.Agent):
+            def command(self, prompt, output_file=None, no_edit=False):
+                return [sys.executable, "-c", "import time; time.sleep(30)"]
+
+        with tempfile.TemporaryDirectory() as td:
+            agent = SlowAgent("Codex", Path(td))
+            cancel_event = threading.Event()
+            timer = threading.Timer(0.3, cancel_event.set)
+            timer.start()
+            agent.cancel_event = cancel_event
+            try:
+                with self.assertRaises(RuntimeError) as raised:
+                    agent.run("prompt", lambda line: None, no_edit=True)
+            finally:
+                timer.cancel()
+        self.assertEqual(str(raised.exception), "Codex cancelled")
+
+    def test_preflight_check_reports_auth_required_instead_of_generic_timeout(self):
+        """End-to-end: preflight_check must surface the clearer auth message even though its own
+        bounded timeout is what actually cancels the hung, unauthenticated process."""
+        class SlowAuthAgent(roundtable.Agent):
+            def command(self, prompt, output_file=None, no_edit=False):
+                return [sys.executable, "-c",
+                       "import sys, time; "
+                       "print('Authentication required. Please visit the URL to log in:'); "
+                       "sys.stdout.flush(); time.sleep(30)"]
+
+        with tempfile.TemporaryDirectory() as td:
+            agent = SlowAuthAgent("Antigravity", Path(td))
+            ok, message = roundtable.preflight_check(
+                "Antigravity", agent, lambda *_: None, threading.Event(), timeout=0.3)
+        self.assertFalse(ok)
+        self.assertIn("needs interactive login", message)
+        self.assertIn("agy", message)
+        self.assertNotIn("timed out after", message)
+
     def test_agents_exchange_and_synthesize(self):
         with tempfile.TemporaryDirectory() as td:
             session = roundtable.Session("Solve it", td, 1, "now", [])
@@ -2879,7 +2964,7 @@ class RoundtableTests(unittest.TestCase):
             for action in parser._actions
             if isinstance(action, roundtable.argparse._StoreTrueAction)
             and action.help != roundtable.argparse.SUPPRESS
-            and action.dest not in ("plain", "list_agents", "install", "update", "bugsend")
+            and action.dest not in ("plain", "list_agents", "install", "update", "bugsend", "list_keys")
         }
         toggle_names = {name for name, _ in roundtable.OPTION_TOGGLES}
         self.assertTrue(parser_flags <= toggle_names, f"Missing toggles for: {parser_flags - toggle_names}")
@@ -2936,6 +3021,197 @@ class RoundtableTests(unittest.TestCase):
         self.assertIn('"--bugsend" in sys.argv[1:]', source)
         gate = gate_start
         self.assertLess(source.index(gate), source.index("\nimport curses\n"))
+
+    def test_main_sets_locale_before_anything_else(self):
+        """Regression: found live via a screenshot of the real Windows GUI -- box-drawing corners
+        and status-dot icons throughout the display were rendering as garbled tofu/replacement
+        boxes. Root cause: curses' addstr() has undefined behavior for non-ASCII glyphs in the
+        default "C" locale, on both PDCurses (windows-curses) and ncurses, and this file never
+        called locale.setlocale(). Must happen before any curses.wrapper() call in main() --
+        --list-agents exits before ever reaching one, so this confirms the call happens
+        unconditionally up front rather than only on a path that happens to need curses."""
+        argv = ["roundtable", "--list-agents"]
+        with mock.patch.object(sys, "argv", argv), \
+             mock.patch.object(roundtable.locale, "setlocale") as setlocale_mock, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(roundtable.main(), 0)
+        setlocale_mock.assert_called_once_with(roundtable.locale.LC_ALL, "")
+
+    def test_main_tolerates_a_locale_that_cannot_be_set(self):
+        """A minimal environment with no locale data installed must not crash roundtable outright
+        -- it degrades to the same mangled glyphs the setlocale call exists to prevent, same as
+        before this fix, rather than failing worse than that."""
+        argv = ["roundtable", "--list-agents"]
+        with mock.patch.object(sys, "argv", argv), \
+             mock.patch.object(roundtable.locale, "setlocale",
+                               side_effect=roundtable.locale.Error("unsupported locale")), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(roundtable.main(), 0)
+
+    def test_load_and_save_stored_keys_round_trip(self):
+        with tempfile.TemporaryDirectory() as td:
+            keys_path = Path(td) / "keys.env"
+            with mock.patch.object(roundtable, "_keys_file", return_value=keys_path):
+                roundtable._save_stored_keys({"MISTRAL_API_KEY": "sk-abc", "XAI_API_KEY": "xai-123"})
+                loaded = roundtable._load_stored_keys()
+            self.assertEqual(loaded, {"MISTRAL_API_KEY": "sk-abc", "XAI_API_KEY": "xai-123"})
+
+    def test_save_stored_keys_locks_file_permissions(self):
+        if os.name == "nt":
+            self.skipTest("POSIX permission bits only")
+        with tempfile.TemporaryDirectory() as td:
+            keys_path = Path(td) / "keys.env"
+            with mock.patch.object(roundtable, "_keys_file", return_value=keys_path):
+                roundtable._save_stored_keys({"FOO": "bar"})
+            self.assertEqual(keys_path.stat().st_mode & 0o777, 0o600)
+
+    def test_load_stored_keys_returns_empty_when_file_missing(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(roundtable, "_keys_file", return_value=Path(td) / "nope.env"):
+                self.assertEqual(roundtable._load_stored_keys(), {})
+
+    def test_load_stored_keys_skips_comments_and_blank_lines(self):
+        with tempfile.TemporaryDirectory() as td:
+            keys_path = Path(td) / "keys.env"
+            keys_path.write_text("# comment\n\nFOO=bar\n   \nBAZ=qux\n")
+            with mock.patch.object(roundtable, "_keys_file", return_value=keys_path):
+                loaded = roundtable._load_stored_keys()
+            self.assertEqual(loaded, {"FOO": "bar", "BAZ": "qux"})
+
+    def test_apply_stored_keys_is_a_fallback_not_an_override(self):
+        with tempfile.TemporaryDirectory() as td:
+            keys_path = Path(td) / "keys.env"
+            with mock.patch.object(roundtable, "_keys_file", return_value=keys_path):
+                roundtable._save_stored_keys({"ROUNDTABLE_TEST_KEY": "stored-value"})
+                with mock.patch.dict(os.environ, {"ROUNDTABLE_TEST_KEY": "real-value"}):
+                    roundtable.apply_stored_keys()
+                    self.assertEqual(os.environ["ROUNDTABLE_TEST_KEY"], "real-value")
+
+    def test_apply_stored_keys_fills_in_when_unset(self):
+        with tempfile.TemporaryDirectory() as td:
+            keys_path = Path(td) / "keys.env"
+            with mock.patch.object(roundtable, "_keys_file", return_value=keys_path):
+                roundtable._save_stored_keys({"ROUNDTABLE_TEST_KEY_2": "stored-value"})
+                original = os.environ.pop("ROUNDTABLE_TEST_KEY_2", None)
+                try:
+                    roundtable.apply_stored_keys()
+                    self.assertEqual(os.environ["ROUNDTABLE_TEST_KEY_2"], "stored-value")
+                finally:
+                    os.environ.pop("ROUNDTABLE_TEST_KEY_2", None)
+                    if original is not None:
+                        os.environ["ROUNDTABLE_TEST_KEY_2"] = original
+
+    def test_run_key_command_list_keys_reports_none_stored(self):
+        with tempfile.TemporaryDirectory() as td:
+            keys_path = Path(td) / "keys.env"
+            printed = []
+            with mock.patch.object(roundtable, "_keys_file", return_value=keys_path), \
+                 mock.patch("builtins.print",
+                            side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
+                result = roundtable._run_key_command_from_cli(["--list-keys"])
+            self.assertEqual(result, 0)
+            self.assertTrue(any("no keys stored" in line for line in printed))
+
+    def test_run_key_command_list_keys_shows_names_not_values(self):
+        with tempfile.TemporaryDirectory() as td:
+            keys_path = Path(td) / "keys.env"
+            with mock.patch.object(roundtable, "_keys_file", return_value=keys_path):
+                roundtable._save_stored_keys({"MISTRAL_API_KEY": "super-secret-value"})
+                printed = []
+                with mock.patch("builtins.print",
+                                side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
+                    result = roundtable._run_key_command_from_cli(["--list-keys"])
+            self.assertEqual(result, 0)
+            body = "\n".join(printed)
+            self.assertIn("MISTRAL_API_KEY", body)
+            self.assertNotIn("super-secret-value", body)
+
+    def test_run_key_command_set_key_requires_interactive_terminal(self):
+        with tempfile.TemporaryDirectory() as td:
+            keys_path = Path(td) / "keys.env"
+            with mock.patch.object(roundtable, "_keys_file", return_value=keys_path), \
+                 mock.patch.object(roundtable.sys.stdin, "isatty", return_value=False), \
+                 mock.patch("builtins.print"):
+                result = roundtable._run_key_command_from_cli(["--set-key", "MISTRAL_API_KEY"])
+            self.assertEqual(result, 1)
+            self.assertFalse(keys_path.exists())
+
+    def test_run_key_command_set_key_saves_hidden_value(self):
+        with tempfile.TemporaryDirectory() as td:
+            keys_path = Path(td) / "keys.env"
+            with mock.patch.object(roundtable, "_keys_file", return_value=keys_path), \
+                 mock.patch.object(roundtable.sys.stdin, "isatty", return_value=True), \
+                 mock.patch("getpass.getpass", return_value="sk-abc123"), \
+                 mock.patch("builtins.print"):
+                result = roundtable._run_key_command_from_cli(["--set-key", "MISTRAL_API_KEY"])
+            self.assertEqual(result, 0)
+            with mock.patch.object(roundtable, "_keys_file", return_value=keys_path):
+                self.assertEqual(roundtable._load_stored_keys(), {"MISTRAL_API_KEY": "sk-abc123"})
+
+    def test_run_key_command_set_key_rejects_empty_value(self):
+        with tempfile.TemporaryDirectory() as td:
+            keys_path = Path(td) / "keys.env"
+            with mock.patch.object(roundtable, "_keys_file", return_value=keys_path), \
+                 mock.patch.object(roundtable.sys.stdin, "isatty", return_value=True), \
+                 mock.patch("getpass.getpass", return_value="   "), \
+                 mock.patch("builtins.print"):
+                result = roundtable._run_key_command_from_cli(["--set-key", "MISTRAL_API_KEY"])
+            self.assertEqual(result, 1)
+            self.assertFalse(keys_path.exists())
+
+    def test_run_key_command_clear_key_removes_existing(self):
+        with tempfile.TemporaryDirectory() as td:
+            keys_path = Path(td) / "keys.env"
+            with mock.patch.object(roundtable, "_keys_file", return_value=keys_path):
+                roundtable._save_stored_keys({"MISTRAL_API_KEY": "x", "XAI_API_KEY": "y"})
+                with mock.patch("builtins.print"):
+                    result = roundtable._run_key_command_from_cli(["--clear-key", "MISTRAL_API_KEY"])
+                self.assertEqual(result, 0)
+                self.assertEqual(roundtable._load_stored_keys(), {"XAI_API_KEY": "y"})
+
+    def test_run_key_command_clear_key_not_stored_is_a_no_op(self):
+        with tempfile.TemporaryDirectory() as td:
+            keys_path = Path(td) / "keys.env"
+            with mock.patch.object(roundtable, "_keys_file", return_value=keys_path), \
+                 mock.patch("builtins.print"):
+                result = roundtable._run_key_command_from_cli(["--clear-key", "NOPE"])
+            self.assertEqual(result, 0)
+
+    def test_set_key_flag_invokes_key_command_from_cli(self):
+        with mock.patch("roundtable._run_key_command_from_cli", return_value=0) as mock_key_cmd, \
+             mock.patch("roundtable.apply_stored_keys"), \
+             mock.patch("sys.argv", ["roundtable", "--set-key", "MISTRAL_API_KEY"]):
+            exit_code = roundtable.main()
+            self.assertEqual(exit_code, 0)
+            mock_key_cmd.assert_called_once_with(["--set-key", "MISTRAL_API_KEY"])
+
+    def test_list_keys_flag_invokes_key_command_from_cli(self):
+        with mock.patch("roundtable._run_key_command_from_cli", return_value=0) as mock_key_cmd, \
+             mock.patch("roundtable.apply_stored_keys"), \
+             mock.patch("sys.argv", ["roundtable", "--list-keys"]):
+            exit_code = roundtable.main()
+            self.assertEqual(exit_code, 0)
+            mock_key_cmd.assert_called_once_with(["--list-keys"])
+
+    def test_clear_key_flag_invokes_key_command_from_cli(self):
+        with mock.patch("roundtable._run_key_command_from_cli", return_value=0) as mock_key_cmd, \
+             mock.patch("roundtable.apply_stored_keys"), \
+             mock.patch("sys.argv", ["roundtable", "--clear-key", "MISTRAL_API_KEY"]):
+            exit_code = roundtable.main()
+            self.assertEqual(exit_code, 0)
+            mock_key_cmd.assert_called_once_with(["--clear-key", "MISTRAL_API_KEY"])
+
+    def test_key_commands_are_defined_before_curses_import(self):
+        """--set-key/--list-keys/--clear-key must not require curses (stock Windows) either."""
+        source = Path(roundtable.__file__).read_text(encoding="utf-8")
+        self.assertIn('"--set-key"', source)
+        self.assertIn('"--list-keys"', source)
+        self.assertIn('"--clear-key"', source)
+        self.assertIn("def _run_key_command_from_cli", source)
+        self.assertLess(
+            source.index("def _run_key_command_from_cli"),
+            source.index("\nimport curses\n"),
+        )
 
     def test_bugsend_flag_invokes_installer_main_with_bugsend(self):
         with mock.patch("install.main", return_value=0) as mock_install_main, \
@@ -6695,6 +6971,81 @@ class RoundtableTests(unittest.TestCase):
             display.draw()
         rendered = display.s.text()
         self.assertIn("🧪 mock", rendered)
+
+    def test_run_tui_tolerates_missing_output_dir_on_keyboard_interrupt(self):
+        """Regression: found live on the Optiplex -- a stale .roundtable log had accumulated over
+        2000 repeated tracebacks, all the same crash: save_session(session, Path(args.output_dir))
+        raising TypeError because args.output_dir was None. RunLog's own construction a few lines
+        above already tolerated this (getattr(..., None) or ".roundtable"); the save_session calls
+        in every except branch below it did not. This exercises the KeyboardInterrupt branch
+        specifically with output_dir=None and confirms it saves instead of crashing."""
+        session = roundtable.Session("Task", "/tmp", 1, "now", [
+            roundtable.Turn("User", "follow-up", "Do the thing"),
+        ])
+        args = roundtable.argparse.Namespace(
+            output_dir=None, skip_preflight=True, preflight_timeout=5,
+            touch_mode=False, collab="parallel", synthesizer="rotate",
+            balance_load=False, task_status_check=False, reassign_idle=False,
+            dead_code_check=False, synthesis_passes=3)
+
+        def stub_conduct(active_session, *_args, **_kwargs):
+            raise KeyboardInterrupt
+
+        test_display = make_test_display()
+        test_display.session = session
+        stdscr = mock.MagicMock()
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                os.chdir(td)
+                with mock.patch("roundtable.Display", return_value=test_display), \
+                     mock.patch("roundtable.conduct", side_effect=stub_conduct), \
+                     mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+                     mock.patch.object(roundtable.curses, "has_colors", return_value=False), \
+                     mock.patch("roundtable.finalize_agent_prompt_file"), \
+                     mock.patch("roundtable.suppress_focus_reporting"):
+                    ret = roundtable.run_tui(stdscr, args, session, None, None, None, None,
+                                             None, None, resumed=False)
+                saved = list((Path(td) / ".roundtable").glob("*.json"))
+            finally:
+                os.chdir(original_cwd)
+        self.assertEqual(ret, 130)
+        self.assertEqual(len(saved), 1)
+
+    def test_run_tui_tolerates_missing_output_dir_on_unhandled_exception(self):
+        """Same regression as above, for the generic Exception branch specifically."""
+        session = roundtable.Session("Task", "/tmp", 1, "now", [
+            roundtable.Turn("User", "follow-up", "Do the thing"),
+        ])
+        args = roundtable.argparse.Namespace(
+            output_dir=None, skip_preflight=True, preflight_timeout=5,
+            touch_mode=False, collab="parallel", synthesizer="rotate",
+            balance_load=False, task_status_check=False, reassign_idle=False,
+            dead_code_check=False, synthesis_passes=3)
+
+        def stub_conduct(active_session, *_args, **_kwargs):
+            raise RuntimeError("boom")
+
+        test_display = make_test_display()
+        test_display.session = session
+        stdscr = mock.MagicMock()
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                os.chdir(td)
+                with mock.patch("roundtable.Display", return_value=test_display), \
+                     mock.patch("roundtable.conduct", side_effect=stub_conduct), \
+                     mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+                     mock.patch.object(roundtable.curses, "has_colors", return_value=False), \
+                     mock.patch("roundtable.finalize_agent_prompt_file"), \
+                     mock.patch("roundtable.suppress_focus_reporting"):
+                    ret = roundtable.run_tui(stdscr, args, session, None, None, None, None,
+                                             None, None, resumed=False)
+                saved = list((Path(td) / ".roundtable").glob("*.json"))
+            finally:
+                os.chdir(original_cwd)
+        self.assertEqual(ret, 1)
+        self.assertEqual(len(saved), 1)
 
     def test_run_tui_logs_preflight_skipped_to_ui_console(self):
         args = roundtable.build_parser().parse_args(["--mock", "--plain", "--skip-preflight", "goal"])

@@ -33,9 +33,124 @@ def _run_install_from_cli(argv: list[str] | None = None) -> int:
     return int(module.main(install_argv))
 
 
-# Must run before `import curses` so stock Windows Python can still install/update/bugsend.
-if __name__ == "__main__" and ("--install" in sys.argv[1:] or "--update" in sys.argv[1:]
-                               or "--bugsend" in sys.argv[1:]):
+def _keys_file():
+    """Where locally-stored per-agent API keys live: user-level, not per-project -- the same
+    keys apply across every workspace roundtable runs in, unlike --output-dir's run logs.
+    """
+    from pathlib import Path
+    return Path.home() / ".roundtable" / "keys.env"
+
+
+def _load_stored_keys() -> dict[str, str]:
+    path = _keys_file()
+    if not path.is_file():
+        return {}
+    keys: dict[str, str] = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            name, _, value = stripped.partition("=")
+            keys[name.strip()] = value.strip()
+    except OSError:
+        return {}
+    return keys
+
+
+def _save_stored_keys(keys: dict[str, str]) -> None:
+    path = _keys_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f"{name}={value}" for name, value in sorted(keys.items())]
+    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass  # Best-effort on platforms/filesystems that don't support POSIX permission bits.
+
+
+def apply_stored_keys() -> None:
+    """Load ~/.roundtable/keys.env into this process's environment before any agent launches.
+
+    A fallback only, never an override: os.environ.setdefault leaves a real env var already set
+    (e.g. temporarily overridden for one shell session, or set some other way entirely) alone --
+    the stored file just supplies a persistent default so it doesn't have to be set every time.
+    """
+    import os
+    for name, value in _load_stored_keys().items():
+        os.environ.setdefault(name, value)
+
+
+def _run_key_command_from_cli(argv: list[str] | None = None) -> int:
+    """Handle --set-key/--list-keys/--clear-key without importing the rest of this module (same
+    reasoning as _run_install_from_cli: must work on stock Windows Python, and none of this needs
+    curses anyway).
+    """
+    import argparse
+    import getpass
+
+    args = list(sys.argv[1:] if argv is None else argv)
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--set-key", metavar="NAME")
+    parser.add_argument("--list-keys", action="store_true")
+    parser.add_argument("--clear-key", metavar="NAME")
+    known, _ = parser.parse_known_args(args)
+    keys_path = _keys_file()
+
+    if known.list_keys:
+        keys = _load_stored_keys()
+        if not keys:
+            print(f"no keys stored ({keys_path})")
+            return 0
+        print(f"stored keys ({keys_path}):")
+        for name in sorted(keys):
+            print(f"  {name}")
+        return 0
+
+    if known.clear_key:
+        keys = _load_stored_keys()
+        if known.clear_key not in keys:
+            print(f"{known.clear_key} was not stored")
+            return 0
+        del keys[known.clear_key]
+        _save_stored_keys(keys)
+        print(f"removed {known.clear_key} from {keys_path}")
+        return 0
+
+    if known.set_key:
+        if not sys.stdin.isatty():
+            print("error: --set-key needs an interactive terminal to prompt for the value --"
+                  " that way it never ends up in shell history or a process listing",
+                  file=sys.stderr)
+            return 1
+        try:
+            value = getpass.getpass(f"Enter value for {known.set_key}: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\ncancelled -- nothing was saved")
+            return 0
+        value = value.strip()
+        if not value:
+            print("error: value cannot be empty", file=sys.stderr)
+            return 1
+        keys = _load_stored_keys()
+        keys[known.set_key] = value
+        _save_stored_keys(keys)
+        print(f"saved {known.set_key} to {keys_path}")
+        return 0
+
+    print("error: expected one of --set-key NAME, --list-keys, --clear-key NAME",
+          file=sys.stderr)
+    return 1
+
+
+_KEY_COMMAND_FLAGS = ("--set-key", "--list-keys", "--clear-key")
+
+# Must run before `import curses` so stock Windows Python can still install/update/bugsend/manage
+# keys.
+if __name__ == "__main__" and any(flag in sys.argv[1:] for flag in
+                                  ("--install", "--update", "--bugsend", *_KEY_COMMAND_FLAGS)):
+    if any(flag in sys.argv[1:] for flag in _KEY_COMMAND_FLAGS):
+        raise SystemExit(_run_key_command_from_cli())
     raise SystemExit(_run_install_from_cli())
 
 import argparse
@@ -44,6 +159,7 @@ import curses
 import concurrent.futures
 import hashlib
 import json
+import locale
 import math
 import os
 import queue
@@ -1244,7 +1360,15 @@ class Agent:
                         self.log_diagnostic(
                             f"cancelled pid={proc.pid if proc else 'unknown'} duration={elapsed:.3f}s "
                             f"reader_alive={reader.is_alive() if proc else False}")
-                        raise RuntimeError(f"{self.name} cancelled")
+                        # Include whatever was captured before cancellation (e.g. preflight's
+                        # bounded timeout firing) -- a CLI waiting on interactive login (agy's
+                        # OAuth flow, verified live: it prints the auth prompt almost immediately,
+                        # then blocks on stdin for a code no automated caller can ever supply)
+                        # would otherwise cancel silently, with no trace of why it never responded.
+                        partial = "".join(captured).strip()
+                        raise RuntimeError(
+                            f"{self.name} cancelled\n{partial[-2000:]}" if partial
+                            else f"{self.name} cancelled")
 
                     delivered = False
                     while True:
@@ -1271,7 +1395,8 @@ class Agent:
                 # A deliberate cancellation raises RuntimeError(f"{name} cancelled") from the loop
                 # above, which already logged its own reason before reaching here -- don't relabel
                 # that expected case as an "unexpected error" in the diagnostic log.
-                if not (isinstance(exc, RuntimeError) and str(exc) == f"{self.name} cancelled"):
+                if not (isinstance(exc, RuntimeError)
+                       and str(exc).startswith(f"{self.name} cancelled")):
                     self.log_diagnostic(f"unexpected error during run: {type(exc).__name__}: {exc}")
                 if not process_terminated and proc is not None and proc.poll() is None:
                     stop_process()
@@ -3851,6 +3976,30 @@ def usage_limit_detail(text: str) -> str | None:
     return None
 
 
+# Verified live against Antigravity (agy): an unauthenticated run prints "Authentication
+# required. Please visit the URL to log in:" almost immediately, waits up to 60s, then "Or, paste
+# the authorization code here and press Enter:" -- a raw stdin prompt. roundtable's Agent never
+# connects a CLI's stdin to a real keyboard (agents are driven by prompts, not interactive typing),
+# so this can never be completed from inside a roundtable run, no matter how long any timeout is.
+AUTH_REQUIRED_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
+    r"authentication required",
+    r"please (?:visit|open) (?:the )?url to log ?in",
+    r"paste the authorization code",
+    r"authentication (?:timed out|failed)",
+    r"not authenticated",
+    r"please (?:log|sign) ?in",
+))
+
+
+def auth_required_detail(text: str) -> str | None:
+    """Return the diagnostic line when text indicates the CLI is waiting on interactive login."""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped and any(pattern.search(stripped) for pattern in AUTH_REQUIRED_PATTERNS):
+            return stripped
+    return None
+
+
 # Best-effort: not every CLI reports a running usage-limit percentage the way some do (e.g. "You've
 # used 93% of your usage limit"). When one does, this picks it up from any ticked output line so the
 # dashboard gauge can show it; when none of the six do for a given run, no percentage is ever shown
@@ -4618,6 +4767,15 @@ def preflight_check(name: str, agent: Agent, tick: Callable[[str, str], None],
         agent.run(PREFLIGHT_PROMPT, lambda line: tick(name, line), no_edit=True)
         return True, "ready"
     except Exception as exc:
+        # Checked ahead of cancel_event: an interactive-login prompt (verified live: agy's OAuth
+        # flow) is printed almost immediately, well before any reasonable preflight timeout, so
+        # it's captured even when that same timeout is what ultimately cancels the process --
+        # and it's a far more useful diagnosis than a bare "timed out after Ns" would be.
+        auth_detail = auth_required_detail(str(exc))
+        if auth_detail:
+            executable = AGENT_EXECUTABLES.get(name, name.lower())
+            return False, (f"needs interactive login -- run `{executable}` by hand in a plain "
+                           f"terminal to complete it, then re-run roundtable ({auth_detail})")
         if cancel_event.is_set():
             return False, f"timed out after {timeout:.0f}s"
         limit_detail = usage_limit_detail(str(exc))
@@ -4965,7 +5123,11 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
             resumed: bool = False, checkpoint: Callable[[], None] = lambda: None,
             completed_phases: set[str] | None = None) -> int:
     suppress_focus_reporting()
-    run_log = RunLog(log_path_for(session, Path(getattr(args, "output_dir", None) or ".roundtable")))
+    # A caller (a test double, or any future direct invocation) may hand run_tui a Namespace with
+    # output_dir left None/unset; every save_session() call below must tolerate that the same way
+    # this one does, or a crash here loses the very session state it exists to protect.
+    output_dir = Path(getattr(args, "output_dir", None) or ".roundtable")
+    run_log = RunLog(log_path_for(session, output_dir))
     agents = (codex, claude, antigravity, aider, grok, qwen)
     attach_agent_diagnostics(run_log, agents)
     log_run_context(run_log, args, session, agents, resumed, completed_phases)
@@ -5020,7 +5182,7 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
                    checkpoint=checkpoint,
                    completed_phases=completed_phases)
             ui.busy = False
-            paths = save_session(session, Path(args.output_dir))
+            paths = save_session(session, output_dir)
             run_log.write(
                 "artifact",
                 f"session saved json={paths[0]} markdown={paths[1]} "
@@ -5039,7 +5201,7 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
     except SelfRestartRequired:
         preserve_prompt_board = True
         session.restart_count += 1
-        paths = save_session(session, Path(args.output_dir))
+        paths = save_session(session, output_dir)
         ui.log(f"Source changed; restarting from {paths[0]}", kind="info")
         curses.endwin()
         try:
@@ -5053,7 +5215,7 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
         ui.status, ui.activity = "Cancelled", {}
         ui.log("Cancelled by user", kind="error")
         if session.turns:
-            paths = save_session(session, Path(args.output_dir))
+            paths = save_session(session, output_dir)
             run_log.write("artifact", f"partial session saved json={paths[0]} markdown={paths[1]}")
         ui.draw()
         time.sleep(0.35)
@@ -5066,7 +5228,7 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
         run_log.write("debug", traceback.format_exc())
         if session.turns:
             try:
-                paths = save_session(session, Path(args.output_dir))
+                paths = save_session(session, output_dir)
                 run_log.write(
                     "artifact", f"failure checkpoint saved json={paths[0]} markdown={paths[1]}")
             except OSError as save_exc:
@@ -5372,10 +5534,39 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log", type=Path, default=None,
                         help="specific run log to attach for --bugsend (default: most recent "
                              "log in --output-dir)")
+    parser.add_argument("--set-key", metavar="NAME",
+                        help="store an API key locally (~/.roundtable/keys.env, permission-"
+                             "locked to your account) for an env var an agent CLI reads -- e.g. "
+                             "MISTRAL_API_KEY for Aider's default model, XAI_API_KEY for Grok -- "
+                             "prompted for the value (hidden input) so it never lands in shell "
+                             "history, then exits. A real env var already set always takes "
+                             "priority over a stored one. Does not apply to Antigravity (agy), "
+                             "which authenticates via browser login, not an API key")
+    parser.add_argument("--list-keys", action="store_true",
+                        help="list which env var names have a locally-stored key (never prints "
+                             "the values themselves), then exit")
+    parser.add_argument("--clear-key", metavar="NAME",
+                        help="remove a locally-stored key by env var name, then exit")
     return parser
 
 
 def main() -> int:
+    # Without this, curses' addstr() has no defined behavior for the non-ASCII glyphs used
+    # throughout the display (box-drawing corners, agent status dots, etc.) -- they silently
+    # mangle into replacement/tofu boxes instead of rendering, on both PDCurses (windows-curses)
+    # and ncurses, rather than raising anything that would point at the cause. Must run before
+    # any curses.wrapper() call in this function (there are several: the options toggle screen,
+    # the objective prompt, and the main TUI), so it goes first, before anything else. A missing
+    # locale (e.g. a minimal container with no locale data installed) degrades to the same
+    # mangled glyphs this line exists to prevent, rather than crashing on top of that.
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass
+    # Fills in any of the five API-key agents' env vars not already set for this process, from
+    # ~/.roundtable/keys.env (see --set-key). Cheap and side-effect-free enough to just always
+    # run, rather than threading a skip-condition through every early-exit branch below.
+    apply_stored_keys()
     # A prior `roundtable --install` (or another program) may have just added a CLI to PATH via
     # the registry, but this process's own inherited environment predates that -- refresh it first
     # so verify_clis()/list_agents() below don't report a CLI as missing that's genuinely on PATH
@@ -5384,6 +5575,17 @@ def main() -> int:
     install.refresh_windows_path()
     parser = build_parser()
     args, remaining = parser.parse_known_args()
+    if args.set_key or args.list_keys or args.clear_key:
+        # Consumed by this parser above, so re-add for _run_key_command_from_cli's own parser,
+        # same reasoning as --update/--message/--log below.
+        extra = []
+        if args.set_key:
+            extra += ["--set-key", args.set_key]
+        if args.list_keys:
+            extra.append("--list-keys")
+        if args.clear_key:
+            extra += ["--clear-key", args.clear_key]
+        return _run_key_command_from_cli(extra)
     if args.install or args.update or args.bugsend:
         # --update/--message/--log were already parsed (and consumed) by this parser above, so
         # they're not in `remaining` the way they would be coming from the pre-curses script
