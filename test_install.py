@@ -407,6 +407,34 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(any("externally managed" in m and "upgrade skipped" in m for m in messages))
         self.assertFalse(any("upgrade failed" in m for m in messages))
 
+    def test_update_package_managers_explains_npm_engine_mismatch_without_failing(self):
+        """Regression: found live on the Optiplex -- `npm install -g npm@latest` always targets
+        the newest release, which can need a newer Node than is actually installed. npm's own
+        engine check correctly refuses (EBADENGINE); this is not a bug in this script."""
+        def fake_which(name):
+            return "/usr/bin/npm" if name == "npm" else None
+        error = install.subprocess.CalledProcessError(
+            1, ["npm", "install", "-g", "npm@latest"],
+            output="", stderr="npm error code EBADENGINE\nnpm error engine Unsupported engine\n"
+                              "npm error notsup Required: {\"node\":\"^22.22.2\"}\n"
+                              "npm error notsup Actual:   {\"npm\":\"10.9.2\",\"node\":\"v22.14.0\"}\n")
+        with mock.patch.object(install.shutil, "which", side_effect=fake_which), \
+             mock.patch.object(install.subprocess, "run", side_effect=error):
+            messages, failed = install.update_package_managers(dry_run=False)
+        self.assertFalse(failed)
+        self.assertTrue(any("newer Node.js" in m and "upgrade skipped" in m for m in messages))
+        self.assertFalse(any("upgrade failed" in m for m in messages))
+
+    def test_update_package_managers_includes_captured_output_tail_on_unknown_failure(self):
+        error = install.subprocess.CalledProcessError(
+            1, ["pip", "install", "--upgrade", "pip"],
+            output="", stderr="some genuinely unexpected pip error\nwith a second line\n")
+        with mock.patch.object(install.shutil, "which", return_value=None), \
+             mock.patch.object(install.subprocess, "run", side_effect=error):
+            messages, failed = install.update_package_managers(dry_run=False)
+        self.assertTrue(failed)
+        self.assertTrue(any("genuinely unexpected pip error" in m for m in messages))
+
     def test_main_update_dry_run_shows_package_manager_plan_without_prompting(self):
         with tempfile.TemporaryDirectory() as td:
             bin_dir = Path(td) / "bin"

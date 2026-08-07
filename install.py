@@ -488,8 +488,19 @@ def update_package_managers(dry_run: bool) -> tuple[list[str], bool]:
                     f"included. Use your OS package manager instead (e.g. `apt install "
                     f"--only-upgrade python3-pip`), or pass --break-system-packages yourself if "
                     f"you understand the risk; this script won't do that automatically.")
+            elif "EBADENGINE" in output:
+                # `npm install -g npm@latest` always targets the newest release, which can (and,
+                # found live, does) require a newer Node than what's actually installed -- npm's
+                # own engine check correctly refuses rather than installing something broken.
+                messages.append(
+                    f"{label} upgrade skipped: the latest npm needs a newer Node.js than is "
+                    f"installed here (npm's own engine check refused, not a bug in this script) "
+                    f"-- upgrade Node.js first if you want the newest npm; current npm is still "
+                    f"perfectly usable otherwise.")
             else:
-                messages.append(f"{label} upgrade failed: {exc}")
+                tail = "\n".join(output.strip().splitlines()[-5:]) if output.strip() else None
+                detail = f": {exc}" if tail is None else f":\n{tail}"
+                messages.append(f"{label} upgrade failed{detail}")
                 any_failed = True
         except OSError as exc:
             messages.append(f"{label} upgrade failed: {exc}")
