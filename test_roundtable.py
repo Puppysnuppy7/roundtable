@@ -2986,11 +2986,11 @@ class RoundtableTests(unittest.TestCase):
     def test_install_cli_entry_is_defined_before_curses_import(self):
         """`python3 roundtable.py --install` must not require curses (stock Windows)."""
         source = Path(roundtable.__file__).read_text(encoding="utf-8")
-        gate_start = 'if __name__ == "__main__" and ("--install" in sys.argv[1:]'
-        self.assertIn(gate_start, source)
-        self.assertIn('"--update" in sys.argv[1:]', source)
-        self.assertIn('"--bugsend" in sys.argv[1:]', source)
-        gate = gate_start
+        gate = 'if __name__ == "__main__" and any(flag in sys.argv[1:] for flag in'
+        self.assertIn(gate, source)
+        self.assertIn('"--install"', source)
+        self.assertIn('"--update"', source)
+        self.assertIn('"--bugsend"', source)
         self.assertLess(source.index(gate), source.index("\nimport curses\n"))
         self.assertIn("def _run_install_from_cli", source)
         self.assertLess(
@@ -3015,11 +3015,10 @@ class RoundtableTests(unittest.TestCase):
     def test_update_cli_entry_is_defined_before_curses_import(self):
         """`python3 roundtable.py --update` must not require curses (stock Windows) either."""
         source = Path(roundtable.__file__).read_text(encoding="utf-8")
-        gate_start = 'if __name__ == "__main__" and ("--install" in sys.argv[1:]'
-        self.assertIn(gate_start, source)
-        self.assertIn('"--update" in sys.argv[1:]', source)
-        self.assertIn('"--bugsend" in sys.argv[1:]', source)
-        gate = gate_start
+        gate = 'if __name__ == "__main__" and any(flag in sys.argv[1:] for flag in'
+        self.assertIn(gate, source)
+        self.assertIn('"--update"', source)
+        self.assertIn('"--bugsend"', source)
         self.assertLess(source.index(gate), source.index("\nimport curses\n"))
 
     def test_main_sets_locale_before_anything_else(self):
@@ -7048,12 +7047,29 @@ class RoundtableTests(unittest.TestCase):
         self.assertEqual(len(saved), 1)
 
     def test_run_tui_logs_preflight_skipped_to_ui_console(self):
+        """Regression: found live via a 20+ minute hang on the Pi/Optiplex/Yoga that ballooned
+        memory and pegged CPU. Root cause: this test mocked Display and conduct but not
+        read_followup_ui, so run_tui's post-conduct call to the REAL read_followup_ui drove a
+        bare Mock() as stdscr -- get_wch() returns a fresh Mock() every call, which never equals
+        any real key, so its `while True: key = stdscr.get_wch(); ...` loop spun forever as a
+        tight, unblocked CPU loop, feeding the unrecognized Mock "key" into the line editor each
+        iteration and growing its text buffer without bound. Also stubs conduct to actually
+        append a Final turn (a bare Mock() never does), since fixing the hang alone would just
+        exchange it for session.turns[-1] on an empty list."""
         args = roundtable.build_parser().parse_args(["--mock", "--plain", "--skip-preflight", "goal"])
         session = roundtable.Session("goal", "/tmp", 1, "now", [])
         mock_ui = mock.Mock()
         mock_ui.tick = lambda n, l: None
+
+        def stub_conduct(active_session, *_args, **_kwargs):
+            active_session.turns.append(roundtable.Turn("Final", "consensus", "done"))
+
         with mock.patch.object(roundtable, "Display", return_value=mock_ui), \
-             mock.patch.object(roundtable, "conduct"):
+             mock.patch.object(roundtable, "conduct", side_effect=stub_conduct), \
+             mock.patch.object(roundtable, "read_followup_ui", return_value=""), \
+             mock.patch.object(roundtable, "save_session",
+                               return_value=(Path("/tmp/s.json"), Path("/tmp/s.md"))), \
+             mock.patch.object(roundtable, "finalize_agent_prompt_file"):
             roundtable.run_tui(mock.Mock(), args, session, mock.Mock(), mock.Mock(),
                               mock.Mock(), mock.Mock(), mock.Mock(), mock.Mock())
         mock_ui.log.assert_any_call("Preflight skipped by configuration", kind="phase")
