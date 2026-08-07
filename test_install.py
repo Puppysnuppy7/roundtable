@@ -132,6 +132,50 @@ class InstallTests(unittest.TestCase):
         self.assertIn("already installed", message)
         self.assertTrue(ok)
 
+    def test_install_cli_update_reruns_command_even_when_already_installed(self):
+        def fake_which(name):
+            return "/usr/bin/npm" if name == "npm" else "/usr/bin/codex"
+        with mock.patch.object(install.shutil, "which", side_effect=fake_which), \
+             mock.patch.object(install.subprocess, "run") as run:
+            message, ok = install.install_cli("Codex", "codex", dry_run=False, update=True)
+        run.assert_called_once_with(["/usr/bin/npm", "install", "-g", "@openai/codex"], check=True)
+        self.assertIn("updated", message)
+        self.assertTrue(ok)
+
+    def test_install_cli_update_dry_run_says_would_update_not_install(self):
+        def fake_which(name):
+            return "/usr/bin/npm" if name == "npm" else "/usr/bin/codex"
+        with mock.patch.object(install.shutil, "which", side_effect=fake_which), \
+             mock.patch.object(install.subprocess, "run") as run:
+            message, ok = install.install_cli("Codex", "codex", dry_run=True, update=True)
+        run.assert_not_called()
+        self.assertIn("would update", message)
+        self.assertTrue(ok)
+
+    def test_install_cli_without_update_skips_already_installed_without_running_anything(self):
+        with mock.patch.object(install.shutil, "which", return_value="/usr/bin/codex"), \
+             mock.patch.object(install.subprocess, "run") as run:
+            message, ok = install.install_cli("Codex", "codex", dry_run=False, update=False)
+        run.assert_not_called()
+        self.assertIn("already installed", message)
+        self.assertTrue(ok)
+
+    def test_install_cli_update_reports_already_installed_when_no_automated_installer(self):
+        with mock.patch.object(install.shutil, "which", return_value="/usr/bin/agy"):
+            message, ok = install.install_cli("Antigravity", "agy", dry_run=False, update=True)
+        self.assertIn("already installed", message)
+        self.assertIn("no automated update available", message)
+        self.assertTrue(ok)
+
+    def test_install_cli_update_reports_already_installed_when_requirement_missing(self):
+        def fake_which(name):
+            return "/usr/bin/codex" if name == "codex" else None
+        with mock.patch.object(install.shutil, "which", side_effect=fake_which):
+            message, ok = install.install_cli("Codex", "codex", dry_run=False, update=True)
+        self.assertIn("already installed", message)
+        self.assertIn("needs `npm` on PATH to auto-update", message)
+        self.assertTrue(ok)
+
     def test_install_cli_reports_no_automated_installer_for_agy(self):
         with mock.patch.object(install.shutil, "which", return_value=None):
             message, ok = install.install_cli("Antigravity", "agy", dry_run=False,
@@ -403,7 +447,7 @@ class InstallTests(unittest.TestCase):
              mock.patch.object(install.subprocess, "run") as run:
             message, ok = install.install_cli("Codex", "codex", dry_run=True)
         run.assert_not_called()
-        self.assertIn("would run", message)
+        self.assertIn("would install", message)
         self.assertTrue(ok)
 
     def test_install_cli_runs_installer_and_reports_success(self):
@@ -447,7 +491,7 @@ class InstallTests(unittest.TestCase):
             message, ok = install.install_cli("Aider", "aider", dry_run=False)
         self.assertEqual(run.call_count, 2)
         first_call, second_call = run.call_args_list
-        self.assertEqual(first_call.args[0], ["/usr/bin/pipx", "install", "aider-install"])
+        self.assertEqual(first_call.args[0], ["/usr/bin/pipx", "install", "--force", "aider-install"])
         self.assertEqual(second_call.args[0], ["/usr/bin/aider-install"])
         self.assertIn("installed", message)
         self.assertTrue(ok)
@@ -459,7 +503,7 @@ class InstallTests(unittest.TestCase):
              mock.patch.object(install.subprocess, "run") as run:
             message, ok = install.install_cli("Aider", "aider", dry_run=True)
         run.assert_not_called()
-        self.assertIn("pipx install aider-install", message)
+        self.assertIn("pipx install --force aider-install", message)
         self.assertIn("aider-install", message)
         self.assertTrue(ok)
 
@@ -494,6 +538,21 @@ class InstallTests(unittest.TestCase):
             self.assertIn("Codex", body)
             self.assertIn("Aider", body)
             self.assertNotIn("Grok", body)
+
+    def test_main_update_flag_reaches_install_cli(self):
+        seen_update_values = []
+
+        def fake_install_cli(name, executable, dry_run, current=None, musl=False, update=False):
+            seen_update_values.append(update)
+            return f"{name} ok", True
+
+        with tempfile.TemporaryDirectory() as td:
+            bin_dir = Path(td) / "bin"
+            with mock.patch.object(install, "install_cli", side_effect=fake_install_cli), \
+                 mock.patch.object(install, "current_platform", return_value=("linux", "x86_64")), \
+                 mock.patch("builtins.print"):
+                install.main(["--bin-dir", str(bin_dir), "--update", "--only", "Codex"])
+        self.assertEqual(seen_update_values, [True])
 
     def test_main_prints_detected_platform_banner(self):
         with tempfile.TemporaryDirectory() as td:
@@ -596,7 +655,7 @@ class InstallTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             bin_dir = Path(td) / "bin"
 
-            def fake_install_cli(name, executable, dry_run, current=None, musl=False):
+            def fake_install_cli(name, executable, dry_run, current=None, musl=False, update=False):
                 if executable == "codex":
                     return f"{name} install failed: boom", False
                 return f"{name} already installed (/bin/{executable})", True
@@ -612,7 +671,7 @@ class InstallTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             bin_dir = Path(td) / "bin"
 
-            def fake_install_cli(name, executable, dry_run, current=None, musl=False):
+            def fake_install_cli(name, executable, dry_run, current=None, musl=False, update=False):
                 return f"{name} not found -- no automated installer here", True
 
             with mock.patch.object(install, "install_cli", side_effect=fake_install_cli), \

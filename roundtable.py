@@ -11,8 +11,10 @@ def _run_install_from_cli(argv: list[str] | None = None) -> int:
 
     Stock Windows Python has no stdlib `curses`, so `import roundtable` fails there even though
     `install.py` deliberately avoids that import. When this file is executed as a script with
-    `--install`, dispatch here first so `python3 roundtable.py --install` works on the same
-    platforms as `python3 install.py`. Extra argv after stripping `--install` is forwarded.
+    `--install` or `--update`, dispatch here first so `python3 roundtable.py --install`/`--update`
+    works on the same platforms as `python3 install.py`. Extra argv (including `--update` itself,
+    which install.py's own parser understands) is forwarded as-is; only `--install` is stripped,
+    since that's a roundtable.py-level flag install.py doesn't recognize.
     """
     import importlib.util
     from pathlib import Path
@@ -29,8 +31,8 @@ def _run_install_from_cli(argv: list[str] | None = None) -> int:
     return int(module.main(install_argv))
 
 
-# Must run before `import curses` so stock Windows Python can still install.
-if __name__ == "__main__" and "--install" in sys.argv[1:]:
+# Must run before `import curses` so stock Windows Python can still install/update.
+if __name__ == "__main__" and ("--install" in sys.argv[1:] or "--update" in sys.argv[1:]):
     raise SystemExit(_run_install_from_cli())
 
 import argparse
@@ -5344,15 +5346,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--install", action="store_true",
                         help="run the universal installer script (install.py) to link the "
                              "roundtable command onto PATH and install available agent CLIs, then exit")
+    parser.add_argument("--update", action="store_true",
+                        help="like --install, but also re-run each agent CLI's install command "
+                             "even if already present, to pick up a newer version, then exit")
     return parser
 
 
 def main() -> int:
+    # A prior `roundtable --install` (or another program) may have just added a CLI to PATH via
+    # the registry, but this process's own inherited environment predates that -- refresh it first
+    # so verify_clis()/list_agents() below don't report a CLI as missing that's genuinely on PATH
+    # for any new process. No-op on non-Windows or if winreg is unavailable.
+    import install
+    install.refresh_windows_path()
     parser = build_parser()
     args, remaining = parser.parse_known_args()
-    if args.install:
-        import install
-        return install.main(remaining)
+    if args.install or args.update:
+        # --update was already parsed (and consumed) by this parser above, so it's not in
+        # `remaining` the way it would be coming from the pre-curses script dispatch -- re-add it
+        # so install.py's own parser (which is what actually understands --update) sees it.
+        return install.main(remaining + (["--update"] if args.update else []))
     if remaining:
         parser.error(f"unrecognized arguments: {' '.join(remaining)}")
     if args.list_agents:

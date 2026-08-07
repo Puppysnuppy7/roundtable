@@ -61,8 +61,11 @@ CLI_INSTALLERS: dict[str, list[str] | list[list[str]] | None] = {
     # Not `pipx install aider-chat` directly: aider-chat hard-pins numpy==1.26.4, which has no
     # cp313 wheel on any platform (verified via PyPI's own JSON API, not just observed on one
     # machine) -- pip's naive resolver chokes on it. aider-install's own installer uses uv's
-    # resolver instead, which handles this correctly; verified working end-to-end.
-    "aider": [["pipx", "install", "aider-install"], ["aider-install"]],
+    # resolver instead, which handles this correctly; verified working end-to-end. `--force` on
+    # the pipx step is a no-op on a fresh install and makes --update actually reinstall/refresh
+    # aider-install (and, via it, aider itself) rather than pipx silently no-op'ing because it's
+    # already present.
+    "aider": [["pipx", "install", "--force", "aider-install"], ["aider-install"]],
     "grok": ["npm", "install", "-g", "@xai-official/grok"],
     "qwen": ["npm", "install", "-g", "@qwen-code/qwen-code"],
 }
@@ -347,13 +350,14 @@ def ensure_windows_dependencies(dry_run: bool, current: tuple[str, str] | None =
     return "installed windows-curses, tzdata (needed to run roundtable.py and its tests here)"
 
 
-def install_cli(name: str, executable: str, dry_run: bool,
-                current: tuple[str, str] | None = None, musl: bool = False) -> tuple[str, bool]:
-    """Ensure one agent's CLI is installed.
+def install_cli(name: str, executable: str, dry_run: bool, current: tuple[str, str] | None = None,
+                musl: bool = False, update: bool = False) -> tuple[str, bool]:
+    """Ensure one agent's CLI is installed, or (with update=True) re-run its install command even
+    when already present, to pick up a newer version.
 
-    Returns (status_message, ok). ok is False when an install was attempted and failed, or when
-    the required package manager is missing so a needed auto-install cannot run. The informational
-    "no automated installer" case (agy) is ok=True -- it is not a failure of this script.
+    Returns (status_message, ok). ok is False when an install/update was attempted and failed, or
+    when the required package manager is missing so it cannot run at all. The informational "no
+    automated installer" case (agy) is ok=True -- it is not a failure of this script.
 
     `musl` is a plain bool, not auto-detected here: detecting it shells out to `ldd` (see
     is_musl_libc), and this function is called once per agent, so the caller (main()) detects it
@@ -361,19 +365,26 @@ def install_cli(name: str, executable: str, dry_run: bool,
     than recomputed.
     """
     found = shutil.which(executable)
-    if found:
+    if found and not update:
         return f"{name:<11} {executable:<7} already installed ({found})", True
     current = current or current_platform()
     command = CLI_INSTALLERS.get(executable)
     if command is None:
         caveat = NO_INSTALLER_ARCH_CAVEATS.get(executable)
         note = f" ({caveat})" if caveat and current[1] != _X64 else ""
+        if found:
+            return (f"{name:<11} {executable:<7} already installed ({found}) -- no automated "
+                     f"update available; update it yourself per the vendor's own instructions"
+                     f"{note}", True)
         return (f"{name:<11} {executable:<7} not found -- no automated installer here; "
                  f"install it yourself per the vendor's own instructions{note}", True)
     steps = command if isinstance(command[0], list) else [command]
     joined = " && ".join(" ".join(step) for step in steps)
     requirement = CLI_INSTALLER_REQUIRES.get(executable)
     if requirement and not shutil.which(requirement):
+        if found:
+            return (f"{name:<11} {executable:<7} already installed ({found}) -- needs "
+                     f"`{requirement}` on PATH to auto-update; once available run: {joined}", True)
         return (f"{name:<11} {executable:<7} not found -- needs `{requirement}` on PATH to "
                  f"auto-install; once available run: {joined}", False)
     supported = NPM_ARCH_SUPPORT.get(executable)
@@ -383,8 +394,9 @@ def install_cli(name: str, executable: str, dry_run: bool,
     elif supported is not None and current[0] == "linux" and musl:
         arch_note = (" [running on musl libc (e.g. Alpine); this vendor's npm package may not "
                      "publish a musl build even though it covers this arch on glibc]")
+    verb, verb_past = ("update", "updated") if found else ("install", "installed")
     if dry_run:
-        return f"{name:<11} {executable:<7} would run: {joined}{arch_note}", True
+        return f"{name:<11} {executable:<7} would {verb}: {joined}{arch_note}", True
     try:
         for step in steps:
             # Resolve the launcher to its real path before handing it to subprocess. On Windows,
@@ -394,10 +406,10 @@ def install_cli(name: str, executable: str, dry_run: bool,
             resolved = shutil.which(step[0]) or step[0]
             subprocess.run([resolved, *step[1:]], check=True)
     except (subprocess.CalledProcessError, OSError) as exc:
-        return f"{name:<11} {executable:<7} install failed: {exc}{arch_note}", False
+        return f"{name:<11} {executable:<7} {verb} failed: {exc}{arch_note}", False
     found_after = shutil.which(executable)
     status = found_after if found_after else "not on PATH yet -- open a new shell"
-    return f"{name:<11} {executable:<7} installed ({status}){arch_note}", True
+    return f"{name:<11} {executable:<7} {verb_past} ({status}){arch_note}", True
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -415,6 +427,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="print what would happen without changing anything")
     parser.add_argument("--force", action="store_true",
                         help="replace an existing roundtable command in --bin-dir")
+    parser.add_argument("--update", action="store_true",
+                        help="re-run each CLI's install command even if already present, to pick "
+                             "up a newer version (also refreshes PATH from the registry on "
+                             "Windows first, in case an earlier install just isn't visible yet)")
     return parser
 
 
@@ -457,7 +473,8 @@ def main(argv: list[str] | None = None) -> int:
     any_failed = windows_deps_failed
     for name in (args.only or AGENT_NAMES):
         message, ok = install_cli(
-            name, AGENT_EXECUTABLES[name], args.dry_run, current=current, musl=musl)
+            name, AGENT_EXECUTABLES[name], args.dry_run, current=current, musl=musl,
+            update=args.update)
         print(message)
         if not ok:
             any_failed = True
