@@ -1232,6 +1232,14 @@ class Agent:
         with tempfile.TemporaryDirectory(prefix="roundtable-") as td:
             output_file = Path(td) / "last.txt" if self.name == "Codex" else None
             cmd = self.command(prompt, output_file, no_edit)
+            # Resolve the launcher before handing it to Popen.  This is required on Windows,
+            # where npm-installed agents are exposed through .CMD shims: shutil.which() can find
+            # `codex`, `grok`, and `qwen`, but CreateProcess does not apply PATHEXT when argv[0]
+            # remains the extensionless command name.  Using the resolved path also keeps the
+            # executable checked by verify_clis() identical to the one we actually launch.
+            resolved_executable = shutil.which(cmd[0])
+            if resolved_executable:
+                cmd[0] = resolved_executable
 
             # Log diagnostic info before starting process
             prompt_marker = (
@@ -1253,7 +1261,8 @@ class Agent:
             proc = None
             try:
                 proc = subprocess.Popen(
-                    cmd, cwd=self.workspace, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    cmd, cwd=self.workspace, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, bufsize=1, encoding="utf-8", errors="replace",
                     # Own session so cancel can signal the whole process group (CLI + tools).
                     start_new_session=os.name == "posix",
@@ -1470,6 +1479,9 @@ class MockAgent(Agent):
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError(f"{self.name} cancelled")
         time.sleep(0.15)
+        if prompt == PREFLIGHT_PROMPT:
+            on_tick("OK")
+            return "OK"
         on_tick("thinking…")
         return (f"{self.name} contribution: I evaluated the objective, incorporated the other "
                 "agent's useful points, and proposed a concrete next step with explicit tradeoffs.")
@@ -3957,7 +3969,7 @@ class UsageLimitError(RuntimeError):
 
 
 USAGE_LIMIT_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
-    r"you(?:'|’)?ve hit your (?:session|usage) limit",
+    r"you(?:'|’)?ve hit your (?:session|usage|weekly) limit",
     r"(?:session|usage) limit (?:has been )?(?:reached|exceeded|exhausted)",
     r"(?:quota|credits?) (?:has been )?(?:reached|exceeded|exhausted)",
     r"resource[_ -]?exhausted",
@@ -3987,7 +3999,13 @@ AUTH_REQUIRED_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in
     r"paste the authorization code",
     r"authentication (?:timed out|failed)",
     r"not authenticated",
+    r"not signed in",
     r"please (?:log|sign) ?in",
+    r"(?:invalid|missing) api[ _-]?key",
+    r"api[ _-]?key(?::| is)? not set",
+    r"not able to authenticate",
+    r"401 unauthorized",
+    r"missing bearer .*authentication",
 ))
 
 
@@ -4757,6 +4775,15 @@ PREFLIGHT_PROMPT = ("This is a startup connectivity check, not the real task. Re
 def preflight_check(name: str, agent: Agent, tick: Callable[[str, str], None],
                     cancel_event: threading.Event, timeout: float) -> tuple[bool, str]:
     """Confirm one agent's CLI is authenticated and responsive within a bounded timeout."""
+    def authentication_failure(detail: str) -> tuple[bool, str]:
+        executable = AGENT_EXECUTABLES.get(name, name.lower())
+        if re.search(r"api[ _-]?key|not able to authenticate|401 unauthorized|missing bearer",
+                     detail, re.IGNORECASE):
+            return False, (f"needs valid API credentials -- configure `{executable}` or its "
+                           f"provider key, then re-run roundtable ({detail})")
+        return False, (f"needs interactive login -- run `{executable}` by hand in a plain "
+                       f"terminal to complete it, then re-run roundtable ({detail})")
+
     agent.cancel_event = cancel_event
     timer = threading.Timer(timeout, cancel_event.set)
     timer.daemon = True
@@ -4764,8 +4791,14 @@ def preflight_check(name: str, agent: Agent, tick: Callable[[str, str], None],
     previous_effort = agent.suggested_effort
     agent.suggested_effort = "low"
     try:
-        agent.run(PREFLIGHT_PROMPT, lambda line: tick(name, line), no_edit=True)
-        return True, "ready"
+        answer = agent.run(PREFLIGHT_PROMPT, lambda line: tick(name, line), no_edit=True)
+        if answer.strip().casefold() == "ok":
+            return True, "ready"
+        auth_detail = auth_required_detail(answer)
+        if auth_detail:
+            return authentication_failure(auth_detail)
+        detail = next((line.strip() for line in answer.splitlines() if line.strip()), "no response")
+        return False, f"unexpected connectivity-check response instead of OK: {detail}"
     except Exception as exc:
         # Checked ahead of cancel_event: an interactive-login prompt (verified live: agy's OAuth
         # flow) is printed almost immediately, well before any reasonable preflight timeout, so
@@ -4773,9 +4806,7 @@ def preflight_check(name: str, agent: Agent, tick: Callable[[str, str], None],
         # and it's a far more useful diagnosis than a bare "timed out after Ns" would be.
         auth_detail = auth_required_detail(str(exc))
         if auth_detail:
-            executable = AGENT_EXECUTABLES.get(name, name.lower())
-            return False, (f"needs interactive login -- run `{executable}` by hand in a plain "
-                           f"terminal to complete it, then re-run roundtable ({auth_detail})")
+            return authentication_failure(auth_detail)
         if cancel_event.is_set():
             return False, f"timed out after {timeout:.0f}s"
         limit_detail = usage_limit_detail(str(exc))

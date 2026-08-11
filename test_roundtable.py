@@ -1038,6 +1038,53 @@ class RoundtableTests(unittest.TestCase):
         self.assertIsNone(roundtable.auth_required_detail(
             "Codex exited with status 1\nsome other error"))
 
+    def test_usage_limit_detector_matches_claude_weekly_limit(self):
+        detail = roundtable.usage_limit_detail(
+            "You've hit your weekly limit · resets Aug 12, 9am (America/Chicago)")
+        self.assertIsNotNone(detail)
+        self.assertIn("weekly limit", detail)
+
+    def test_preflight_check_rejects_zero_exit_authentication_output(self):
+        """Aider can print an authentication failure and still exit zero; that is not ready."""
+        class ZeroExitAuthAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                return ("MISTRAL_API_KEY: Not set\n"
+                        "The API provider is not able to authenticate you. Check your API key.")
+
+        with tempfile.TemporaryDirectory() as td:
+            ok, detail = roundtable.preflight_check(
+                "Aider", ZeroExitAuthAgent("Aider", Path(td)), lambda *_: None,
+                threading.Event(), timeout=1)
+        self.assertFalse(ok)
+        self.assertIn("needs valid API credentials", detail)
+        self.assertIn("MISTRAL_API_KEY", detail)
+
+    def test_preflight_check_rejects_non_ok_success_response(self):
+        class WrongAnswerAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                return "Everything seems fine"
+
+        with tempfile.TemporaryDirectory() as td:
+            ok, detail = roundtable.preflight_check(
+                "Codex", WrongAnswerAgent("Codex", Path(td)), lambda *_: None,
+                threading.Event(), timeout=1)
+        self.assertFalse(ok)
+        self.assertIn("instead of OK", detail)
+
+    def test_preflight_check_classifies_nonzero_api_key_failure_as_credentials(self):
+        class MissingKeyAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                raise RuntimeError(
+                    "Qwen exited with status 1\nMissing API key for OpenAI-compatible auth")
+
+        with tempfile.TemporaryDirectory() as td:
+            ok, detail = roundtable.preflight_check(
+                "Qwen", MissingKeyAgent("Qwen", Path(td)), lambda *_: None,
+                threading.Event(), timeout=1)
+        self.assertFalse(ok)
+        self.assertIn("needs valid API credentials", detail)
+        self.assertNotIn("interactive login", detail)
+
     def test_agent_run_cancellation_includes_partial_captured_output(self):
         """Regression: found live via agy -- an unauthenticated run prints its auth prompt almost
         immediately, then hangs waiting on stdin no automated caller can ever supply. Before this
@@ -7151,6 +7198,19 @@ class RoundtableTests(unittest.TestCase):
             with self.assertRaises(RuntimeError) as cm:
                 agent.run("test prompt", lambda x: None)
             self.assertIn("failed to start process", str(cm.exception))
+
+    def test_agent_run_resolves_windows_command_shim_before_launch(self):
+        """npm agents resolve to .CMD shims that an extensionless Popen argv cannot launch."""
+        agent = roundtable.Agent("Grok", Path("/tmp"))
+        shim = r"C:\Users\User\AppData\Roaming\npm\grok.CMD"
+        with mock.patch.object(roundtable.shutil, "which", return_value=shim), \
+             mock.patch.object(roundtable.subprocess, "Popen", side_effect=OSError("stop")) \
+                     as mock_popen:
+            with self.assertRaisesRegex(RuntimeError, "failed to start process"):
+                agent.run("test prompt", lambda x: None)
+
+        self.assertEqual(mock_popen.call_args.args[0][0], shim)
+        self.assertIs(mock_popen.call_args.kwargs["stdin"], roundtable.subprocess.DEVNULL)
 
     def test_gui_focused_panel_highlights_box_border(self):
         """draw() must actually bold the focused panel's border, not just leave focused_panel set.
