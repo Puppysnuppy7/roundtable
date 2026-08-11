@@ -1083,6 +1083,8 @@ class RoundtableTests(unittest.TestCase):
                 threading.Event(), timeout=1)
         self.assertFalse(ok)
         self.assertIn("needs valid API credentials", detail)
+        self.assertIn("--set-key OPENAI_API_KEY", detail)
+        self.assertIn("--auth-setup", detail)
         self.assertNotIn("interactive login", detail)
 
     def test_agent_run_cancellation_includes_partial_captured_output(self):
@@ -3012,7 +3014,10 @@ class RoundtableTests(unittest.TestCase):
             for action in parser._actions
             if isinstance(action, roundtable.argparse._StoreTrueAction)
             and action.help != roundtable.argparse.SUPPRESS
-            and action.dest not in ("plain", "list_agents", "install", "update", "bugsend", "list_keys")
+            and action.dest not in (
+                "plain", "list_agents", "install", "update", "bugsend", "list_keys",
+                "auth_setup",
+            )
         }
         toggle_names = {name for name, _ in roundtable.OPTION_TOGGLES}
         self.assertTrue(parser_flags <= toggle_names, f"Missing toggles for: {parser_flags - toggle_names}")
@@ -3206,6 +3211,42 @@ class RoundtableTests(unittest.TestCase):
             self.assertEqual(result, 1)
             self.assertFalse(keys_path.exists())
 
+    def test_run_key_command_auth_setup_saves_multiple_hidden_values_and_allows_skips(self):
+        with tempfile.TemporaryDirectory() as td:
+            keys_path = Path(td) / "keys.env"
+            printed = []
+            with mock.patch.object(roundtable, "_keys_file", return_value=keys_path), \
+                 mock.patch.object(roundtable.sys.stdin, "isatty", return_value=True), \
+                 mock.patch.dict(os.environ, {
+                     "MISTRAL_API_KEY": "", "XAI_API_KEY": "", "OPENAI_API_KEY": "",
+                 }), \
+                 mock.patch("getpass.getpass",
+                            side_effect=["mistral-secret", "", "qwen-secret"]), \
+                 mock.patch("builtins.print",
+                            side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
+                result = roundtable._run_key_command_from_cli(["--auth-setup"])
+                loaded = roundtable._load_stored_keys()
+            self.assertEqual(result, 0)
+            self.assertEqual(loaded, {
+                "MISTRAL_API_KEY": "mistral-secret",
+                "OPENAI_API_KEY": "qwen-secret",
+            })
+            body = "\n".join(printed)
+            self.assertNotIn("mistral-secret", body)
+            self.assertNotIn("qwen-secret", body)
+            self.assertIn("codex login", body)
+            self.assertIn("grok login --device-code", body)
+
+    def test_run_key_command_auth_setup_requires_interactive_terminal(self):
+        with tempfile.TemporaryDirectory() as td:
+            keys_path = Path(td) / "keys.env"
+            with mock.patch.object(roundtable, "_keys_file", return_value=keys_path), \
+                 mock.patch.object(roundtable.sys.stdin, "isatty", return_value=False), \
+                 mock.patch("builtins.print"):
+                result = roundtable._run_key_command_from_cli(["--auth-setup"])
+            self.assertEqual(result, 1)
+            self.assertFalse(keys_path.exists())
+
     def test_run_key_command_clear_key_removes_existing(self):
         with tempfile.TemporaryDirectory() as td:
             keys_path = Path(td) / "keys.env"
@@ -3248,12 +3289,21 @@ class RoundtableTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             mock_key_cmd.assert_called_once_with(["--clear-key", "MISTRAL_API_KEY"])
 
+    def test_auth_setup_flag_invokes_key_command_from_cli(self):
+        with mock.patch("roundtable._run_key_command_from_cli", return_value=0) as mock_key_cmd, \
+             mock.patch("roundtable.apply_stored_keys"), \
+             mock.patch("sys.argv", ["roundtable", "--auth-setup"]):
+            exit_code = roundtable.main()
+            self.assertEqual(exit_code, 0)
+            mock_key_cmd.assert_called_once_with(["--auth-setup"])
+
     def test_key_commands_are_defined_before_curses_import(self):
-        """--set-key/--list-keys/--clear-key must not require curses (stock Windows) either."""
+        """Key management, including the wizard, must not require curses on stock Windows."""
         source = Path(roundtable.__file__).read_text(encoding="utf-8")
         self.assertIn('"--set-key"', source)
         self.assertIn('"--list-keys"', source)
         self.assertIn('"--clear-key"', source)
+        self.assertIn('"--auth-setup"', source)
         self.assertIn("def _run_key_command_from_cli", source)
         self.assertLess(
             source.index("def _run_key_command_from_cli"),

@@ -88,14 +88,56 @@ def _run_key_command_from_cli(argv: list[str] | None = None) -> int:
     """
     import argparse
     import getpass
+    import os
 
     args = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--set-key", metavar="NAME")
     parser.add_argument("--list-keys", action="store_true")
     parser.add_argument("--clear-key", metavar="NAME")
+    parser.add_argument("--auth-setup", action="store_true")
     known, _ = parser.parse_known_args(args)
     keys_path = _keys_file()
+
+    if known.auth_setup:
+        if not sys.stdin.isatty():
+            print("error: --auth-setup needs an interactive terminal so key values can be "
+                  "entered with hidden input", file=sys.stderr)
+            return 1
+        keys = _load_stored_keys()
+        prompts = (
+            ("Aider (Mistral/Codestral)", "MISTRAL_API_KEY"),
+            ("Grok", "XAI_API_KEY"),
+            ("Qwen (OpenAI-compatible provider)", "OPENAI_API_KEY"),
+        )
+        saved: list[str] = []
+        print(f"API keys are stored in {keys_path} with user-only permissions.")
+        print("Input is hidden. Press Enter to skip a provider; use --set-key NAME to replace "
+              "an existing value.\n")
+        for label, name in prompts:
+            if os.environ.get(name) or keys.get(name):
+                print(f"{label}: {name} is already configured")
+                continue
+            try:
+                value = getpass.getpass(f"{label} — {name} (Enter to skip): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\ncancelled -- nothing new was saved")
+                return 0
+            if value:
+                keys[name] = value
+                saved.append(name)
+        if saved:
+            _save_stored_keys(keys)
+            print("\nsaved: " + ", ".join(saved))
+        else:
+            print("\nno new API keys saved")
+        print("\nLogin-based agents use their vendor CLIs instead:")
+        print("  Codex:       codex login")
+        print("  Claude:      claude")
+        print("  Antigravity: agy")
+        print("  Grok:        grok login --device-code  (alternative to XAI_API_KEY)")
+        print("After setup, launch Roundtable normally; preflight will verify every agent.")
+        return 0
 
     if known.list_keys:
         keys = _load_stored_keys()
@@ -143,7 +185,7 @@ def _run_key_command_from_cli(argv: list[str] | None = None) -> int:
     return 1
 
 
-_KEY_COMMAND_FLAGS = ("--set-key", "--list-keys", "--clear-key")
+_KEY_COMMAND_FLAGS = ("--set-key", "--list-keys", "--clear-key", "--auth-setup")
 
 # Must run before `import curses` so stock Windows Python can still install/update/bugsend/manage
 # keys.
@@ -4777,12 +4819,21 @@ def preflight_check(name: str, agent: Agent, tick: Callable[[str, str], None],
     """Confirm one agent's CLI is authenticated and responsive within a bounded timeout."""
     def authentication_failure(detail: str) -> tuple[bool, str]:
         executable = AGENT_EXECUTABLES.get(name, name.lower())
+        recovery = {
+            "Codex": "run `codex login`",
+            "Claude": "run `claude` and complete its login",
+            "Antigravity": "run `agy` and complete its browser login",
+            "Aider": "run `roundtable --set-key MISTRAL_API_KEY`",
+            "Grok": ("run `grok login --device-code` or "
+                     "`roundtable --set-key XAI_API_KEY`"),
+            "Qwen": "run `roundtable --set-key OPENAI_API_KEY`",
+        }.get(name, f"configure `{executable}`")
         if re.search(r"api[ _-]?key|not able to authenticate|401 unauthorized|missing bearer",
                      detail, re.IGNORECASE):
-            return False, (f"needs valid API credentials -- configure `{executable}` or its "
-                           f"provider key, then re-run roundtable ({detail})")
-        return False, (f"needs interactive login -- run `{executable}` by hand in a plain "
-                       f"terminal to complete it, then re-run roundtable ({detail})")
+            return False, (f"needs valid API credentials -- {recovery}, or run "
+                           f"`roundtable --auth-setup`; then re-run roundtable ({detail})")
+        return False, (f"needs interactive login -- {recovery}, or run "
+                       f"`roundtable --auth-setup`; then re-run roundtable ({detail})")
 
     agent.cancel_event = cancel_event
     timer = threading.Timer(timeout, cancel_event.set)
@@ -5580,6 +5631,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "the values themselves), then exit")
     parser.add_argument("--clear-key", metavar="NAME",
                         help="remove a locally-stored key by env var name, then exit")
+    parser.add_argument("--auth-setup", action="store_true",
+                        help="run a guided, hidden-input setup for Aider/Mistral, Grok, and Qwen "
+                             "API keys and show the login commands for browser-authenticated "
+                             "agents, then exit")
     return parser
 
 
@@ -5608,7 +5663,7 @@ def main() -> int:
     install.refresh_windows_path()
     parser = build_parser()
     args, remaining = parser.parse_known_args()
-    if args.set_key or args.list_keys or args.clear_key:
+    if args.set_key or args.list_keys or args.clear_key or args.auth_setup:
         # Consumed by this parser above, so re-add for _run_key_command_from_cli's own parser,
         # same reasoning as --update/--message/--log below.
         extra = []
@@ -5618,6 +5673,8 @@ def main() -> int:
             extra.append("--list-keys")
         if args.clear_key:
             extra += ["--clear-key", args.clear_key]
+        if args.auth_setup:
+            extra.append("--auth-setup")
         return _run_key_command_from_cli(extra)
     if args.install or args.update or args.bugsend:
         # --update/--message/--log were already parsed (and consumed) by this parser above, so

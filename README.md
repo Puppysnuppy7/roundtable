@@ -75,6 +75,26 @@ package, which this installer does not manage. The installer deliberately does n
 roundtable` (it keeps a small local agent-name manifest, checked by tests against
 `AGENT_EXECUTABLES`) so it can still start on a Windows Python that lacks `curses`.
 
+## Authenticate the agents
+
+After installing the CLIs, run the guided setup:
+
+```bash
+roundtable --auth-setup
+```
+
+It prompts with hidden input for the three API-key paths Roundtable uses by default: Aider's
+`MISTRAL_API_KEY`, Grok's optional `XAI_API_KEY`, and Qwen's `OPENAI_API_KEY`. Press Enter to skip
+any provider you do not have a key for. Values are stored in `~/.roundtable/keys.env`, locked to
+the current user where the platform supports it, and are never printed. Existing environment
+variables take priority over stored values.
+
+Login-based agents still use their vendor commands: `codex login`, `claude`, and `agy`; Grok can
+use `grok login --device-code` instead of an API key. For direct or scripted administration, use
+`roundtable --set-key NAME` (hidden prompt), `roundtable --list-keys` (names only), and
+`roundtable --clear-key NAME`. Key commands intentionally require an interactive terminal so a
+secret cannot accidentally land in shell history, command arguments, or piped logs.
+
 ## Run it
 
 All six CLIs must already be installed and authenticated (`codex`, `claude`, `agy`, `aider`, `grok`,
