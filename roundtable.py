@@ -59,14 +59,36 @@ def _load_stored_keys() -> dict[str, str]:
 
 
 def _save_stored_keys(keys: dict[str, str]) -> None:
+    import os
+    import tempfile
+    from pathlib import Path
+
     path = _keys_file()
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [f"{name}={value}" for name, value in sorted(keys.items())]
-    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    content = "\n".join(lines) + ("\n" if lines else "")
+    temporary: Path | None = None
     try:
-        path.chmod(0o600)
-    except OSError:
-        pass  # Best-effort on platforms/filesystems that don't support POSIX permission bits.
+        with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=path.parent,
+                prefix=f".{path.name}.", suffix=".tmp", delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            temporary.chmod(0o600)
+        except OSError:
+            pass  # Best-effort on platforms/filesystems that do not expose POSIX mode bits.
+        os.replace(temporary, path)
+        temporary = None
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def apply_stored_keys() -> None:

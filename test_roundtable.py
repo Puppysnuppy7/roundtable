@@ -3117,6 +3117,18 @@ class RoundtableTests(unittest.TestCase):
                 roundtable._save_stored_keys({"FOO": "bar"})
             self.assertEqual(keys_path.stat().st_mode & 0o777, 0o600)
 
+    def test_save_stored_keys_replace_failure_preserves_previous_file_and_cleans_temp(self):
+        with tempfile.TemporaryDirectory() as td:
+            keys_path = Path(td) / "keys.env"
+            with mock.patch.object(roundtable, "_keys_file", return_value=keys_path):
+                roundtable._save_stored_keys({"OLD_KEY": "still-valid"})
+                with mock.patch.object(roundtable.os, "replace",
+                                       side_effect=OSError("simulated replace failure")):
+                    with self.assertRaisesRegex(OSError, "simulated replace failure"):
+                        roundtable._save_stored_keys({"NEW_KEY": "do-not-truncate-old"})
+                self.assertEqual(roundtable._load_stored_keys(), {"OLD_KEY": "still-valid"})
+            self.assertEqual(list(Path(td).glob(".keys.env.*.tmp")), [])
+
     def test_load_stored_keys_returns_empty_when_file_missing(self):
         with tempfile.TemporaryDirectory() as td:
             with mock.patch.object(roundtable, "_keys_file", return_value=Path(td) / "nope.env"):
