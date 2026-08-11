@@ -1323,11 +1323,15 @@ class Agent:
                 sys.stderr.flush()
 
             proc = None
+            env = dict(os.environ)
+            env["QWEN_CODE_SUPPRESS_YOLO_WARNING"] = "1"
+            env["PYTHONIOENCODING"] = "utf-8"
             try:
                 proc = subprocess.Popen(
                     cmd, cwd=self.workspace, stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, bufsize=1, encoding="utf-8", errors="replace",
+                    env=env,
                     # Own session so cancel can signal the whole process group (CLI + tools).
                     start_new_session=os.name == "posix",
                 )
@@ -4865,12 +4869,16 @@ def preflight_check(name: str, agent: Agent, tick: Callable[[str, str], None],
     agent.suggested_effort = "low"
     try:
         answer = agent.run(PREFLIGHT_PROMPT, lambda line: tick(name, line), no_edit=True)
-        if answer.strip().casefold() == "ok":
-            return True, "ready"
+        lines = [line.strip() for line in answer.splitlines() if line.strip()]
         auth_detail = auth_required_detail(answer)
         if auth_detail:
             return authentication_failure(auth_detail)
-        detail = next((line.strip() for line in answer.splitlines() if line.strip()), "no response")
+        limit_detail = usage_limit_detail(answer)
+        if limit_detail:
+            return True, f"usage-limited; will wait during the task ({limit_detail})"
+        if any(line.casefold() == "ok" for line in lines):
+            return True, "ready"
+        detail = next((line for line in lines), "no response")
         return False, f"unexpected connectivity-check response instead of OK: {detail}"
     except Exception as exc:
         # Checked ahead of cancel_event: an interactive-login prompt (verified live: agy's OAuth
