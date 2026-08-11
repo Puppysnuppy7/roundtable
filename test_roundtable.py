@@ -1586,6 +1586,7 @@ class RoundtableTests(unittest.TestCase):
                     "-C", td, "--output-dir", str(Path(td) / "out")]
             stderr = io.StringIO()
             with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(roundtable, "verify_clis"), \
                  mock.patch.object(roundtable, "Agent", FailingAgent), \
                  contextlib.redirect_stderr(stderr):
                 code = roundtable.main()
