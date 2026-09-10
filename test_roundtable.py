@@ -8129,15 +8129,16 @@ class DetachedRunTests(unittest.TestCase):
 
     @staticmethod
     def _unused_pid() -> int:
-        """A pid that is not running. Searches upward rather than assuming any fixed value."""
-        for candidate in range(400000, 500000):
-            try:
-                os.kill(candidate, 0)
-            except ProcessLookupError:
-                return candidate
-            except OSError:
-                continue
-        raise unittest.SkipTest("could not find an unused pid")
+        """A pid that is definitely not running.
+
+        Reaps a real child rather than scanning a numeric range: on a box with a low pid_max
+        (the Pi, for instance) every candidate in an arbitrary high range raises OSError
+        rather than ProcessLookupError, and a scan would silently skip the test on exactly
+        the machine this most needs to work on.
+        """
+        finished = subprocess.Popen([sys.executable, "-c", ""])
+        finished.wait()
+        return finished.pid
 
 
 if __name__ == "__main__":

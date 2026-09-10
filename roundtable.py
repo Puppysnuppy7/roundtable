@@ -5849,6 +5849,11 @@ def start_detached(argv: list[str], output_dir: Path) -> tuple[int, Path]:
     the terminal or logging out does not signal it. The child still dies with the machine -- this
     buys independence from the session, not from the hardware, which matters on a laptop that
     sleeps.
+
+    Survives a --self restart: restart_self re-execs in place, keeping both the pid --status
+    probes and the inherited stdout, and the status path is derived from started_at, which the
+    resumed session carries. A restart that silently stopped updating status would show as a
+    died run that is in fact still working.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     console = output_dir / f"detached-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.out"
@@ -5858,6 +5863,10 @@ def start_detached(argv: list[str], output_dir: Path) -> tuple[int, Path]:
             detach_command(argv), stdin=subprocess.DEVNULL, stdout=handle, stderr=handle,
             start_new_session=True, cwd=os.getcwd())
     finally:
+        # Safe to close here, and load-bearing that it is only here: Popen has already dup'd
+        # the descriptor into the child by the time it returns, so the child keeps writing to
+        # the file after this handle goes away. Closing earlier would break it; not closing
+        # would leak a descriptor per detached run.
         handle.close()
     return process.pid, console
 
