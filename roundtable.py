@@ -521,6 +521,15 @@ AGENT_EXECUTABLES: dict[str, str] = {
 # AGENT_NAMES so a new agent can never be selectable-but-unknown (or known-but-unselectable).
 AGENT_SLUGS: dict[str, str] = {name.lower(): name for name in AGENT_NAMES}
 
+# Default model per agent, for the CLIs that need one passed explicitly. Single source of
+# truth so build_parser() and any other caller that has to construct an Agent without a
+# parsed argv cannot drift: --check-agents did exactly that, probed Aider and Qwen with no
+# model, and reported working credentials as broken.
+AGENT_DEFAULT_MODELS: dict[str, str] = {
+    "Aider": "mistral/codestral-latest",
+    "Qwen": "qwen3-coder-plus",
+}
+
 
 class RosterError(ValueError):
     """An --agents value that names nothing runnable."""
@@ -4769,8 +4778,19 @@ def _run_sequential_phase(session: Session, agents: list[tuple[str, Agent]], pha
                             restart_vote_pending=restart_vote_pending,
                             chat=chat, context=context)
         log_prompt(name, prompt)
-        content = _run_with_retry(agent, prompt, lambda line, speaker=name: tick(speaker, line),
-                                  no_edit=chat, on_limit=on_limit)
+        try:
+            content = _run_with_retry(
+                agent, prompt, lambda line, speaker=name: tick(speaker, line),
+                no_edit=chat, on_limit=on_limit)
+        except RuntimeError as exc:
+            if str(exc) == f"{name} cancelled" or not usage_limit_detail(str(exc)):
+                raise
+            # The parallel runner already drops a failed agent and carries on; this relay
+            # did not, so on_limit=drop -- the default for any two-agent roster -- turned a
+            # rate limit into a dead run under --collab sequential and mixed.
+            tick(name, f"out of quota — leaving the relay "
+                       f"({usage_limit_detail(str(exc))})")
+            continue
         # Independently verify this agent's turn against real, deterministic evidence rather than
         # whatever it claimed -- a no-op outside a --self session.
         verify_self_edit_turn(session, agent, lambda line, speaker=name: tick(speaker, line))
@@ -5539,7 +5559,7 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
             lineup = run_preflight(lineup, ui.tick, status,
                                    timeout=args.preflight_timeout,
                                    strict=getattr(args, "strict_preflight", False),
-                                   on_limit=getattr(args, "on_limit", "drop"))
+                                   on_limit=("wait" if len(lineup) < 2 else getattr(args, "on_limit", "drop")))
             # Narrow before conduct reads the roster and before save_session writes it,
             # so a resumed run does not re-seat an agent preflight already rejected.
             session.roster = [name for name, _agent in lineup]
@@ -5716,7 +5736,10 @@ def check_agents(timeout: float = EXTENDED_PREFLIGHT_TIMEOUT_SECONDS,
     if installed:
         with tempfile.TemporaryDirectory(prefix="roundtable-check-") as probe_dir:
             def probe(name: str) -> tuple[bool, str]:
-                agent = cls(name, Path(probe_dir))
+                # Same model a real run would use. Without this Aider falls back to its
+                # own default and Qwen fails auth with a misleading "Invalid API-key",
+                # so a healthy agent is reported as a broken one.
+                agent = cls(name, Path(probe_dir), AGENT_DEFAULT_MODELS.get(name))
                 cancel_event = threading.Event()
                 # on_limit="wait" keeps a usage-limited agent a *pass* inside preflight_check so it
                 # reports the quota detail, which this function then classifies separately.
@@ -5793,9 +5816,30 @@ def describe_run_state(record: dict, now: datetime | None = None) -> str:
     age = (now - updated).total_seconds()
     same_host = str(record.get("host", "")) == socket.gethostname()
     live = "waiting" if state == "waiting" else "running"
+    try:
+        pid = int(record.get("pid", 0) or 0)
+    except (TypeError, ValueError):
+        # Treat a corrupt record the way every other malformed field here is treated,
+        # rather than crashing the reporting command that is trying to read it.
+        return "unknown"
     if same_host:
-        return live if _process_is_running(int(record.get("pid", 0) or 0)) else "died"
+        if not _process_is_running(pid):
+            return "died"
+        # The pid is live, but pids are recycled: after a crash the OS can hand this one
+        # to an unrelated process, and a run silent for longer than a phase plausibly
+        # takes is better called stale than confidently reported as still working.
+        return live if age < STATUS_STALE_AFTER_SECONDS else "stale"
     return live if age < STATUS_STALE_AFTER_SECONDS else "stale"
+
+
+def status_path_to_log(status_path: str | Path) -> str:
+    """The .log beside a .status file, replacing only the suffix.
+
+    str.replace rewrites every occurrence, so an --output-dir like /tmp/job.status.data
+    had its directory rewritten too and the reported log path pointed nowhere.
+    """
+    text = str(status_path)
+    return text[: -len(".status")] + ".log" if text.endswith(".status") else text
 
 
 def read_run_statuses(output_dir: Path) -> list[dict]:
@@ -5837,7 +5881,7 @@ def format_run_status(output_dir: Path, limit: int = 10) -> str:
                      f"updated={record.get('updated_at', '?')}")
         if record.get("phase"):
             lines.append(f"           phase: {record['phase']}")
-        log = str(record.get("path", "")).replace(".status", ".log")
+        log = status_path_to_log(record.get("path", ""))
         lines.append(f"           log:  {log}")
         if state == "died":
             lines.append("           (process is gone — the run stopped before finishing)")
@@ -5875,8 +5919,14 @@ def start_detached(argv: list[str], output_dir: Path) -> tuple[int, Path]:
     died run that is in fact still working.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    console = output_dir / f"detached-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.out"
-    handle = console.open("w", encoding="utf-8", errors="replace")
+    # O_EXCL and a pid in the name, not a bare timestamp: the old one-second-resolution name
+    # opened with "w" followed symlinks and truncated whatever it pointed at, and two launches
+    # in the same second silently interleaved into one file. 0600 matches RunLog, which chmods
+    # its log deliberately -- this file carries the same output and should not be looser.
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    console = output_dir / f"detached-{stamp}-{os.getpid()}.out"
+    descriptor = os.open(console, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    handle = os.fdopen(descriptor, "w", encoding="utf-8", errors="replace")
     try:
         process = subprocess.Popen(
             detach_command(argv), stdin=subprocess.DEVNULL, stdout=handle, stderr=handle,
@@ -5937,7 +5987,7 @@ def follow_run(output_dir: Path, poll: float = 0.5, out=None,
         print(f"No runs recorded in {output_dir}.", file=out, flush=True)
         return 1
     record = records[0]
-    log_path = Path(str(record.get("path", "")).replace(".status", ".log"))
+    log_path = Path(status_path_to_log(record.get("path", "")))
     objective = " ".join(str(record.get("objective", "")).split())
     print(f"Following: {objective or '(no objective)'}", file=out, flush=True)
     print(f"Log: {log_path}", file=out, flush=True)
@@ -5970,7 +6020,9 @@ def follow_run(output_dir: Path, poll: float = 0.5, out=None,
             if current is None:
                 return 0
             state = describe_run_state(current)
-            if state in ("finished", "failed", "cancelled", "died"):
+            if state in ("finished", "failed", "cancelled", "died", "stale", "unknown"):
+                # "stale" was terminal in the pre-loop check and not in this one, so a
+                # followed run that went quiet was followed forever.
                 print(f"\nRun {state}.", file=out, flush=True)
                 return 0 if state == "finished" else 1
             if state == "waiting":
@@ -6034,6 +6086,12 @@ def remote_command(target: str, argv: list[str]) -> list[str]:
     host, separator, path = target.partition(":")
     if not host:
         raise ValueError("--on needs a host, e.g. --on octopi or --on octopi:/opt/roundtable.py")
+    if host.startswith("-"):
+        # Quoting the command protects the far side and does nothing for the near side. A
+        # leading dash puts this in ssh's OPTION slot rather than its destination slot, so
+        # --on=-F/tmp/cfg or --on=-oProxyCommand=... would reconfigure the local client.
+        # argparse accepts the --on=VALUE form without complaint, so this is the only guard.
+        raise ValueError(f"--on host cannot begin with '-': {host!r}")
     executable = path if separator and path else "roundtable"
     words = [executable] + strip_remote_flag(argv)
     return ["ssh", host, " ".join(shlex.quote(word) for word in words)]
@@ -6236,12 +6294,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--codex-model")
     parser.add_argument("--claude-model")
     parser.add_argument("--antigravity-model")
-    parser.add_argument("--aider-model", default="mistral/codestral-latest",
+    parser.add_argument("--aider-model", default=AGENT_DEFAULT_MODELS["Aider"],
                         help="model for Aider in LiteLLM naming (default: mistral/codestral-latest, "
                              "so Aider's underlying model doesn't just duplicate one of the other "
                              "lab-native agents)")
     parser.add_argument("--grok-model")
-    parser.add_argument("--qwen-model", default="qwen3-coder-plus",
+    parser.add_argument("--qwen-model", default=AGENT_DEFAULT_MODELS["Qwen"],
                         help="model for Qwen (default: qwen3-coder-plus). Always required in "
                              "practice -- verified against the real CLI, Qwen Code silently fails "
                              "auth with a misleading 'Invalid API-key' error if no -m/--model is "
@@ -6707,7 +6765,7 @@ def main() -> int:
                 lineup = run_preflight(lineup, tick, status,
                                        timeout=args.preflight_timeout,
                                        strict=getattr(args, "strict_preflight", False),
-                                       on_limit=getattr(args, "on_limit", "drop"))
+                                       on_limit=("wait" if len(lineup) < 2 else getattr(args, "on_limit", "drop")))
                 session.roster = [name for name, _agent in lineup]
             else:
                 run_log.write("info", "Preflight skipped by configuration")

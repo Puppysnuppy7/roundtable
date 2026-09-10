@@ -8360,5 +8360,166 @@ class RemoteInvocationTests(unittest.TestCase):
         self.assertIn("own roundtable checkout", errors.getvalue())
 
 
+class ReviewFindingsTests(unittest.TestCase):
+    """Defects found by pointing roundtable at its own pre-merge diff.
+
+    Each of these was a real bug in the --agents/--on-limit/--detach/--on work, found by the
+    program reviewing its own branch rather than by its test suite.
+    """
+
+    def test_an_ssh_destination_cannot_be_an_option(self):
+        """argparse accepts --on=-F/tmp/cfg without complaint, which lands in ssh's OPTION slot:
+        -F, -i, -E and -o reconfigure the local client. Quoting the remote command does nothing
+        about this, because the injection is on the near side."""
+        for hostile in ("-F/tmp/attacker-config", "-oProxyCommand=touch /tmp/pwned",
+                        "-i/tmp/key", "-E/tmp/log"):
+            with self.subTest(host=hostile):
+                with self.assertRaises(ValueError):
+                    roundtable.remote_command(hostile, ["--status"])
+
+    def test_a_normal_host_still_works(self):
+        self.assertEqual(roundtable.remote_command("octopi", ["--status"])[1], "octopi")
+        self.assertEqual(
+            roundtable.remote_command("user@octopi", ["--status"])[1], "user@octopi")
+
+    def test_a_quota_drop_does_not_kill_a_sequential_relay(self):
+        """The parallel runner already dropped a capped agent and carried on. The relay did not,
+        so --on-limit drop -- the default for any two-agent roster -- turned a rate limit into a
+        dead run under --collab sequential and mixed."""
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session("Solve it", td, 0, "now", [],
+                                         roster=["Codex", "Grok"])
+            capped = UsageLimitPolicyTests._LimitedAgent("Codex", Path(td))
+            agents = [("Codex", capped), ("Grok", roundtable.MockAgent("Grok", Path(td)))]
+            with mock.patch.object(roundtable, "_wait_for_agent_availability") as waited:
+                roundtable._run_sequential_phase(
+                    session, agents, "proposal", lambda *_: None, lambda *_: None, "Working",
+                    on_limit="drop")
+            waited.assert_not_called()
+            speakers = [turn.speaker for turn in session.turns]
+            self.assertEqual(speakers, ["Grok"])
+
+    def test_a_real_failure_in_a_relay_still_propagates(self):
+        """Only a quota drop is survivable; a genuinely broken agent must not be swallowed."""
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session("Solve it", td, 0, "now", [], roster=["Codex"])
+            broken = roundtable.MockAgent("Codex", Path(td))
+            broken.run = mock.Mock(side_effect=RuntimeError("segfault in the CLI"))
+            with self.assertRaises(RuntimeError):
+                roundtable._run_sequential_phase(
+                    session, [("Codex", broken)], "proposal", lambda *_: None, lambda *_: None,
+                    "Working", on_limit="drop")
+
+    def test_a_corrupt_pid_does_not_crash_the_status_report(self):
+        record = DetachedRunTests._record(pid="not-a-number")
+        self.assertEqual(roundtable.describe_run_state(record), "unknown")
+        record = DetachedRunTests._record(pid="123.0")
+        self.assertEqual(roundtable.describe_run_state(record), "unknown")
+
+    def test_a_recycled_pid_does_not_resurrect_a_dead_run(self):
+        """pids are reused. A live pid plus a long-silent record is more likely an unrelated
+        process than a run that is still working."""
+        old = datetime.now(timezone.utc) - timedelta(
+            seconds=roundtable.STATUS_STALE_AFTER_SECONDS + 60)
+        record = DetachedRunTests._record(updated_at=old.isoformat())  # pid = this live process
+        self.assertEqual(roundtable.describe_run_state(record), "stale")
+
+    def test_a_dead_pid_is_still_reported_as_died_however_old(self):
+        old = datetime.now(timezone.utc) - timedelta(days=3)
+        record = DetachedRunTests._record(pid=DetachedRunTests._unused_pid(),
+                                          updated_at=old.isoformat())
+        self.assertEqual(roundtable.describe_run_state(record), "died")
+
+    def test_following_a_run_that_goes_quiet_eventually_stops(self):
+        """'stale' was terminal in the pre-loop check and not in the in-loop one, so a followed
+        run that went silent was followed forever."""
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session("Goal", td, 0, "2026-09-10T00:00:00+00:00", [])
+            (Path(td) / "roundtable-20260910-000000-000000.log").write_text("", encoding="utf-8")
+            roundtable.write_run_status(session, Path(td), "running", "proposal")
+            path = roundtable.status_path_for(session, Path(td))
+            record = json.loads(path.read_text())
+            record["host"] = "some-other-box"
+            record["updated_at"] = (datetime.now(timezone.utc) - timedelta(
+                seconds=roundtable.STATUS_STALE_AFTER_SECONDS + 60)).isoformat()
+            path.write_text(json.dumps(record))
+            out = io.StringIO()
+            self.assertEqual(roundtable.follow_run(Path(td), poll=0.01, out=out), 1)
+            self.assertIn("stale", out.getvalue())
+
+    def test_only_the_status_suffix_is_rewritten_to_log(self):
+        """str.replace rewrote every occurrence, so an output dir containing '.status' had its
+        directory renamed and the reported log path pointed nowhere."""
+        self.assertEqual(
+            roundtable.status_path_to_log("/tmp/job.status.data/roundtable-X.status"),
+            "/tmp/job.status.data/roundtable-X.log")
+        self.assertEqual(roundtable.status_path_to_log("/tmp/a/roundtable-X.status"),
+                         "/tmp/a/roundtable-X.log")
+        self.assertEqual(roundtable.status_path_to_log("/tmp/a/not-a-status-file"),
+                         "/tmp/a/not-a-status-file")
+
+    def test_the_detached_console_file_is_owner_only_and_unique(self):
+        """RunLog chmods its log 0600 deliberately; this file carries the same output. The old
+        one-second name opened with 'w' also followed symlinks and truncated the target."""
+        if os.name != "posix":
+            self.skipTest("POSIX permission semantics")
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(roundtable.subprocess, "Popen") as popen:
+                popen.return_value = mock.Mock(pid=4242)
+                _pid, console = roundtable.start_detached(["--plain", "x"], Path(td))
+            self.assertEqual(console.stat().st_mode & 0o777, 0o600)
+            self.assertIn(str(os.getpid()), console.name)
+
+    def test_the_detached_console_refuses_to_write_through_a_symlink(self):
+        if os.name != "posix":
+            self.skipTest("POSIX symlink semantics")
+        with tempfile.TemporaryDirectory() as td:
+            victim = Path(td) / "victim.txt"
+            victim.write_text("important", encoding="utf-8")
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+            attack = Path(td) / f"detached-{stamp}-{os.getpid()}.out"
+            attack.symlink_to(victim)
+            with mock.patch.object(roundtable.subprocess, "Popen") as popen:
+                popen.return_value = mock.Mock(pid=4242)
+                with self.assertRaises(OSError):
+                    roundtable.start_detached(["--plain", "x"], Path(td))
+            self.assertEqual(victim.read_text(encoding="utf-8"), "important")
+
+    def test_check_agents_probes_with_the_models_a_real_run_would_use(self):
+        """Probing with no model made Aider fall back to its own default and Qwen fail auth with a
+        misleading 'Invalid API-key' -- healthy agents reported as broken credentials."""
+        seen = {}
+
+        def record_agent(name, workspace, model=None, **kwargs):
+            seen[name] = model
+            return roundtable.MockAgent(name, workspace)
+
+        with mock.patch.object(roundtable.shutil, "which",
+                               side_effect=lambda exe: "/usr/bin/" + exe), \
+             mock.patch.object(roundtable, "Agent", side_effect=record_agent):
+            roundtable.check_agents(timeout=5)
+        self.assertEqual(seen["Aider"], roundtable.AGENT_DEFAULT_MODELS["Aider"])
+        self.assertEqual(seen["Qwen"], roundtable.AGENT_DEFAULT_MODELS["Qwen"])
+
+    def test_the_parser_defaults_match_the_shared_model_table(self):
+        """The drift this table exists to prevent."""
+        parsed = roundtable.build_parser().parse_args(["objective"])
+        self.assertEqual(parsed.aider_model, roundtable.AGENT_DEFAULT_MODELS["Aider"])
+        self.assertEqual(parsed.qwen_model, roundtable.AGENT_DEFAULT_MODELS["Qwen"])
+
+    def test_a_lone_agent_is_not_dropped_at_preflight_for_being_capped(self):
+        """--on-limit's help says it is ignored for a one-agent roster, but the exemption lived
+        only in conduct(); preflight dropped the sole agent and aborted the run."""
+        class Capped(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                raise RuntimeError("Usage limit reached. Resets at 9pm.")
+
+        with tempfile.TemporaryDirectory() as td:
+            survivors = roundtable.run_preflight(
+                [("Codex", Capped("Codex", Path(td)))], lambda *_: None, lambda *_: None,
+                on_limit="wait")
+            self.assertEqual([name for name, _ in survivors], ["Codex"])
+
+
 if __name__ == "__main__":
     unittest.main()
