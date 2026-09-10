@@ -141,6 +141,11 @@ Useful options:
                        always canonical, however you type it. A one-agent roster is valid and
                        still produces a final answer. The roster is saved with the session, so
                        --resume reopens the same table.
+--strict-preflight     Fail the whole run if any agent fails the preliminary system check.
+                       By default a failing agent is dropped and the rest carry on, the same
+                       way an agent that fails mid-round is dropped from that phase; only an
+                       empty table is fatal. Use this for scripted runs where a quietly
+                       smaller table would be the wrong outcome.
 --on-limit wait|drop   What to do when an agent hits its provider's usage limit mid-run.
                        "wait" (the default) holds the round until the provider's reported
                        reset time, which can be hours; "drop" lets that agent leave the phase

@@ -2240,7 +2240,7 @@ def log_run_context(run_log: RunLog, args: argparse.Namespace, session: Session,
                 "plain", "self", "mock", "collab", "synthesizer", "synthesis_passes",
                 "reasoning_effort", "balance_load", "task_status_check", "reassign_idle",
                 "skip_preflight", "preflight_timeout", "extended_preflight", "touch_mode",
-                "debug", "dead_code_check",
+                "debug", "dead_code_check", "agents", "on_limit", "strict_preflight",
             )
         },
         "agents": agent_details,
@@ -2681,6 +2681,33 @@ class Display:
         ("Grok", "▲", "xAI coding agent", 8),
         ("Qwen", "◈", "Alibaba coding agent", 9),
     )
+
+    def set_roster(self, names: Iterable[str]) -> None:
+        """Re-narrow the dashboard to the agents still playing.
+
+        Preflight can drop an agent after the UI is already built, and a panel for an agent that
+        will never speak reads as a hang rather than an absence.
+        """
+        roster = tuple(name for name in AGENT_NAMES if name in tuple(names))
+        if not roster or roster == getattr(self, "roster", None):
+            return
+        self.roster = roster
+        self.AGENTS = tuple(entry for entry in Display.AGENTS if entry[0] in roster)
+        self.PANEL_NAMES = tuple(name for name in Display.PANEL_NAMES
+                                 if name in roster or name in ("Final", "Code", "Console"))
+        self.SCROLL_NAMES = self.PANEL_NAMES
+        self.usage_names = roster
+        for attribute in ("scroll", "unread", "turn_times", "turn_outputs", "activity_pulses",
+                          "work_activity", "work_reads", "work_execs", "work_writes"):
+            existing = getattr(self, attribute, None)
+            if isinstance(existing, dict):
+                for name in [key for key in existing
+                             if key in AGENT_NAMES and key not in roster]:
+                    existing.pop(name, None)
+        if self.focused_panel not in self.PANEL_NAMES:
+            self.focused_panel = None
+        if self.expanded not in self.PANEL_NAMES:
+            self.expanded = None
 
     def toggle_expanded(self, name: str) -> None:
         """Show one panel full-size for its complete content, or collapse back to the dashboard."""
@@ -3781,6 +3808,7 @@ OPTION_TOGGLES: tuple[tuple[str, str], ...] = (
     ("self", "Self-edit — agents edit roundtable's own source (dangerous)"),
     ("skip_preflight", "Skip preflight — bypass the preliminary system check (saves time)"),
     ("extended_preflight", "Extended preflight — use a longer timeout for slow-starting agents"),
+    ("strict_preflight", "Strict preflight — abort the run if any agent fails its system check"),
     ("reassign_idle", "Reassign idle — a finished agent picks up other work instead of waiting"),
     ("debug", "Debug mode — enable verbose subprocess and diagnostic trace logging"),
     ("dead_code_check", "Dead code check — sweep for and remove unused code before the final answer"),
@@ -5054,11 +5082,20 @@ def preflight_check(name: str, agent: Agent, tick: Callable[[str, str], None],
 
 def run_preflight(agents: list[tuple[str, Agent]], tick: Callable[[str, str], None],
                   status: Callable[[Iterable[str], str], None], timeout: float = 25.0,
-                  stagger: float | None = None) -> None:
-    """Check every agent CLI is reachable before committing to the real task.
+                  stagger: float | None = None,
+                  strict: bool = False) -> list[tuple[str, Agent]]:
+    """Check every agent CLI is reachable before committing to the real task, and return
+    the ones that answered.
 
     Without this, a hung or unauthenticated CLI leaves every panel stuck on
-    'waiting for task' with no explanation. This fails fast with a clear reason instead.
+    'waiting for task' with no explanation. This reports a clear reason instead.
+
+    A failure here used to abort the whole run, which made one unauthenticated CLI enough to
+    stop a six-agent session before it started -- the same all-or-nothing shape as requiring
+    every CLI to be installed. A failing agent is now dropped and the rest carry on, matching
+    what the phase runners already do with an agent that fails mid-round. Only an empty table
+    is fatal, since there is then no run to have. strict=True restores the old behavior for
+    scripted use where a silently smaller table would be the wrong outcome.
     """
     if stagger is None:
         stagger = AGENT_SPAWN_STAGGER_SECONDS
@@ -5107,8 +5144,12 @@ def run_preflight(agents: list[tuple[str, Agent]], tick: Callable[[str, str], No
         tick(name, ("check passed" if detail == "ready" else detail) if ok
              else f"check failed: {detail}")
     failed = [f"{name} ({detail})" for name, (ok, detail) in results.items() if not ok]
-    if failed:
+    survivors = [(name, agent) for name, agent in agents if results[name][0]]
+    if failed and (strict or not survivors):
         raise RuntimeError("Preliminary system check failed — " + "; ".join(failed))
+    if failed:
+        tick("", f"continuing without {len(failed)} agent(s): " + "; ".join(failed))
+    return survivors
 
 
 def drain_queued_prompts(session: Session) -> bool:
@@ -5424,7 +5465,13 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
         ui.busy = True
         stdscr.nodelay(True)
         if not getattr(args, "skip_preflight", False):
-            run_preflight(lineup, ui.tick, status, timeout=args.preflight_timeout)
+            lineup = run_preflight(lineup, ui.tick, status,
+                                   timeout=args.preflight_timeout,
+                                   strict=getattr(args, "strict_preflight", False))
+            # Narrow before conduct reads the roster and before save_session writes it,
+            # so a resumed run does not re-seat an agent preflight already rejected.
+            session.roster = [name for name, _agent in lineup]
+            ui.set_roster(session.roster)
         else:
             run_log.write("info", "Preflight skipped by configuration")
             ui.log("Preflight skipped by configuration", kind="phase")
@@ -5654,6 +5701,8 @@ def restart_arguments(args: argparse.Namespace, session_path: Path,
         command.extend(("--agents", args.agents))
     if getattr(args, "on_limit", "wait") != "wait":
         command.extend(("--on-limit", args.on_limit))
+    if getattr(args, "strict_preflight", False):
+        command.append("--strict-preflight")
     if getattr(args, "workspace", None):
         command.extend(("--workspace", str(args.workspace)))
     for option, value in (("--codex-model", args.codex_model),
@@ -5818,6 +5867,11 @@ def build_parser() -> argparse.ArgumentParser:
                              "reported reset time, which can be hours; 'drop' lets that agent "
                              "leave the phase and finishes the round with the others. Ignored "
                              "for a one-agent roster, which has no round left to save")
+    parser.add_argument("--strict-preflight", action="store_true",
+                        help="fail the whole run if any agent fails the preliminary system "
+                             "check, instead of dropping that agent and continuing with the "
+                             "rest. Useful for scripted runs where a quietly smaller table "
+                             "would be the wrong outcome")
     parser.add_argument("--list-agents", action="store_true",
                         help="print which of the six known AI CLIs (the other agents in the "
                              "roundtable) are installed on this machine, then exit without "
@@ -5936,6 +5990,7 @@ def main() -> int:
                 "self": args.self,
                 "skip_preflight": args.skip_preflight,
                 "extended_preflight": args.extended_preflight,
+                "strict_preflight": args.strict_preflight,
                 "reassign_idle": args.reassign_idle,
                 "debug": args.debug,
                 "dead_code_check": args.dead_code_check,
@@ -5955,6 +6010,7 @@ def main() -> int:
         args.self = toggled["self"]
         args.skip_preflight = toggled["skip_preflight"]
         args.extended_preflight = toggled["extended_preflight"]
+        args.strict_preflight = toggled["strict_preflight"]
         args.reassign_idle = toggled["reassign_idle"]
         args.debug = toggled["debug"]
         args.dead_code_check = toggled["dead_code_check"]
@@ -6095,7 +6151,10 @@ def main() -> int:
             run_log.write("prompt", f"[{name}] PROMPT:\n{prompt}")
         try:
             if not args.skip_preflight:
-                run_preflight(lineup, tick, status, timeout=args.preflight_timeout)
+                lineup = run_preflight(lineup, tick, status,
+                                       timeout=args.preflight_timeout,
+                                       strict=getattr(args, "strict_preflight", False))
+                session.roster = [name for name, _agent in lineup]
             else:
                 run_log.write("info", "Preflight skipped by configuration")
             conduct(session, codex, claude, antigravity, aider, grok, qwen, tick, status,

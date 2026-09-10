@@ -7723,5 +7723,96 @@ class NarrowedRosterLayoutTests(unittest.TestCase):
                          len(roundtable.AGENT_NAMES))
 
 
+class PreflightDropsFailuresTests(unittest.TestCase):
+    """A failed system check used to abort the whole run.
+
+    One unauthenticated CLI was enough to stop a six-agent session before it started -- the same
+    all-or-nothing shape as requiring every CLI to be installed.
+    """
+
+    def test_a_failing_agent_is_dropped_and_the_rest_survive(self):
+        with tempfile.TemporaryDirectory() as td:
+            agents = [("Codex", roundtable.MockAgent("Codex", Path(td))),
+                      ("Claude", FailingAgent("Claude", Path(td))),
+                      ("Grok", roundtable.MockAgent("Grok", Path(td)))]
+            survivors = roundtable.run_preflight(agents, lambda *_: None, lambda *_: None)
+            self.assertEqual([name for name, _ in survivors], ["Codex", "Grok"])
+
+    def test_the_drop_is_reported_rather_than_silent(self):
+        with tempfile.TemporaryDirectory() as td:
+            agents = [("Codex", roundtable.MockAgent("Codex", Path(td))),
+                      ("Claude", FailingAgent("Claude", Path(td)))]
+            lines = []
+            roundtable.run_preflight(agents, lambda _name, line: lines.append(line),
+                                     lambda *_: None)
+            self.assertTrue(any("continuing without 1 agent" in line for line in lines), lines)
+            self.assertTrue(any("Claude" in line for line in lines), lines)
+
+    def test_every_agent_failing_still_aborts_with_each_reason(self):
+        """An empty table is fatal: there is no run left to have."""
+        with tempfile.TemporaryDirectory() as td:
+            agents = [(name, FailingAgent(name, Path(td)))
+                      for name in ("Codex", "Claude", "Antigravity")]
+            with self.assertRaises(RuntimeError) as raised:
+                roundtable.run_preflight(agents, lambda *_: None, lambda *_: None)
+            message = str(raised.exception)
+            for name in ("Codex", "Claude", "Antigravity"):
+                self.assertIn(name, message)
+            self.assertIn("boom: simulated failure", message)
+
+    def test_strict_restores_the_old_all_must_pass_behavior(self):
+        with tempfile.TemporaryDirectory() as td:
+            agents = [("Codex", roundtable.MockAgent("Codex", Path(td))),
+                      ("Claude", FailingAgent("Claude", Path(td)))]
+            with self.assertRaises(RuntimeError) as raised:
+                roundtable.run_preflight(agents, lambda *_: None, lambda *_: None, strict=True)
+            self.assertIn("Claude", str(raised.exception))
+
+    def test_a_healthy_table_is_returned_unchanged(self):
+        with tempfile.TemporaryDirectory() as td:
+            agents = [(name, roundtable.MockAgent(name, Path(td)))
+                      for name in ("Codex", "Grok")]
+            survivors = roundtable.run_preflight(agents, lambda *_: None, lambda *_: None)
+            self.assertEqual([name for name, _ in survivors], ["Codex", "Grok"])
+
+    def test_set_roster_renarrows_a_live_dashboard(self):
+        """Preflight can drop an agent after the UI is built; a panel that will never speak reads
+        as a hang rather than an absence."""
+        display = make_test_display()
+        display.roster = roundtable.AGENT_NAMES
+        display.AGENTS = roundtable.Display.AGENTS
+        display.PANEL_NAMES = roundtable.Display.PANEL_NAMES
+        display.set_roster(["Codex", "Grok"])
+        self.assertEqual(display.roster, ("Codex", "Grok"))
+        self.assertEqual([entry[0] for entry in display.AGENTS], ["Codex", "Grok"])
+        self.assertEqual(display.usage_names, ("Codex", "Grok"))
+        for absent in ("Claude", "Antigravity", "Aider", "Qwen"):
+            self.assertNotIn(absent, display.scroll)
+            self.assertNotIn(absent, display.PANEL_NAMES)
+        for kept in ("Final", "Code", "Console"):
+            self.assertIn(kept, display.scroll)
+
+    def test_set_roster_clears_focus_on_a_panel_that_is_gone(self):
+        display = make_test_display()
+        display.roster = roundtable.AGENT_NAMES
+        display.AGENTS = roundtable.Display.AGENTS
+        display.PANEL_NAMES = roundtable.Display.PANEL_NAMES
+        display.focused_panel = "Qwen"
+        display.expanded = "Qwen"
+        display.set_roster(["Codex"])
+        self.assertIsNone(display.focused_panel)
+        self.assertIsNone(display.expanded)
+
+    def test_set_roster_ignores_an_empty_roster(self):
+        """Never blank the dashboard; an empty table is handled by aborting, not by drawing nothing."""
+        display = make_test_display()
+        display.roster = ("Codex", "Grok")
+        display.AGENTS = tuple(entry for entry in roundtable.Display.AGENTS
+                               if entry[0] in ("Codex", "Grok"))
+        display.PANEL_NAMES = ("Codex", "Grok", "Final", "Code", "Console")
+        display.set_roster([])
+        self.assertEqual(display.roster, ("Codex", "Grok"))
+
+
 if __name__ == "__main__":
     unittest.main()
