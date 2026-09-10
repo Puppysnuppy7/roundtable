@@ -4312,7 +4312,7 @@ def _wait_for_agent_availability(agent: Agent, on_tick: Callable[[str], None],
 def _run_with_retry(agent: Agent, prompt: str, on_tick: Callable[[str], None],
                     cancel_event: threading.Event | None = None, no_edit: bool = False,
                     suggested_effort: str | None = None,
-                    transient_retries: int = 1) -> str:
+                    transient_retries: int = 1, on_limit: str = "wait") -> str:
     """Run one agent turn, recovering from transient failures and provider usage limits.
 
     Real CLI failures seen in practice during a long run (a nonzero exit, an empty response) are
@@ -4322,11 +4322,16 @@ def _run_with_retry(agent: Agent, prompt: str, on_tick: Callable[[str], None],
     task_status_check stopping this agent, or Ctrl+C) is never retried: it was stopped on purpose,
     not because it failed, and retrying it would redo work that was intentionally cut short.
 
-    A provider usage/session limit is different: while Roundtable is still running, wait for the
-    agent to come back before resending the lightweight preflight prompt -- until the provider's own
-    reported reset time if it named one, or a short poll interval otherwise -- then resend its
-    original task once the agent answers again, so the round can finish without discarding the
-    other agents' work.
+    A provider usage/session limit is different, and on_limit decides what to do about it.
+    "wait" (the default) holds the seat: wait for the agent to come back before resending the
+    lightweight preflight prompt -- until the provider's own reported reset time if it named
+    one, or a short poll interval otherwise -- then resend its original task once the agent
+    answers again, so the round can finish without discarding the other agents' work. That is
+    the right trade when the wait is short, and the wrong one when a weekly cap means hours:
+    the whole round blocks on the one provider that has nothing left to give.
+    "drop" instead lets the limit surface as an ordinary turn failure, which the phase runners
+    already handle by dropping that agent from the phase and continuing with the rest -- the
+    round finishes now, one agent short, instead of stalling until a reset.
 
     Either way, a resend appends RERUN_PROGRESS_NOTE telling the agent to check current progress
     first. Time has passed since the original attempt -- a few seconds for a transient failure, up
@@ -4357,6 +4362,11 @@ def _run_with_retry(agent: Agent, prompt: str, on_tick: Callable[[str], None],
                 detail = usage_limit_detail(str(exc))
                 if detail:
                     agent.log_diagnostic(f"failure classified as usage limit: {detail}")
+                    if on_limit == "drop":
+                        agent.log_diagnostic(
+                            "on_limit=drop: leaving the phase instead of waiting for reset")
+                        on_tick(f"out of quota ({detail}) — dropping from this phase")
+                        raise
                     on_tick(f"temporarily unavailable: {detail}")
                     _wait_for_agent_availability(agent, on_tick, active_cancel, detail)
                     current_prompt = f"{prompt}\n\n{RERUN_PROGRESS_NOTE}"
@@ -4401,7 +4411,7 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
                         agent_speed: dict[str, list[float]] | None = None,
                         task_status_check: bool = False, reassign_idle: bool = False,
                         stagger: float | None = None, restart_vote_pending: bool = False,
-                        chat: bool = False) -> str | None:
+                        chat: bool = False, on_limit: str = "wait") -> str | None:
     """Run one collaboration phase concurrently and record results deterministically.
 
     When agent_speed is provided, an agent running notably slower than the others (based on
@@ -4466,7 +4476,7 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
                 try:
                     content = _run_with_retry(
                         agent, prompt, lambda line: events.put((speaker, line)), cancel_event,
-                        no_edit=chat)
+                        no_edit=chat, on_limit=on_limit)
                 finally:
                     agent_finished[speaker] = time.monotonic()
                 # Independently verify this agent's turn against real, deterministic evidence
@@ -4657,7 +4667,8 @@ def _run_sequential_phase(session: Session, agents: list[tuple[str, Agent]], pha
                           status: Callable[[Iterable[str], str], None], message: str,
                           log_prompt: Callable[[str, str], None] = lambda *_: None,
                           task_status_check: bool = False,
-                          restart_vote_pending: bool = False, chat: bool = False) -> str | None:
+                          restart_vote_pending: bool = False, chat: bool = False,
+                          on_limit: str = "wait") -> str | None:
     """Run one collaboration phase as a live relay: each agent reads and builds on the one before it.
 
     Unlike the parallel phase, each agent's prompt is built right before it runs, after the previous
@@ -4678,7 +4689,7 @@ def _run_sequential_phase(session: Session, agents: list[tuple[str, Agent]], pha
                             chat=chat, context=context)
         log_prompt(name, prompt)
         content = _run_with_retry(agent, prompt, lambda line, speaker=name: tick(speaker, line),
-                                  no_edit=chat)
+                                  no_edit=chat, on_limit=on_limit)
         # Independently verify this agent's turn against real, deterministic evidence rather than
         # whatever it claimed -- a no-op outside a --self session.
         verify_self_edit_turn(session, agent, lambda line, speaker=name: tick(speaker, line))
@@ -5090,7 +5101,7 @@ def _run_phase(runner: Callable[..., str | None], session: Session, agents: list
               agent_speed: dict[str, list[float]] | None,
               task_status_check: bool = False, reassign_idle: bool = False,
               stagger: float | None = None, restart_vote_pending: bool = False,
-              chat: bool = False) -> str | None:
+              chat: bool = False, on_limit: str = "wait") -> str | None:
     """Dispatch to a phase runner, passing parallel-only knobs only to the parallel runner.
 
     Returns the name of an agent that marked TASK STATUS: complete this phase, if any — used by
@@ -5101,11 +5112,13 @@ def _run_phase(runner: Callable[..., str | None], session: Session, agents: list
         phase = f"followup-{phase}"
     if runner is _run_parallel_phase:
         return runner(session, agents, phase, tick, status, message, log_prompt, agent_speed,
-                      task_status_check, reassign_idle, stagger, restart_vote_pending, chat)
+                      task_status_check, reassign_idle, stagger, restart_vote_pending, chat,
+                      on_limit)
     if runner is _run_sequential_phase:
         return runner(session, agents, phase, tick, status, message, log_prompt,
                       task_status_check=task_status_check,
-                      restart_vote_pending=restart_vote_pending, chat=chat)
+                      restart_vote_pending=restart_vote_pending, chat=chat,
+                      on_limit=on_limit)
     return runner(session, agents, phase, tick, status, message, log_prompt)
 
 
@@ -5120,7 +5133,7 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
             dead_code_check: bool = False, chat: bool = False,
             checkpoint: Callable[[], None] = lambda: None,
             completed_phases: set[str] | None = None,
-            stagger: float | None = None) -> None:
+            stagger: float | None = None, on_limit: str = "wait") -> None:
     # Chat mode never edits files, so a dead-code sweep (which needs edit rights) has nothing to
     # do; force it off regardless of what was requested/toggled rather than letting an agent get
     # edit rights for a coding-specific step that makes no sense in a plain-text discussion.
@@ -5133,6 +5146,9 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
     # progress count downstream iterates this list, so filtering here is what makes --agents real
     # without reshaping the six-argument signatures the whole call graph is built on.
     roster = tuple(session.roster) or AGENT_NAMES
+    # Dropping a rate-limited agent only helps when someone else can carry the phase.
+    # With a one-agent table there is no round left to save, so wait for the reset.
+    effective_on_limit = "wait" if len(roster) < 2 else on_limit
     agents = [(name, agent) for name, agent in
               (("Codex", codex), ("Claude", claude), ("Antigravity", antigravity),
                ("Aider", aider), ("Grok", grok), ("Qwen", qwen))
@@ -5255,7 +5271,8 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
     if phase not in completed_phases:
         completed_by = _run_phase(
             proposal_runner, session, agents, phase, estimated_tick, estimated_status, message,
-            log_prompt, agent_speed, task_status_check, reassign_idle, stagger, chat=chat)
+            log_prompt, agent_speed, task_status_check, reassign_idle, stagger, chat=chat,
+            on_limit=effective_on_limit)
         estimator.complete(phase_work_units(proposal_runner))
         note_phase_completion(completed_by)
         if self_mode and session.rounds >= 1 and source_fingerprint() != restart_baseline:
@@ -5289,6 +5306,7 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
                 f"Agents are reviewing {round_style} · round {round_no}/{session.rounds}",
                 log_prompt, agent_speed, task_status_check, reassign_idle, stagger,
                 restart_vote_pending=asking_vote_this_round, chat=chat,
+                on_limit=effective_on_limit,
             )
             estimator.complete(phase_work_units(runner))
             if task_status_check and completed_by:
@@ -5409,7 +5427,8 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
                    synthesis_passes=getattr(args, "synthesis_passes", 6),
                    dead_code_check=args.dead_code_check, chat=getattr(args, "chat", False),
                    checkpoint=checkpoint,
-                   completed_phases=completed_phases)
+                   completed_phases=completed_phases,
+                   on_limit=getattr(args, "on_limit", "wait"))
             ui.busy = False
             paths = save_session(session, output_dir)
             run_log.write(
@@ -5605,6 +5624,8 @@ def restart_arguments(args: argparse.Namespace, session_path: Path,
     # so a --self run on a box that only has some of them would die at verify_clis mid-session.
     if getattr(args, "agents", None):
         command.extend(("--agents", args.agents))
+    if getattr(args, "on_limit", "wait") != "wait":
+        command.extend(("--on-limit", args.on_limit))
     if getattr(args, "workspace", None):
         command.extend(("--workspace", str(args.workspace)))
     for option, value in (("--codex-model", args.codex_model),
@@ -5763,6 +5784,12 @@ def build_parser() -> argparse.ArgumentParser:
                              "provider whose quota is gone -- no longer blocks a run. 'auto' uses "
                              "whichever of the six are on PATH; 'all' (the default) uses every "
                              "agent. Order is always canonical, however you type it")
+    parser.add_argument("--on-limit", choices=("wait", "drop"), default="wait",
+                        help="what to do when an agent hits its provider's usage limit "
+                             "mid-run: 'wait' (default) holds the round until the provider's "
+                             "reported reset time, which can be hours; 'drop' lets that agent "
+                             "leave the phase and finishes the round with the others. Ignored "
+                             "for a one-agent roster, which has no round left to save")
     parser.add_argument("--list-agents", action="store_true",
                         help="print which of the six known AI CLIs (the other agents in the "
                              "roundtable) are installed on this machine, then exit without "
@@ -6049,7 +6076,8 @@ def main() -> int:
                    balance_load=args.balance_load, task_status_check=args.task_status_check,
                    reassign_idle=args.reassign_idle, synthesis_passes=args.synthesis_passes,
                    dead_code_check=args.dead_code_check, chat=getattr(args, "chat", False),
-                   checkpoint=checkpoint, completed_phases=completed_phases)
+                   checkpoint=checkpoint, completed_phases=completed_phases,
+                   on_limit=getattr(args, "on_limit", "wait"))
             successful_paths = save_session(session, Path(args.output_dir))
             run_log.write(
                 "artifact",

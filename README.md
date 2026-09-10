@@ -97,8 +97,11 @@ secret cannot accidentally land in shell history, command arguments, or piped lo
 
 ## Run it
 
-All six CLIs must already be installed and authenticated (`codex`, `claude`, `agy`, `aider`, `grok`,
-and `qwen`) — `roundtable --list-agents` reports which are currently found on `PATH`. Aider is
+By default all six CLIs must already be installed and authenticated (`codex`, `claude`, `agy`,
+`aider`, `grok`, and `qwen`) — `roundtable --list-agents` reports which are currently found on
+`PATH`. To run with only some of them, name them with `--agents` (or `--agents auto` to take
+whichever are installed); only those are required, preflighted, given panels and given turns.
+Aider is
 model-agnostic — it defaults to `mistral/codestral-latest` here specifically so it doesn't just
 duplicate one of the five lab-native agents; point `--aider-model` at a different provider if you'd
 rather it run as something else.
@@ -130,6 +133,19 @@ Useful options:
 ```text
 -r 0-5                 Number of back-and-forth review rounds (default: 1)
 -C PATH                Workspace all agents can inspect and edit
+--agents LIST          Which agents take part, comma-separated (e.g. --agents codex,grok).
+                       Only the named CLIs are required, preflighted, given panels and given
+                       turns, so a box where some agents are not installed — or a provider
+                       whose quota is gone — no longer blocks a run. "auto" uses whichever of
+                       the six are on PATH; "all" (the default) uses every agent. Order is
+                       always canonical, however you type it. A one-agent roster is valid and
+                       still produces a final answer. The roster is saved with the session, so
+                       --resume reopens the same table.
+--on-limit wait|drop   What to do when an agent hits its provider's usage limit mid-run.
+                       "wait" (the default) holds the round until the provider's reported
+                       reset time, which can be hours; "drop" lets that agent leave the phase
+                       and finishes the round with the others. Ignored for a one-agent roster,
+                       which has no round left to save.
 --self                 Point the workspace at roundtable's own source instead, so the agents can
                        improve roundtable itself (-C still overrides). Adds a standing note asking
                        agents to read the existing code, stay dependency-free, and run the test

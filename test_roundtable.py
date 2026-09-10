@@ -7524,5 +7524,111 @@ class RosterSelectionTests(unittest.TestCase):
             self.assertIn(kept, fresh.PANEL_NAMES)
 
 
+class UsageLimitPolicyTests(unittest.TestCase):
+    """--on-limit: whether a rate-limited agent blocks the round or leaves it.
+
+    Roundtable's built-in response to an exhausted quota was to wait for the provider's reset --
+    up to hours -- which stalls the whole round on the one agent that has nothing left to give.
+    """
+
+    class _LimitedAgent(roundtable.MockAgent):
+        """Fails once with a provider usage-limit message, then succeeds."""
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.attempts = 0
+
+        def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("Usage limit reached. Resets at 9pm.")
+            return super().run(prompt, on_tick, cancel_event, no_edit)
+
+    def test_drop_raises_instead_of_waiting_for_a_reset(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = self._LimitedAgent("Codex", Path(td))
+            with mock.patch.object(roundtable, "_wait_for_agent_availability") as waited:
+                with self.assertRaises(RuntimeError):
+                    roundtable._run_with_retry(agent, "do it", lambda _line: None,
+                                               on_limit="drop")
+            waited.assert_not_called()
+            self.assertEqual(agent.attempts, 1)
+
+    def test_wait_is_still_the_default_and_still_resends(self):
+        """The existing behavior has to stay exactly as it was unless drop is asked for."""
+        with tempfile.TemporaryDirectory() as td:
+            agent = self._LimitedAgent("Codex", Path(td))
+            with mock.patch.object(roundtable, "_wait_for_agent_availability") as waited:
+                content = roundtable._run_with_retry(agent, "do it", lambda _line: None)
+            waited.assert_called_once()
+            self.assertEqual(agent.attempts, 2)
+            self.assertTrue(content)
+
+    def test_drop_reports_the_quota_in_the_tick_line(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = self._LimitedAgent("Codex", Path(td))
+            lines = []
+            with self.assertRaises(RuntimeError):
+                roundtable._run_with_retry(agent, "do it", lines.append, on_limit="drop")
+            self.assertTrue(any("dropping from this phase" in line for line in lines), lines)
+
+    def test_a_capped_agent_does_not_stall_the_round(self):
+        """The point of the flag: the other agent's work still lands."""
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session("Solve it", td, 0, "now", [],
+                                         roster=["Codex", "Grok"])
+            agents = {name: roundtable.MockAgent(name, Path(td))
+                      for name in roundtable.AGENT_NAMES}
+            agents["Codex"] = self._LimitedAgent("Codex", Path(td))
+            ordered = [agents[name] for name in roundtable.AGENT_NAMES]
+            with mock.patch.object(roundtable, "_wait_for_agent_availability") as waited:
+                roundtable.conduct(session, *ordered, lambda *_: None, lambda *_: None,
+                                   on_limit="drop")
+            waited.assert_not_called()
+            proposals = [t.speaker for t in session.turns if t.phase == "proposal"]
+            self.assertIn("Grok", proposals)
+            self.assertNotIn("Codex", proposals)
+            self.assertTrue(session.final)
+
+    def test_a_lone_agent_waits_even_when_drop_was_requested(self):
+        """Dropping the only agent leaves nothing to finish the round with."""
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session("Solve it", td, 0, "now", [], roster=["Codex"])
+            agents = {name: roundtable.MockAgent(name, Path(td))
+                      for name in roundtable.AGENT_NAMES}
+            agents["Codex"] = self._LimitedAgent("Codex", Path(td))
+            ordered = [agents[name] for name in roundtable.AGENT_NAMES]
+            with mock.patch.object(roundtable, "_wait_for_agent_availability") as waited:
+                roundtable.conduct(session, *ordered, lambda *_: None, lambda *_: None,
+                                   on_limit="drop")
+            waited.assert_called_once()
+
+    def test_on_limit_survives_a_self_restart(self):
+        args = roundtable.argparse.Namespace(
+            output_dir=None, collab="parallel", synthesizer="rotate",
+            synthesis_passes=6, rounds=1, workspace=None, agents=None, on_limit="drop",
+            codex_model=None, claude_model=None, antigravity_model=None, aider_model=None,
+            grok_model=None, qwen_model=None, reasoning_effort="auto", elevated=[],
+            plain=False, mock=False, balance_load=False, task_status_check=False,
+            reassign_idle=False, dead_code_check=False, chat=False, debug=False,
+            extended_preflight=True, preflight_timeout=None, touch=None)
+        setattr(args, "self", True)
+        command = roundtable.restart_arguments(args, Path("/tmp/session.json"), followup=False)
+        self.assertEqual(command[command.index("--on-limit") + 1], "drop")
+
+    def test_default_run_emits_no_on_limit_flag_on_restart(self):
+        args = roundtable.argparse.Namespace(
+            output_dir=None, collab="parallel", synthesizer="rotate",
+            synthesis_passes=6, rounds=1, workspace=None, agents=None, on_limit="wait",
+            codex_model=None, claude_model=None, antigravity_model=None, aider_model=None,
+            grok_model=None, qwen_model=None, reasoning_effort="auto", elevated=[],
+            plain=False, mock=False, balance_load=False, task_status_check=False,
+            reassign_idle=False, dead_code_check=False, chat=False, debug=False,
+            extended_preflight=True, preflight_timeout=None, touch=None)
+        setattr(args, "self", True)
+        command = roundtable.restart_arguments(args, Path("/tmp/session.json"), followup=False)
+        self.assertNotIn("--on-limit", command)
+
+
 if __name__ == "__main__":
     unittest.main()
