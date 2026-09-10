@@ -5634,6 +5634,60 @@ def list_agents() -> str:
     return "\n".join(lines)
 
 
+def check_agents(timeout: float = EXTENDED_PREFLIGHT_TIMEOUT_SECONDS,
+                 mock: bool = False) -> tuple[str, list[str]]:
+    """Probe every installed agent and report who could actually take a turn right now.
+
+    --list-agents answers "is it installed", which is not the question that sends someone to a
+    single CLI by hand. That question is "who has credit left" -- and until now the only way to
+    find out was to start a run and watch it fail. This runs the same check a real run does and
+    reports the outcome per agent, so the table can be chosen before committing to a session.
+
+    Probes directly rather than through run_preflight, which reports only who survived: the
+    difference between "ready" and "out of quota until 5:30pm" is the whole point of the report,
+    and both are survivors under the waiting policy.
+
+    Returns the report and the agents that are ready now, so callers can act on it as well as
+    print it.
+    """
+    cls = MockAgent if mock else Agent
+    installed = [name for name in AGENT_NAMES
+                 if mock or shutil.which(AGENT_EXECUTABLES[name])]
+    rows: dict[str, str] = {name: "not installed" for name in AGENT_NAMES}
+    ready: list[str] = []
+    if installed:
+        with tempfile.TemporaryDirectory(prefix="roundtable-check-") as probe_dir:
+            def probe(name: str) -> tuple[bool, str]:
+                agent = cls(name, Path(probe_dir))
+                cancel_event = threading.Event()
+                # on_limit="wait" keeps a usage-limited agent a *pass* inside preflight_check so it
+                # reports the quota detail, which this function then classifies separately.
+                return preflight_check(name, agent, lambda *_: None, cancel_event, timeout,
+                                       on_limit="wait")
+
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=len(installed), thread_name_prefix="check") as pool:
+                results = dict(zip(installed, pool.map(probe, installed)))
+        for name, (ok, detail) in results.items():
+            if not ok:
+                rows[name] = detail
+            elif detail.startswith("usage-limited"):
+                # preflight phrases this for a run that is about to wait; nothing waits here.
+                _, _, reason = detail.partition("(")
+                rows[name] = f"out of quota ({reason}" if reason else "out of quota"
+            else:
+                rows[name] = "ready"
+                ready.append(name)
+    lines = [f"{name:<11} {AGENT_EXECUTABLES[name]:<7} {rows[name]}"
+             for name in AGENT_NAMES]
+    lines.append("")
+    if ready:
+        lines.append(f"Usable now: --agents {','.join(name.lower() for name in ready)}")
+    else:
+        lines.append("No agent can take a turn right now.")
+    return "\n".join(lines), ready
+
+
 def positive_finite_float(value: str) -> float:
     """Argparse type for positive, finite timeout values."""
     number = float(value)
@@ -5901,6 +5955,11 @@ def build_parser() -> argparse.ArgumentParser:
                              "finishes with the others; 'wait' holds the whole round until "
                              "the provider's reported reset time, which can be hours. "
                              "Ignored for a one-agent roster, which has no round left to save")
+    parser.add_argument("--check-agents", action="store_true",
+                        help="probe every installed agent CLI and report which ones can "
+                             "actually take a turn right now — ready, out of quota, or "
+                             "needing a login — then exit. --list-agents only answers "
+                             "whether they are installed")
     parser.add_argument("--strict-preflight", action="store_true",
                         help="fail the whole run if any agent fails the preliminary system "
                              "check, instead of dropping that agent and continuing with the "
@@ -6009,6 +6068,12 @@ def main() -> int:
     if args.list_agents:
         print(list_agents())
         return 0
+    if args.check_agents:
+        report, ready = check_agents(
+            timeout=args.preflight_timeout or EXTENDED_PREFLIGHT_TIMEOUT_SECONDS,
+            mock=args.mock)
+        print(report)
+        return 0 if ready else 1
     args.touch_mode = has_touchscreen() if args.touch is None else args.touch
     # A --self restart already carries the flags the user chose before the edit (restart_arguments
     # rebuilds the full invocation from args), so re-showing the toggle screen here would just be an

@@ -107,6 +107,25 @@ Name agents explicitly with `--agents codex,grok` when you want a specific table
 named agent that is missing is an error rather than a warning, since you asked for it. Use
 `--agents all` to require all six, and `--strict-preflight` to fail if any of them fails its
 check.
+
+To see who can actually take a turn before committing to a run — the "which of my accounts
+still has credit" question — use `roundtable --check-agents`. It runs the same check a real
+run does and reports each agent as ready, out of quota (with the provider's own reset time),
+needing a login, or not installed, then suggests an `--agents` value you can paste:
+
+```text
+$ roundtable --check-agents
+Codex       codex   ready
+Claude      claude  out of quota (You've hit your session limit · resets 5:30pm)
+Antigravity agy     needs login: run `agy` and complete its browser login
+Aider       aider   ready
+Grok        grok    not installed
+Qwen        qwen    ready
+
+Usable now: --agents codex,aider,qwen
+```
+
+It exits non-zero when nothing is usable, so it works as a scripted precondition.
 Aider is
 model-agnostic — it defaults to `mistral/codestral-latest` here specifically so it doesn't just
 duplicate one of the five lab-native agents; point `--aider-model` at a different provider if you'd
@@ -147,6 +166,10 @@ Useful options:
                        always canonical, however you type it. A one-agent roster is valid and
                        still produces a final answer. The roster is saved with the session, so
                        --resume reopens the same table.
+--check-agents         Probe every installed agent and report which can take a turn right
+                       now — ready, out of quota, or needing a login — then exit. Exits
+                       non-zero if none are usable. --list-agents only answers whether
+                       they are installed.
 --strict-preflight     Fail the whole run if any agent fails the preliminary system check.
                        By default a failing agent is dropped and the rest carry on, the same
                        way an agent that fails mid-round is dropped from that phase; only an

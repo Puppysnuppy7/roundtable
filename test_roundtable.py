@@ -3015,9 +3015,11 @@ class RoundtableTests(unittest.TestCase):
             for action in parser._actions
             if isinstance(action, roundtable.argparse._StoreTrueAction)
             and action.help != roundtable.argparse.SUPPRESS
+            # Exempt: flags that print something and exit rather than configuring a session,
+            # plus --plain, which selects a UI rather than an option within one.
             and action.dest not in (
-                "plain", "list_agents", "install", "update", "bugsend", "list_keys",
-                "auth_setup",
+                "plain", "list_agents", "check_agents", "install", "update", "bugsend",
+                "list_keys", "auth_setup",
             )
         }
         toggle_names = {name for name, _ in roundtable.OPTION_TOGGLES}
@@ -7923,6 +7925,91 @@ class DefaultBehaviorTests(unittest.TestCase):
         with mock.patch.object(roundtable.shutil, "which", return_value=None):
             with self.assertRaises(SystemExit):
                 roundtable.verify_clis(False, roundtable.AGENT_NAMES, explicit=False)
+
+
+class CheckAgentsTests(unittest.TestCase):
+    """--check-agents: who can take a turn right now.
+
+    --list-agents answers "is it installed", which is not the question that sends someone to a
+    single CLI by hand; that question is "who has credit left".
+    """
+
+    class _CappedAgent(roundtable.Agent):
+        def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+            raise RuntimeError(
+                "Grok unavailable: You've hit your session limit · resets 5:30pm")
+
+    def test_reports_uninstalled_agents_without_probing_them(self):
+        with mock.patch.object(roundtable.shutil, "which", return_value=None):
+            report, ready = roundtable.check_agents(timeout=1)
+        self.assertEqual(ready, [])
+        for name in roundtable.AGENT_NAMES:
+            self.assertIn(f"{name:<11}", report)
+        self.assertIn("not installed", report)
+        self.assertIn("No agent can take a turn right now.", report)
+
+    def test_a_ready_agent_is_reported_and_suggested(self):
+        with mock.patch.object(roundtable.shutil, "which",
+                               side_effect=lambda exe: "/usr/bin/" + exe if exe == "codex" else None), \
+             mock.patch.object(roundtable, "Agent", roundtable.MockAgent):
+            report, ready = roundtable.check_agents(timeout=5)
+        self.assertEqual(ready, ["Codex"])
+        self.assertIn("ready", report)
+        self.assertIn("--agents codex", report)
+
+    def test_an_out_of_quota_agent_is_distinguished_from_a_broken_one(self):
+        """The distinction is the whole point: 'not right now' is not 'cannot'."""
+        def fake_agent(name, workspace, *args, **kwargs):
+            if name == "Grok":
+                return self._CappedAgent(name, workspace)
+            return roundtable.MockAgent(name, workspace)
+
+        with mock.patch.object(roundtable.shutil, "which",
+                               side_effect=lambda exe: "/usr/bin/" + exe
+                               if exe in ("codex", "grok") else None), \
+             mock.patch.object(roundtable, "Agent", side_effect=fake_agent):
+            report, ready = roundtable.check_agents(timeout=5)
+        self.assertEqual(ready, ["Codex"])
+        self.assertIn("out of quota", report)
+        self.assertIn("resets 5:30pm", report)
+        self.assertNotIn("will wait during the task", report)
+        self.assertIn("--agents codex", report)
+
+    def test_the_suggested_command_is_a_usable_agents_value(self):
+        with mock.patch.object(roundtable.shutil, "which",
+                               side_effect=lambda exe: "/usr/bin/" + exe
+                               if exe in ("codex", "grok") else None), \
+             mock.patch.object(roundtable, "Agent", roundtable.MockAgent):
+            report, ready = roundtable.check_agents(timeout=5)
+        suggestion = report.rsplit("--agents ", 1)[-1].strip()
+        self.assertEqual(roundtable.resolve_roster(suggestion), tuple(ready))
+
+    def test_exit_code_reports_whether_anything_is_usable(self):
+        with mock.patch.object(roundtable.shutil, "which", return_value=None), \
+             mock.patch.object(sys, "argv", ["roundtable", "--check-agents"]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(roundtable.main(), 1)
+        with mock.patch.object(roundtable, "check_agents", return_value=("report", ["Codex"])), \
+             mock.patch.object(sys, "argv", ["roundtable", "--check-agents"]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(roundtable.main(), 0)
+
+    def test_check_agents_does_not_touch_the_working_directory(self):
+        """It probes into a temporary directory: asking who is available must not write anything
+        into the project you happen to be standing in."""
+        with tempfile.TemporaryDirectory() as td:
+            original = os.getcwd()
+            try:
+                os.chdir(td)
+                before = set(os.listdir(td))
+                with mock.patch.object(roundtable.shutil, "which",
+                                       side_effect=lambda exe: "/usr/bin/" + exe
+                                       if exe == "codex" else None), \
+                     mock.patch.object(roundtable, "Agent", roundtable.MockAgent):
+                    roundtable.check_agents(timeout=5)
+                self.assertEqual(set(os.listdir(td)), before)
+            finally:
+                os.chdir(original)
 
 
 if __name__ == "__main__":
