@@ -7422,11 +7422,62 @@ class RosterSelectionTests(unittest.TestCase):
         self.assertIn("one of 2 members", prompt)
         self.assertNotIn("Antigravity", prompt)
 
-    def test_session_roster_round_trips_through_save_and_load(self):
+    def test_the_requested_roster_round_trips_through_save_and_load(self):
+        """What round-trips is the table you asked for. The live roster is re-derived each run
+        from what is actually available, so it is not a lasting choice."""
         with tempfile.TemporaryDirectory() as td:
-            session = roundtable.Session("Goal", td, 0, "now", [], roster=["Codex", "Grok"])
+            session = roundtable.Session("Goal", td, 0, "now", [],
+                                         roster=["Codex", "Grok"],
+                                         requested_roster=["Codex", "Grok"])
             json_path, _ = roundtable.save_session(session, Path(td))
-            self.assertEqual(roundtable.load_session(json_path).roster, ["Codex", "Grok"])
+            loaded = roundtable.load_session(json_path)
+            self.assertEqual(loaded.requested_roster, ["Codex", "Grok"])
+            self.assertEqual(loaded.roster, ["Codex", "Grok"])
+
+    def test_an_agent_dropped_for_quota_rejoins_on_resume(self):
+        """The regression this split exists to prevent: a provider outage at save time must not
+        write an agent out of the session permanently. Quotas reset; the transcript does not."""
+        with tempfile.TemporaryDirectory() as td:
+            # Asked for two agents; only one could run when this was saved.
+            session = roundtable.Session("Goal", td, 0, "now", [],
+                                         roster=["Codex"],
+                                         requested_roster=["Codex", "Grok"])
+            json_path, _ = roundtable.save_session(session, Path(td))
+            resumed = roundtable.load_session(json_path)
+            self.assertEqual(resumed.roster, ["Codex", "Grok"])
+            self.assertEqual(resumed.requested_roster, ["Codex", "Grok"])
+
+    def test_a_session_saved_before_the_split_keeps_its_roster_as_intent(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "old.json"
+            path.write_text(json.dumps({
+                "objective": "Goal", "workspace": td, "rounds": 0,
+                "started_at": "now", "turns": [], "final": "", "roster": ["Codex", "Grok"],
+            }), encoding="utf-8")
+            loaded = roundtable.load_session(path)
+            self.assertEqual(loaded.requested_roster, ["Codex", "Grok"])
+            self.assertEqual(loaded.roster, ["Codex", "Grok"])
+
+    def test_load_session_rejects_a_bad_requested_roster(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "bad.json"
+            path.write_text(json.dumps({
+                "objective": "Goal", "workspace": td, "rounds": 0, "started_at": "now",
+                "turns": [], "final": "", "roster": ["Codex"],
+                "requested_roster": ["Codex", "Bogus"],
+            }), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                roundtable.load_session(path)
+
+    def test_conduct_still_plays_the_live_roster_not_the_requested_one(self):
+        """Narrowing has to reach the turns; requested_roster is a record, not a seating chart."""
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session("Solve it", td, 0, "now", [],
+                                         roster=["Codex"],
+                                         requested_roster=["Codex", "Grok"])
+            agents = [roundtable.MockAgent(name, Path(td)) for name in roundtable.AGENT_NAMES]
+            roundtable.conduct(session, *agents, lambda *_: None, lambda *_: None)
+            self.assertEqual({t.speaker for t in session.turns} - {"Final"}, {"Codex"})
 
     def test_session_written_before_agents_existed_loads_as_every_agent(self):
         with tempfile.TemporaryDirectory() as td:

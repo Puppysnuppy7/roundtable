@@ -676,10 +676,13 @@ class Session:
     # roundtable.py mid-run (see SelfRestartRequired). Persisted across restarts so the run stays
     # aware of its own edit-and-reload history instead of each new process looking pristine.
     restart_count: int = 0
-    # Which agents actually take turns (see resolve_roster). Persisted so --resume reopens the run
-    # with the same table it was recorded with: a two-agent transcript resumed as six would hand
-    # four agents a history they were never part of, and re-require four CLIs the box may not have.
+    # The table this run is actually playing with. Narrowed during startup by whatever is
+    # installed and passing its check, so it reflects today's machine, not a lasting choice.
     roster: list[str] = field(default_factory=lambda: list(AGENT_NAMES))
+    # The table that was *asked* for. A resume starts from this and re-tests availability,
+    # so an agent that was merely out of quota when the session was saved rejoins once its
+    # quota resets, instead of being written out of the run permanently.
+    requested_roster: list[str] = field(default_factory=lambda: list(AGENT_NAMES))
 
 
 class SelfRestartRequired(RuntimeError):
@@ -2087,14 +2090,20 @@ def load_session(path: Path) -> Session:
     # Sessions written before --agents existed have no roster; they were six-agent runs by
     # definition, so absent means all six rather than an error.
     roster = data.get("roster", list(AGENT_NAMES))
-    if (not isinstance(roster, list) or not roster
-            or any(name not in AGENT_NAMES for name in roster)):
-        raise ValueError(
-            f"session field 'roster' must be a non-empty list drawn from {', '.join(AGENT_NAMES)}")
+    requested = data.get("requested_roster", roster)
+    for label, value in (("roster", roster), ("requested_roster", requested)):
+        if (not isinstance(value, list) or not value
+                or any(name not in AGENT_NAMES for name in value)):
+            raise ValueError(
+                f"session field {label!r} must be a non-empty list drawn from "
+                f"{', '.join(AGENT_NAMES)}")
+    # Availability is re-tested every run, so a resumed session starts from what was asked
+    # for rather than from whoever happened to be reachable when it was saved.
+    requested = [name for name in AGENT_NAMES if name in requested]
     return Session(data["objective"], data["workspace"], data["rounds"],
                    data["started_at"], turns, final, queued_prompts=queued_prompts,
                    restart_count=restart_count,
-                   roster=[name for name in AGENT_NAMES if name in roster])
+                   roster=list(requested), requested_roster=list(requested))
 
 
 class RunLog:
@@ -6047,6 +6056,7 @@ def main() -> int:
         roster = resolve_roster(args.agents)
     except RosterError as exc:
         parser.error(str(exc))
+    requested = roster
     self_dir = Path(__file__).resolve().parent
     resumed = args.resume is not None
     if args.continue_after_restart and not resumed:
@@ -6062,11 +6072,12 @@ def main() -> int:
         session.workspace = str(workspace)
         if args.rounds is not None:
             session.rounds = args.rounds
-        # A resumed run keeps the table it was recorded with unless --agents explicitly changes it,
-        # so `--resume` alone can't silently re-seat four agents that were never in the transcript.
+        # A resumed run keeps the table it was asked for unless --agents explicitly changes it,
+        # so `--resume` alone can't silently re-seat agents that were never in the transcript --
+        # but an agent dropped for a transient reason does get re-tested rather than written out.
         if args.agents is not None:
-            session.roster = list(roster)
-        roster = tuple(session.roster)
+            session.requested_roster = list(roster)
+        roster = tuple(session.requested_roster)
         args.output_dir = args.output_dir or str(resume_path.parent)
     else:
         workspace = Path(args.workspace or (self_dir if args.self else os.getcwd())
@@ -6074,9 +6085,11 @@ def main() -> int:
         args.output_dir = args.output_dir or ".roundtable"
     # Checked once the roster is settled (a resumed session can carry its own), so only the CLIs
     # this run will actually shell out to are required.
+    requested = roster
     roster = verify_clis(args.mock, roster, explicit=args.agents is not None)
     if resumed:
         session.roster = list(roster)
+        session.requested_roster = list(requested)
     if not workspace.is_dir():
         parser.error(f"workspace is not a directory: {workspace}")
     if args.self:
@@ -6119,7 +6132,8 @@ def main() -> int:
             # should survive that truncation rather than the boilerplate note leading it.
             request = f"{request}\n\n{SELF_EDIT_NOTE}\n\n{self_test_sandbox_note(sandbox)}"
         session = Session(request, str(workspace), args.rounds if args.rounds is not None else 1,
-                          datetime.now(timezone.utc).isoformat(), [], roster=list(roster))
+                          datetime.now(timezone.utc).isoformat(), [], roster=list(roster),
+                          requested_roster=list(requested))
     cls = MockAgent if args.mock else Agent
     elevated_all = "all" in args.elevated
     elevated = {
