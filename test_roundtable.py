@@ -7934,6 +7934,9 @@ class CheckAgentsTests(unittest.TestCase):
     single CLI by hand; that question is "who has credit left".
     """
 
+    # check_agents reads the module-level Agent at call time (cls = MockAgent if mock else
+    # Agent), which is what makes patching roundtable.Agent below work. Without that patch
+    # these tests would shell out to the real CLIs.
     class _CappedAgent(roundtable.Agent):
         def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
             raise RuntimeError(

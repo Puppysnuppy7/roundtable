@@ -125,7 +125,9 @@ Qwen        qwen    ready
 Usable now: --agents codex,aider,qwen
 ```
 
-It exits non-zero when nothing is usable, so it works as a scripted precondition.
+It exits non-zero when nothing is usable, so it works as a scripted precondition. It sends
+each installed agent the same one-word connectivity prompt a real run does — a real request
+against each provider, small enough to ignore occasionally but not free to poll in a loop.
 Aider is
 model-agnostic — it defaults to `mistral/codestral-latest` here specifically so it doesn't just
 duplicate one of the five lab-native agents; point `--aider-model` at a different provider if you'd

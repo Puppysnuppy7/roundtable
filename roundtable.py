@@ -5959,7 +5959,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="probe every installed agent CLI and report which ones can "
                              "actually take a turn right now — ready, out of quota, or "
                              "needing a login — then exit. --list-agents only answers "
-                             "whether they are installed")
+                             "whether they are installed. Sends each agent the same "
+                             "one-word connectivity prompt a real run does, so it is a "
+                             "real (if tiny) request against each provider — cheap to run, "
+                             "not free to poll in a loop")
     parser.add_argument("--strict-preflight", action="store_true",
                         help="fail the whole run if any agent fails the preliminary system "
                              "check, instead of dropping that agent and continuing with the "
