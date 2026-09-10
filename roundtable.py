@@ -4340,7 +4340,7 @@ def _wait_for_agent_availability(agent: Agent, on_tick: Callable[[str], None],
 def _run_with_retry(agent: Agent, prompt: str, on_tick: Callable[[str], None],
                     cancel_event: threading.Event | None = None, no_edit: bool = False,
                     suggested_effort: str | None = None,
-                    transient_retries: int = 1, on_limit: str = "wait") -> str:
+                    transient_retries: int = 1, on_limit: str = "drop") -> str:
     """Run one agent turn, recovering from transient failures and provider usage limits.
 
     Real CLI failures seen in practice during a long run (a nonzero exit, an empty response) are
@@ -4439,7 +4439,7 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
                         agent_speed: dict[str, list[float]] | None = None,
                         task_status_check: bool = False, reassign_idle: bool = False,
                         stagger: float | None = None, restart_vote_pending: bool = False,
-                        chat: bool = False, on_limit: str = "wait") -> str | None:
+                        chat: bool = False, on_limit: str = "drop") -> str | None:
     """Run one collaboration phase concurrently and record results deterministically.
 
     When agent_speed is provided, an agent running notably slower than the others (based on
@@ -4696,7 +4696,7 @@ def _run_sequential_phase(session: Session, agents: list[tuple[str, Agent]], pha
                           log_prompt: Callable[[str, str], None] = lambda *_: None,
                           task_status_check: bool = False,
                           restart_vote_pending: bool = False, chat: bool = False,
-                          on_limit: str = "wait") -> str | None:
+                          on_limit: str = "drop") -> str | None:
     """Run one collaboration phase as a live relay: each agent reads and builds on the one before it.
 
     Unlike the parallel phase, each agent's prompt is built right before it runs, after the previous
@@ -4920,7 +4920,7 @@ def synthesize(session: Session, order: list[tuple[str, Agent]],
                log_prompt: Callable[[str, str], None] = lambda *_: None,
                followup: bool = False,
                step_complete: Callable[[int], None] = lambda *_: None,
-               chat: bool = False, on_limit: str = "wait") -> str:
+               chat: bool = False, on_limit: str = "drop") -> str:
     """Produce the final answer as a relay: one agent drafts it, the rest refine it in turn,
     so the result is a merge shaped by all of them rather than the output of a single agent.
 
@@ -4991,7 +4991,7 @@ def run_dead_code_check(session: Session, name: str, agent: Agent,
                         tick: Callable[[str, str], None],
                         status: Callable[[Iterable[str], str], None],
                         log_prompt: Callable[[str, str], None] = lambda *_: None,
-                        on_limit: str = "wait") -> None:
+                        on_limit: str = "drop") -> None:
     """Run one agent through a dead-code sweep before the synthesis relay drafts the final answer.
 
     A soft failure here (the agent errors out) is not fatal to the run -- it just means synthesis
@@ -5019,8 +5019,15 @@ PREFLIGHT_PROMPT = ("This is a startup connectivity check, not the real task. Re
 
 
 def preflight_check(name: str, agent: Agent, tick: Callable[[str, str], None],
-                    cancel_event: threading.Event, timeout: float) -> tuple[bool, str]:
-    """Confirm one agent's CLI is authenticated and responsive within a bounded timeout."""
+                    cancel_event: threading.Event, timeout: float,
+                    on_limit: str = "drop") -> tuple[bool, str]:
+    """Confirm one agent's CLI is authenticated and responsive within a bounded timeout.
+
+    An agent that reports an exhausted quota here is only worth seating under on_limit="wait",
+    where the run will hold for its reset. Under "drop" it would be seated and then dropped on
+    its first turn anyway, so drop it now and spend nothing on the turn that was never going
+    to land.
+    """
     def authentication_failure(detail: str) -> tuple[bool, str]:
         executable = AGENT_EXECUTABLES.get(name, name.lower())
         recovery = {
@@ -5053,7 +5060,9 @@ def preflight_check(name: str, agent: Agent, tick: Callable[[str, str], None],
             return authentication_failure(auth_detail)
         limit_detail = usage_limit_detail(answer)
         if limit_detail:
-            return True, f"usage-limited; will wait during the task ({limit_detail})"
+            if on_limit == "wait":
+                return True, f"usage-limited; will wait during the task ({limit_detail})"
+            return False, f"out of quota ({limit_detail})"
         if any(line.casefold() == "ok" for line in lines):
             return True, "ready"
         detail = next((line for line in lines), "no response")
@@ -5070,7 +5079,9 @@ def preflight_check(name: str, agent: Agent, tick: Callable[[str, str], None],
             return False, f"timed out after {timeout:.0f}s"
         limit_detail = usage_limit_detail(str(exc))
         if limit_detail:
-            return True, f"usage-limited; will wait during the task ({limit_detail})"
+            if on_limit == "wait":
+                return True, f"usage-limited; will wait during the task ({limit_detail})"
+            return False, f"out of quota ({limit_detail})"
         message = str(exc).strip().splitlines()[0] if str(exc).strip() else "no response"
         return False, message
     finally:
@@ -5083,7 +5094,8 @@ def preflight_check(name: str, agent: Agent, tick: Callable[[str, str], None],
 def run_preflight(agents: list[tuple[str, Agent]], tick: Callable[[str, str], None],
                   status: Callable[[Iterable[str], str], None], timeout: float = 25.0,
                   stagger: float | None = None,
-                  strict: bool = False) -> list[tuple[str, Agent]]:
+                  strict: bool = False,
+                  on_limit: str = "drop") -> list[tuple[str, Agent]]:
     """Check every agent CLI is reachable before committing to the real task, and return
     the ones that answered.
 
@@ -5113,7 +5125,7 @@ def run_preflight(agents: list[tuple[str, Agent]], tick: Callable[[str, str], No
                     return False, f"timed out after {timeout:.0f}s"
                 return preflight_check(speaker, agent_obj,
                                        lambda spk, line: events.put((spk, line)),
-                                       cancel_evt, timeout)
+                                       cancel_evt, timeout, on_limit)
 
             futures[name] = pool.submit(_preflight_run)
         pending = set(names)
@@ -5169,7 +5181,7 @@ def _run_phase(runner: Callable[..., str | None], session: Session, agents: list
               agent_speed: dict[str, list[float]] | None,
               task_status_check: bool = False, reassign_idle: bool = False,
               stagger: float | None = None, restart_vote_pending: bool = False,
-              chat: bool = False, on_limit: str = "wait") -> str | None:
+              chat: bool = False, on_limit: str = "drop") -> str | None:
     """Dispatch to a phase runner, passing parallel-only knobs only to the parallel runner.
 
     Returns the name of an agent that marked TASK STATUS: complete this phase, if any — used by
@@ -5201,7 +5213,7 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
             dead_code_check: bool = False, chat: bool = False,
             checkpoint: Callable[[], None] = lambda: None,
             completed_phases: set[str] | None = None,
-            stagger: float | None = None, on_limit: str = "wait") -> None:
+            stagger: float | None = None, on_limit: str = "drop") -> None:
     # Chat mode never edits files, so a dead-code sweep (which needs edit rights) has nothing to
     # do; force it off regardless of what was requested/toggled rather than letting an agent get
     # edit rights for a coding-specific step that makes no sense in a plain-text discussion.
@@ -5467,7 +5479,8 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
         if not getattr(args, "skip_preflight", False):
             lineup = run_preflight(lineup, ui.tick, status,
                                    timeout=args.preflight_timeout,
-                                   strict=getattr(args, "strict_preflight", False))
+                                   strict=getattr(args, "strict_preflight", False),
+                                   on_limit=getattr(args, "on_limit", "drop"))
             # Narrow before conduct reads the roster and before save_session writes it,
             # so a resumed run does not re-seat an agent preflight already rejected.
             session.roster = [name for name, _agent in lineup]
@@ -5503,7 +5516,7 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
                    dead_code_check=args.dead_code_check, chat=getattr(args, "chat", False),
                    checkpoint=checkpoint,
                    completed_phases=completed_phases,
-                   on_limit=getattr(args, "on_limit", "wait"))
+                   on_limit=getattr(args, "on_limit", "drop"))
             ui.busy = False
             paths = save_session(session, output_dir)
             run_log.write(
@@ -5568,22 +5581,34 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
         run_log.close()
 
 
-def verify_clis(mock: bool, roster: tuple[str, ...] | None = None) -> None:
-    """Fail fast if a CLI this run needs isn't on PATH.
+def verify_clis(mock: bool, roster: tuple[str, ...] | None = None,
+                explicit: bool = True) -> tuple[str, ...]:
+    """Resolve the roster against what is actually on PATH, and return what survives.
 
-    Only the roster is required. Roundtable used to demand all six unconditionally, which made a
-    box with one unauthenticated or uninstalled CLI unable to start at all -- the check ran after
-    the options screen, so you configured a run and then watched it exit.
+    Roundtable used to demand all six CLIs unconditionally, and the check ran after the options
+    screen -- so on a box missing one you configured a whole run and then watched it exit.
+
+    A roster the user named explicitly stays strict: you asked for those agents, and a missing
+    or misspelled one should say so rather than quietly running something smaller. The implicit
+    default roster instead narrows to what is installed and says which agents it dropped, so a
+    partially-installed machine runs with what it has. Only an empty result is fatal.
     """
     if mock:
-        return
-    roster = roster or AGENT_NAMES
-    missing = [AGENT_EXECUTABLES[name] for name in roster
-               if not shutil.which(AGENT_EXECUTABLES[name])]
-    if missing:
+        return tuple(roster or AGENT_NAMES)
+    roster = tuple(roster or AGENT_NAMES)
+    missing = [name for name in roster if not shutil.which(AGENT_EXECUTABLES[name])]
+    if not missing:
+        return roster
+    listed = ", ".join(AGENT_EXECUTABLES[name] for name in missing)
+    present = tuple(name for name in roster if name not in missing)
+    if explicit or not present:
         raise SystemExit(
-            f"Missing required CLI(s): {', '.join(missing)}. Install them (roundtable --install), "
+            f"Missing required CLI(s): {listed}. Install them (roundtable --install), "
             f"or run only the agents you have with --agents (e.g. --agents auto).")
+    print(f"warning: skipping {listed} — not on PATH. "
+          f"Running with {', '.join(present)}; pass --agents to choose explicitly, or "
+          f"--agents all to require every agent.", file=sys.stderr)
+    return present
 
 
 def list_agents() -> str:
@@ -5699,7 +5724,7 @@ def restart_arguments(args: argparse.Namespace, session_path: Path,
     # so a --self run on a box that only has some of them would die at verify_clis mid-session.
     if getattr(args, "agents", None):
         command.extend(("--agents", args.agents))
-    if getattr(args, "on_limit", "wait") != "wait":
+    if getattr(args, "on_limit", "drop") != "drop":
         command.extend(("--on-limit", args.on_limit))
     if getattr(args, "strict_preflight", False):
         command.append("--strict-preflight")
@@ -5861,12 +5886,12 @@ def build_parser() -> argparse.ArgumentParser:
                              "provider whose quota is gone -- no longer blocks a run. 'auto' uses "
                              "whichever of the six are on PATH; 'all' (the default) uses every "
                              "agent. Order is always canonical, however you type it")
-    parser.add_argument("--on-limit", choices=("wait", "drop"), default="wait",
+    parser.add_argument("--on-limit", choices=("wait", "drop"), default="drop",
                         help="what to do when an agent hits its provider's usage limit "
-                             "mid-run: 'wait' (default) holds the round until the provider's "
-                             "reported reset time, which can be hours; 'drop' lets that agent "
-                             "leave the phase and finishes the round with the others. Ignored "
-                             "for a one-agent roster, which has no round left to save")
+                             "mid-run: 'drop' (default) lets that agent leave the round and "
+                             "finishes with the others; 'wait' holds the whole round until "
+                             "the provider's reported reset time, which can be hours. "
+                             "Ignored for a one-agent roster, which has no round left to save")
     parser.add_argument("--strict-preflight", action="store_true",
                         help="fail the whole run if any agent fails the preliminary system "
                              "check, instead of dropping that agent and continuing with the "
@@ -6049,7 +6074,9 @@ def main() -> int:
         args.output_dir = args.output_dir or ".roundtable"
     # Checked once the roster is settled (a resumed session can carry its own), so only the CLIs
     # this run will actually shell out to are required.
-    verify_clis(args.mock, roster)
+    roster = verify_clis(args.mock, roster, explicit=args.agents is not None)
+    if resumed:
+        session.roster = list(roster)
     if not workspace.is_dir():
         parser.error(f"workspace is not a directory: {workspace}")
     if args.self:
@@ -6153,7 +6180,8 @@ def main() -> int:
             if not args.skip_preflight:
                 lineup = run_preflight(lineup, tick, status,
                                        timeout=args.preflight_timeout,
-                                       strict=getattr(args, "strict_preflight", False))
+                                       strict=getattr(args, "strict_preflight", False),
+                                       on_limit=getattr(args, "on_limit", "drop"))
                 session.roster = [name for name, _agent in lineup]
             else:
                 run_log.write("info", "Preflight skipped by configuration")
@@ -6164,7 +6192,7 @@ def main() -> int:
                    reassign_idle=args.reassign_idle, synthesis_passes=args.synthesis_passes,
                    dead_code_check=args.dead_code_check, chat=getattr(args, "chat", False),
                    checkpoint=checkpoint, completed_phases=completed_phases,
-                   on_limit=getattr(args, "on_limit", "wait"))
+                   on_limit=getattr(args, "on_limit", "drop"))
             successful_paths = save_session(session, Path(args.output_dir))
             run_log.write(
                 "artifact",

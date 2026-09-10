@@ -1017,7 +1017,8 @@ class RoundtableTests(unittest.TestCase):
             ticks = []
             roundtable.run_preflight(
                 [("Claude", LimitedAgent("Claude", Path(td)))],
-                lambda name, line: ticks.append((name, line)), lambda *_: None)
+                lambda name, line: ticks.append((name, line)), lambda *_: None,
+                on_limit="wait")
         self.assertTrue(any("usage-limited; will wait" in line for _, line in ticks))
 
     def test_auth_required_detail_matches_agy_live_output(self):
@@ -5708,7 +5709,8 @@ class RoundtableTests(unittest.TestCase):
         agent = LimitedThenReadyAgent("Claude", Path("/tmp"))
         ticks = []
         with mock.patch.object(threading.Event, "wait", return_value=False) as wait_mock:
-            result = roundtable._run_with_retry(agent, "original task", ticks.append)
+            result = roundtable._run_with_retry(agent, "original task", ticks.append,
+                                                on_limit="wait")
         self.assertEqual(result, "completed original task")
         self.assertEqual(len(LimitedThenReadyAgent.task_prompts), 2)
         self.assertEqual(LimitedThenReadyAgent.probes, 2)
@@ -7554,12 +7556,13 @@ class UsageLimitPolicyTests(unittest.TestCase):
             waited.assert_not_called()
             self.assertEqual(agent.attempts, 1)
 
-    def test_wait_is_still_the_default_and_still_resends(self):
-        """The existing behavior has to stay exactly as it was unless drop is asked for."""
+    def test_wait_still_holds_the_seat_and_resends_when_asked_for(self):
+        """No longer the default, but it must still work exactly as it always did."""
         with tempfile.TemporaryDirectory() as td:
             agent = self._LimitedAgent("Codex", Path(td))
             with mock.patch.object(roundtable, "_wait_for_agent_availability") as waited:
-                content = roundtable._run_with_retry(agent, "do it", lambda _line: None)
+                content = roundtable._run_with_retry(agent, "do it", lambda _line: None,
+                                                     on_limit="wait")
             waited.assert_called_once()
             self.assertEqual(agent.attempts, 2)
             self.assertTrue(content)
@@ -7606,7 +7609,7 @@ class UsageLimitPolicyTests(unittest.TestCase):
     def test_on_limit_survives_a_self_restart(self):
         args = roundtable.argparse.Namespace(
             output_dir=None, collab="parallel", synthesizer="rotate",
-            synthesis_passes=6, rounds=1, workspace=None, agents=None, on_limit="drop",
+            synthesis_passes=6, rounds=1, workspace=None, agents=None, on_limit="wait",
             codex_model=None, claude_model=None, antigravity_model=None, aider_model=None,
             grok_model=None, qwen_model=None, reasoning_effort="auto", elevated=[],
             plain=False, mock=False, balance_load=False, task_status_check=False,
@@ -7614,12 +7617,12 @@ class UsageLimitPolicyTests(unittest.TestCase):
             extended_preflight=True, preflight_timeout=None, touch=None)
         setattr(args, "self", True)
         command = roundtable.restart_arguments(args, Path("/tmp/session.json"), followup=False)
-        self.assertEqual(command[command.index("--on-limit") + 1], "drop")
+        self.assertEqual(command[command.index("--on-limit") + 1], "wait")
 
     def test_default_run_emits_no_on_limit_flag_on_restart(self):
         args = roundtable.argparse.Namespace(
             output_dir=None, collab="parallel", synthesizer="rotate",
-            synthesis_passes=6, rounds=1, workspace=None, agents=None, on_limit="wait",
+            synthesis_passes=6, rounds=1, workspace=None, agents=None, on_limit="drop",
             codex_model=None, claude_model=None, antigravity_model=None, aider_model=None,
             grok_model=None, qwen_model=None, reasoning_effort="auto", elevated=[],
             plain=False, mock=False, balance_load=False, task_status_check=False,
@@ -7656,13 +7659,14 @@ class UsageLimitPolicyTests(unittest.TestCase):
                 roundtable.synthesize(session, [("Codex", capped)], lambda *_: None,
                                       lambda *_: None, on_limit="drop")
 
-    def test_a_capped_drafter_still_waits_under_the_default_policy(self):
+    def test_a_capped_drafter_waits_when_wait_is_asked_for(self):
         with tempfile.TemporaryDirectory() as td:
             capped = self._LimitedAgent("Codex", Path(td))
             order = [("Codex", capped), ("Grok", roundtable.MockAgent("Grok", Path(td)))]
             session = roundtable.Session("Solve it", td, 0, "now", [], roster=["Codex", "Grok"])
             with mock.patch.object(roundtable, "_wait_for_agent_availability") as waited:
-                final = roundtable.synthesize(session, order, lambda *_: None, lambda *_: None)
+                final = roundtable.synthesize(session, order, lambda *_: None, lambda *_: None,
+                                              on_limit="wait")
             waited.assert_called_once()
             self.assertTrue(final)
 
@@ -7812,6 +7816,62 @@ class PreflightDropsFailuresTests(unittest.TestCase):
         display.PANEL_NAMES = ("Codex", "Grok", "Final", "Code", "Console")
         display.set_roster([])
         self.assertEqual(display.roster, ("Codex", "Grok"))
+
+
+class DefaultBehaviorTests(unittest.TestCase):
+    """The defaults that make roundtable usable on a real, imperfect machine.
+
+    All three used to be all-or-nothing: every CLI installed, every CLI passing its check, and a
+    round that stopped dead on the first exhausted quota.
+    """
+
+    def test_on_limit_defaults_to_drop(self):
+        parser = roundtable.build_parser()
+        self.assertEqual(parser.parse_args(["objective"]).on_limit, "drop")
+
+    def test_a_capped_agent_is_dropped_without_being_asked(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = UsageLimitPolicyTests._LimitedAgent("Codex", Path(td))
+            with mock.patch.object(roundtable, "_wait_for_agent_availability") as waited:
+                with self.assertRaises(RuntimeError):
+                    roundtable._run_with_retry(agent, "do it", lambda _line: None)
+            waited.assert_not_called()
+
+    def test_preflight_drops_a_capped_agent_rather_than_seating_it(self):
+        """Under the drop policy a seated capped agent would be dropped on its first turn anyway,
+        so it costs a whole turn's latency to seat it."""
+        class LimitedAgent(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                raise RuntimeError(
+                    "Claude exited with status 1\n"
+                    "You've hit your session limit · resets 5:30pm (America/Chicago)")
+
+        with tempfile.TemporaryDirectory() as td:
+            agents = [("Claude", LimitedAgent("Claude", Path(td))),
+                      ("Codex", roundtable.MockAgent("Codex", Path(td)))]
+            survivors = roundtable.run_preflight(agents, lambda *_: None, lambda *_: None)
+            self.assertEqual([name for name, _ in survivors], ["Codex"])
+
+    def test_an_uninstalled_cli_narrows_the_default_roster_instead_of_exiting(self):
+        present = {"codex", "grok", "aider", "qwen", "agy"}  # claude missing
+        with mock.patch.object(roundtable.shutil, "which",
+                               side_effect=lambda exe: "/usr/bin/" + exe if exe in present else None):
+            roster = roundtable.verify_clis(False, roundtable.AGENT_NAMES, explicit=False)
+        self.assertNotIn("Claude", roster)
+        self.assertIn("Codex", roster)
+
+    def test_an_explicitly_named_missing_agent_still_fails_loudly(self):
+        """You asked for that agent by name; a typo or a missing install should say so."""
+        present = {"codex"}
+        with mock.patch.object(roundtable.shutil, "which",
+                               side_effect=lambda exe: "/usr/bin/" + exe if exe in present else None):
+            with self.assertRaises(SystemExit):
+                roundtable.verify_clis(False, ("Codex", "Claude"), explicit=True)
+
+    def test_nothing_installed_is_still_fatal_even_implicitly(self):
+        with mock.patch.object(roundtable.shutil, "which", return_value=None):
+            with self.assertRaises(SystemExit):
+                roundtable.verify_clis(False, roundtable.AGENT_NAMES, explicit=False)
 
 
 if __name__ == "__main__":

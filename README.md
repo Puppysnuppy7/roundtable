@@ -97,10 +97,16 @@ secret cannot accidentally land in shell history, command arguments, or piped lo
 
 ## Run it
 
-By default all six CLIs must already be installed and authenticated (`codex`, `claude`, `agy`,
-`aider`, `grok`, and `qwen`) — `roundtable --list-agents` reports which are currently found on
-`PATH`. To run with only some of them, name them with `--agents` (or `--agents auto` to take
-whichever are installed); only those are required, preflighted, given panels and given turns.
+Roundtable runs with whichever of its six agent CLIs (`codex`, `claude`, `agy`, `aider`, `grok`,
+`qwen`) are actually available right now. One that isn't installed is skipped with a warning,
+one that fails its startup check is dropped, and one that is out of quota leaves the round
+rather than holding it — only an empty table stops a run. `roundtable --list-agents` reports
+which are currently found on `PATH`.
+
+Name agents explicitly with `--agents codex,grok` when you want a specific table; an explicitly
+named agent that is missing is an error rather than a warning, since you asked for it. Use
+`--agents all` to require all six, and `--strict-preflight` to fail if any of them fails its
+check.
 Aider is
 model-agnostic — it defaults to `mistral/codestral-latest` here specifically so it doesn't just
 duplicate one of the five lab-native agents; point `--aider-model` at a different provider if you'd
@@ -147,10 +153,11 @@ Useful options:
                        empty table is fatal. Use this for scripted runs where a quietly
                        smaller table would be the wrong outcome.
 --on-limit wait|drop   What to do when an agent hits its provider's usage limit mid-run.
-                       "wait" (the default) holds the round until the provider's reported
-                       reset time, which can be hours; "drop" lets that agent leave the phase
-                       and finishes the round with the others. Ignored for a one-agent roster,
-                       which has no round left to save.
+                       "drop" (the default) lets that agent leave the round and finishes with
+                       the others, including at the final-answer stage, where a capped drafter
+                       hands the draft to the next agent. "wait" instead holds the whole round
+                       until the provider's reported reset time, which can be hours. Ignored
+                       for a one-agent roster, which has no round left to save.
 --self                 Point the workspace at roundtable's own source instead, so the agents can
                        improve roundtable itself (-C still overrides). Adds a standing note asking
                        agents to read the existing code, stay dependency-free, and run the test
