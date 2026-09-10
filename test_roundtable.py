@@ -3,6 +3,7 @@ import inspect
 import io
 import json
 import os
+import shlex
 import socket
 import subprocess
 import sys
@@ -3019,8 +3020,8 @@ class RoundtableTests(unittest.TestCase):
             # Exempt: flags that print something and exit rather than configuring a session,
             # plus --plain, which selects a UI rather than an option within one.
             and action.dest not in (
-                "plain", "list_agents", "check_agents", "status", "detach", "install",
-                "update", "bugsend", "list_keys", "auth_setup",
+                "plain", "list_agents", "check_agents", "status", "detach", "attach",
+                "install", "update", "bugsend", "list_keys", "auth_setup",
             )
         }
         toggle_names = {name for name, _ in roundtable.OPTION_TOGGLES}
@@ -8139,6 +8140,224 @@ class DetachedRunTests(unittest.TestCase):
         finished = subprocess.Popen([sys.executable, "-c", ""])
         finished.wait()
         return finished.pid
+
+
+class AttachTests(unittest.TestCase):
+    """--attach: watch a run go. --status says whether it is going; this says what it is doing."""
+
+    @staticmethod
+    def _log_line(kind: str, text: str) -> str:
+        return f"+     1.0s  {kind.upper():7s} {text}\n"
+
+    def test_prompt_and_board_dumps_are_hidden(self):
+        """A single phase can push hundreds of lines of prompt text past the progress line you were
+        watching for, which makes raw following useless."""
+        chunk = ("".join(self._log_line("PROMPT", f"prompt line {i}") for i in range(200))
+                 + self._log_line("PHASE", "[Codex] Step 1/3"))
+        filtered = roundtable.filter_log_chunk(chunk)
+        self.assertNotIn("prompt line", filtered)
+        self.assertIn("Step 1/3", filtered)
+
+    def test_progress_kinds_survive_filtering(self):
+        for kind in ("PHASE", "TICK", "INFO", "ERROR", "ARTIFACT", "CONFIG"):
+            with self.subTest(kind=kind):
+                line = self._log_line(kind, "something happened")
+                self.assertEqual(roundtable.filter_log_chunk(line), line)
+
+    def test_noise_kinds_are_recognised(self):
+        for kind in ("PROMPT", "BOARD", "DEBUG"):
+            with self.subTest(kind=kind):
+                self.assertTrue(roundtable.log_line_is_noise(self._log_line(kind, "x")))
+
+    def test_lines_that_are_not_log_records_pass_through(self):
+        """The log has a '# Roundtable run started ...' banner, and agent output can contain
+        anything at all -- neither should be silently eaten."""
+        for line in ("# Roundtable run started 2026-09-10\n", "plain text\n", "\n"):
+            with self.subTest(line=line):
+                self.assertFalse(roundtable.log_line_is_noise(line))
+
+    def test_attaching_with_nothing_recorded_says_so(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = io.StringIO()
+            code = roundtable.follow_run(Path(td), out=out)
+            self.assertEqual(code, 1)
+            self.assertIn("No runs recorded", out.getvalue())
+
+    def test_attaching_to_a_finished_run_shows_how_it_ended(self):
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session("Goal", td, 0, "2026-09-10T00:00:00+00:00", [])
+            roundtable.write_run_status(session, Path(td), "finished", "complete")
+            log = Path(td) / "roundtable-20260910-000000-000000.log"
+            log.write_text(self._log_line("PHASE", "[complete] Final answer complete"),
+                           encoding="utf-8")
+            out = io.StringIO()
+            code = roundtable.follow_run(Path(td), out=out)
+            self.assertEqual(code, 0)
+            self.assertIn("already finished", out.getvalue())
+            self.assertIn("Final answer complete", out.getvalue())
+
+    def test_attaching_to_a_failed_run_exits_non_zero(self):
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session("Goal", td, 0, "2026-09-10T00:00:00+00:00", [])
+            roundtable.write_run_status(session, Path(td), "failed", "everything broke")
+            out = io.StringIO()
+            self.assertEqual(roundtable.follow_run(Path(td), out=out), 1)
+
+    def test_following_stops_when_the_run_finishes(self):
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session("Goal", td, 0, "2026-09-10T00:00:00+00:00", [])
+            log = Path(td) / "roundtable-20260910-000000-000000.log"
+            log.write_text(self._log_line("PHASE", "working"), encoding="utf-8")
+            roundtable.write_run_status(session, Path(td), "running", "proposal")
+
+            calls = {"n": 0}
+            real_read = roundtable.read_run_statuses
+
+            def read_then_finish(output_dir):
+                calls["n"] += 1
+                if calls["n"] > 2:
+                    roundtable.write_run_status(session, Path(td), "finished", "complete")
+                return real_read(output_dir)
+
+            out = io.StringIO()
+            with mock.patch.object(roundtable, "read_run_statuses", side_effect=read_then_finish):
+                code = roundtable.follow_run(Path(td), poll=0.01, out=out)
+            self.assertEqual(code, 0)
+            self.assertIn("Run finished", out.getvalue())
+            self.assertIn("working", out.getvalue())
+
+    def test_detaching_leaves_the_run_alone(self):
+        """Attaching is read-only; stopping watching must not stop the run."""
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session("Goal", td, 0, "2026-09-10T00:00:00+00:00", [])
+            roundtable.write_run_status(session, Path(td), "running", "proposal")
+            (Path(td) / "roundtable-20260910-000000-000000.log").write_text("", encoding="utf-8")
+            out = io.StringIO()
+            code = roundtable.follow_run(Path(td), poll=0.01, out=out,
+                                         is_cancelled=lambda: True)
+            self.assertEqual(code, 0)
+            self.assertIn("keeps going", out.getvalue())
+            record = roundtable.read_run_statuses(Path(td))[0]
+            self.assertEqual(record["state"], "running")
+
+    def test_a_run_waiting_for_a_follow_up_says_so_and_returns(self):
+        """An interactive run parked at its follow-up prompt is not finished and not stuck."""
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session("Goal", td, 0, "2026-09-10T00:00:00+00:00", [])
+            (Path(td) / "roundtable-20260910-000000-000000.log").write_text("", encoding="utf-8")
+            roundtable.write_run_status(session, Path(td), "waiting", "waiting for a follow-up")
+            out = io.StringIO()
+            self.assertEqual(roundtable.follow_run(Path(td), poll=0.01, out=out), 0)
+            self.assertIn("Waiting for a follow-up", out.getvalue())
+
+    def test_waiting_still_gets_a_liveness_check(self):
+        """A session closed while parked at its prompt must read as died, not waiting forever."""
+        record = DetachedRunTests._record(state="waiting", pid=DetachedRunTests._unused_pid())
+        self.assertEqual(roundtable.describe_run_state(record), "died")
+        self.assertEqual(
+            roundtable.describe_run_state(DetachedRunTests._record(state="waiting")), "waiting")
+
+
+class RemoteInvocationTests(unittest.TestCase):
+    """--on HOST: run a reporting or detached-start command on another machine.
+
+    The shared output directory --status/--attach otherwise need is the one prerequisite a
+    tailscale-only laptop cannot satisfy, which is what made those commands local-only in practice.
+    """
+
+    def test_the_objective_survives_a_real_remote_shell(self):
+        """The one place in this program where a quoting bug is worse than a crash: ssh joins its
+        command words and hands the result to a shell on the far side."""
+        nasty = "it's $HOME; rm -rf /tmp/x && echo $(whoami)\nsecond line"
+        command = roundtable.remote_command("octopi", ["--detach", nasty])
+        self.assertEqual(command[0], "ssh")
+        self.assertEqual(command[1], "octopi")
+        # Run the assembled string through a real shell the way sshd would, and check the
+        # objective arrives as one argument, byte for byte.
+        script = "import sys, json; print(json.dumps(sys.argv[1:]))"
+        remote = command[2].replace("roundtable", f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}", 1)
+        output = subprocess.run(["/bin/sh", "-c", remote], capture_output=True, text=True)
+        self.assertEqual(json.loads(output.stdout), ["--detach", nasty])
+
+    def test_substitutions_are_not_executed_on_the_far_side(self):
+        command = roundtable.remote_command("octopi", ["--detach", "$(touch /tmp/pwned)"])
+        self.assertIn("'$(touch /tmp/pwned)'", command[2])
+
+    def test_the_on_flag_itself_is_not_forwarded(self):
+        for argv in (["--status", "--on", "octopi"], ["--status", "--on=octopi"]):
+            with self.subTest(argv=argv):
+                command = roundtable.remote_command("octopi", argv)
+                self.assertNotIn("--on", command[2])
+                self.assertIn("--status", command[2])
+                self.assertNotIn("octopi", command[2])
+
+    def test_a_bare_host_uses_roundtable_from_the_remote_path(self):
+        command = roundtable.remote_command("octopi", ["--status"])
+        self.assertTrue(command[2].startswith("roundtable "))
+
+    def test_an_explicit_path_is_used_instead_when_given(self):
+        """A non-interactive ssh PATH is not a login shell's, and this project has been bitten by a
+        PATH that looked right and wasn't."""
+        command = roundtable.remote_command("octopi:/opt/rt/roundtable.py", ["--status"])
+        self.assertEqual(command[1], "octopi")
+        self.assertTrue(command[2].startswith("/opt/rt/roundtable.py "))
+
+    def test_an_empty_host_is_rejected(self):
+        with self.assertRaises(ValueError):
+            roundtable.remote_command(":/opt/roundtable.py", ["--status"])
+
+    def test_ssh_transport_failure_is_not_reported_as_a_result(self):
+        """'no runs found' and 'could not reach the machine that has the runs' must not look
+        alike -- that is the same lying-about-state failure this feature is built to avoid."""
+        errors = io.StringIO()
+        with mock.patch.object(roundtable.shutil, "which", return_value="/usr/bin/ssh"), \
+             mock.patch.object(roundtable.subprocess, "call", return_value=255), \
+             contextlib.redirect_stderr(errors):
+            code = roundtable.run_remote("octopi", ["--status", "--on", "octopi"])
+        self.assertEqual(code, 255)
+        self.assertIn("could not reach octopi", errors.getvalue())
+
+    def test_a_missing_remote_roundtable_says_how_to_fix_it(self):
+        errors = io.StringIO()
+        with mock.patch.object(roundtable.shutil, "which", return_value="/usr/bin/ssh"), \
+             mock.patch.object(roundtable.subprocess, "call", return_value=127), \
+             contextlib.redirect_stderr(errors):
+            code = roundtable.run_remote("octopi", ["--status", "--on", "octopi"])
+        self.assertEqual(code, 127)
+        self.assertIn("--install", errors.getvalue())
+        self.assertIn("/path/to/roundtable.py", errors.getvalue())
+
+    def test_a_real_exit_code_passes_straight_through(self):
+        with mock.patch.object(roundtable.shutil, "which", return_value="/usr/bin/ssh"), \
+             mock.patch.object(roundtable.subprocess, "call", return_value=1):
+            self.assertEqual(roundtable.run_remote("octopi", ["--status"]), 1)
+
+    def test_missing_ssh_is_reported_rather_than_crashing(self):
+        errors = io.StringIO()
+        with mock.patch.object(roundtable.shutil, "which", return_value=None), \
+             contextlib.redirect_stderr(errors):
+            self.assertEqual(roundtable.run_remote("octopi", ["--status"]), 2)
+        self.assertIn("ssh client", errors.getvalue())
+
+    def test_an_interactive_run_over_on_is_refused(self):
+        """ssh without a tty gives curses nothing to draw on."""
+        errors = io.StringIO()
+        with mock.patch.object(sys, "argv", ["roundtable", "--on", "octopi", "do a thing"]), \
+             contextlib.redirect_stderr(errors):
+            with self.assertRaises(SystemExit):
+                roundtable.main()
+        self.assertIn("--detach --on", errors.getvalue())
+
+    def test_self_over_on_is_refused(self):
+        """--self over --on would edit the *remote* checkout: a different program than the one
+        being invoked, and sign-off territory per this repo's CLAUDE.md."""
+        errors = io.StringIO()
+        with mock.patch.object(sys, "argv",
+                               ["roundtable", "--detach", "--self", "--on", "octopi", "x"]), \
+             contextlib.redirect_stderr(errors):
+            with self.assertRaises(SystemExit):
+                roundtable.main()
+        self.assertIn("own roundtable checkout", errors.getvalue())
 
 
 if __name__ == "__main__":

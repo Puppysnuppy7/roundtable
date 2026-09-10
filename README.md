@@ -168,6 +168,11 @@ Useful options:
                        always canonical, however you type it. A one-agent roster is valid and
                        still produces a final answer. The roster is saved with the session, so
                        --resume reopens the same table.
+--on HOST              Run this command on another machine over ssh. Works with --status,
+                       --attach, --check-agents, --detach and --list-agents. Takes HOST or
+                       HOST:/path/to/roundtable.py.
+--attach               Follow the newest run in --output-dir and stop when it does.
+                       Read-only: Ctrl-C detaches without stopping the run.
 --detach               Run in the background and return the terminal immediately (implies
                        --plain). Check on it with --status. Survives the terminal, not the
                        machine.
@@ -563,6 +568,34 @@ running   work out why the checkout test is flaky
 The status file is written at every phase boundary, separately from the transcript, and is never
 read back by the run itself — if it goes missing or stale, `--status` says so and nothing else is
 affected.
+
+`--attach` follows the newest run's log as it goes and stops when it does. It is read-only, so
+detaching again (Ctrl-C) leaves the run going, and several people can watch the same run at once.
+Prompt and board dumps are hidden — a single phase can push hundreds of lines of prompt text past
+whatever you were watching for — and `--debug` shows the log unfiltered.
+
+### On another machine
+
+`--status` and `--attach` read a directory, so they work across machines that share one. When they
+don't share one, `--on HOST` runs the command over ssh instead:
+
+```bash
+roundtable --detach --on octopi "work out why the checkout test is flaky"
+roundtable --status --on octopi
+roundtable --attach --on octopi
+roundtable --check-agents --on optiplex          # which accounts have credit over there
+```
+
+`--on` takes `HOST` (using your ssh config, ProxyJump and all) or `HOST:/path/to/roundtable.py` for
+when roundtable isn't on that host's *non-interactive* ssh PATH, which is not the same as a login
+shell's. Reaching the wrong conclusion about a machine you can't contact is worse than failing, so
+an unreachable host and a missing remote roundtable each say exactly that rather than reporting an
+empty result.
+
+Only the reporting and detached-start commands can run remotely. An interactive session can't:
+ssh gives it no terminal to draw on — start it with `--detach --on` and watch it with `--attach
+--on` instead. `--self` over `--on` is refused too, since it would edit *that* machine's roundtable
+checkout rather than the one you invoked.
 
 **A detached run survives the terminal, not the machine.** It is detached from the controlling
 terminal's process group, so closing the terminal or logging out won't signal it — but it still

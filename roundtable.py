@@ -228,6 +228,7 @@ import math
 import os
 import queue
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -5525,6 +5526,12 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
     def status(active: Iterable[str], message: str) -> None:
         ui.update_status(active, message)
         ui.draw()
+        write_run_status(session, output_dir, "running", message)
+    # Interactive runs report progress too. "Show me my runs" that silently omitted every
+    # run started in the normal UI would be worse than no report at all -- and an
+    # interactive run over SSH on the always-on box is exactly the one worth checking from
+    # somewhere else.
+    write_run_status(session, output_dir, "running", "starting")
     try:
         ui.busy = True
         stdscr.nodelay(True)
@@ -5578,6 +5585,10 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
             ui.status = "Complete"
             ui.activity = {}
             drain_queued_prompts(session)
+            # Distinct from "finished": the round is done but the run is still open, sitting
+            # at the follow-up prompt. Someone checking from another machine wants to know it
+            # is waiting on them rather than still thinking.
+            write_run_status(session, output_dir, "waiting", "waiting for a follow-up")
             request = read_followup_ui(stdscr, ui)
             if not request and session.turns[-1].speaker != "User":
                 break
@@ -5585,6 +5596,7 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
                 session.turns.append(Turn("User", "follow-up", request))
             ui.status = "Continuing"
             followup = True
+        write_run_status(session, output_dir, "finished", "complete")
         return 0
     except SelfRestartRequired:
         preserve_prompt_board = True
@@ -5602,6 +5614,7 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
         ui.busy = False
         ui.status, ui.activity = "Cancelled", {}
         ui.log("Cancelled by user", kind="error")
+        write_run_status(session, output_dir, "cancelled", "cancelled")
         if session.turns:
             paths = save_session(session, output_dir)
             run_log.write("artifact", f"partial session saved json={paths[0]} markdown={paths[1]}")
@@ -5611,6 +5624,8 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
     except Exception as exc:
         ui.busy = False
         ui.status = "Could not complete the roundtable"
+        write_run_status(session, output_dir, "failed",
+                         str(exc).splitlines()[0] if str(exc).strip() else "failed")
         ui.error = textwrap.shorten(str(exc).replace("\n", " · "), width=240, placeholder="…")
         ui.log(f"ERROR: {exc}", kind="error")
         run_log.write("debug", traceback.format_exc())
@@ -5765,6 +5780,9 @@ def describe_run_state(record: dict, now: datetime | None = None) -> str:
     state = str(record.get("state", "unknown"))
     if state in ("finished", "failed", "cancelled"):
         return state
+    # "waiting" is live, not terminal -- an interactive run parked at the follow-up
+    # prompt. It gets the same liveness checks as "running" below, so a session whose
+    # terminal was closed while it waited reads as died rather than waiting forever.
     now = now or datetime.now(timezone.utc)
     try:
         updated = datetime.fromisoformat(str(record.get("updated_at")))
@@ -5774,9 +5792,10 @@ def describe_run_state(record: dict, now: datetime | None = None) -> str:
         updated = updated.replace(tzinfo=timezone.utc)
     age = (now - updated).total_seconds()
     same_host = str(record.get("host", "")) == socket.gethostname()
+    live = "waiting" if state == "waiting" else "running"
     if same_host:
-        return "running" if _process_is_running(int(record.get("pid", 0) or 0)) else "died"
-    return "running" if age < STATUS_STALE_AFTER_SECONDS else "stale"
+        return live if _process_is_running(int(record.get("pid", 0) or 0)) else "died"
+    return live if age < STATUS_STALE_AFTER_SECONDS else "stale"
 
 
 def read_run_statuses(output_dir: Path) -> list[dict]:
@@ -5869,6 +5888,187 @@ def start_detached(argv: list[str], output_dir: Path) -> tuple[int, Path]:
         # would leak a descriptor per detached run.
         handle.close()
     return process.pid, console
+
+
+# Log kinds --attach hides by default. The run log is a complete diagnostic record -- it contains
+# every prompt in full, and the shared prompt board reprinted each time it is read -- which makes
+# raw following unreadable: a single phase can push hundreds of lines of prompt text past whatever
+# progress line you were watching for. The full log is still on disk; --status prints its path.
+QUIET_LOG_KINDS = frozenset({"PROMPT", "BOARD", "DEBUG"})
+
+
+def log_line_is_noise(line: str, hidden: frozenset[str] = QUIET_LOG_KINDS) -> bool:
+    """Whether a run-log line is bulk diagnostic detail rather than progress.
+
+    RunLog.write emits "+{elapsed}s  {KIND:7s} {text}", one line per line of text, so a multi-line
+    prompt is many lines all carrying the same kind -- which is what makes prefix matching enough
+    to suppress the whole block.
+    """
+    if not line.startswith("+"):
+        return False
+    _, separator, rest = line.partition("s  ")
+    if not separator:
+        return False
+    return rest[:7].strip().upper() in hidden
+
+
+def filter_log_chunk(chunk: str, hidden: frozenset[str] = QUIET_LOG_KINDS) -> str:
+    """Drop noisy lines from a block of log text, preserving everything else verbatim."""
+    kept = [line for line in chunk.splitlines(keepends=True)
+            if not log_line_is_noise(line, hidden)]
+    return "".join(kept)
+
+
+def follow_run(output_dir: Path, poll: float = 0.5, out=None,
+               is_cancelled: Callable[[], bool] = lambda: False,
+               verbose: bool = False) -> int:
+    """Follow the newest run in a directory: print its log as it grows, stop when it stops.
+
+    --status answers "is it going"; this answers "what is it doing". Together they are what a
+    detached run needs to be usable, since the alternative is knowing a log path and remembering
+    the tail incantation.
+
+    Reads only. A run being followed is untouched by the following, so attaching from three
+    machines at once is fine, and detaching is just stopping.
+    """
+    out = out or sys.stdout
+    records = read_run_statuses(output_dir)
+    if not records:
+        print(f"No runs recorded in {output_dir}.", file=out, flush=True)
+        return 1
+    record = records[0]
+    log_path = Path(str(record.get("path", "")).replace(".status", ".log"))
+    objective = " ".join(str(record.get("objective", "")).split())
+    print(f"Following: {objective or '(no objective)'}", file=out, flush=True)
+    print(f"Log: {log_path}", file=out, flush=True)
+    state = describe_run_state(record)
+    if state in ("finished", "failed", "cancelled", "died", "stale"):
+        # Already over. Show how it ended rather than waiting for output that will never come.
+        print(f"This run is already {state}.", file=out, flush=True)
+        _print_log_tail(log_path, out, verbose=verbose)
+        return 0 if state == "finished" else 1
+    position = 0
+    try:
+        while True:
+            if is_cancelled():
+                print("Detached. The run keeps going; --status to check on it.",
+                      file=out, flush=True)
+                return 0
+            try:
+                with log_path.open("r", encoding="utf-8", errors="replace") as handle:
+                    handle.seek(position)
+                    chunk = handle.read()
+                    position = handle.tell()
+            except OSError:
+                chunk = ""
+            visible = filter_log_chunk(chunk) if not verbose else chunk
+            if visible:
+                print(visible, end="", file=out, flush=True)
+            latest = read_run_statuses(output_dir)
+            current = next((item for item in latest
+                            if item.get("path") == record.get("path")), None)
+            if current is None:
+                return 0
+            state = describe_run_state(current)
+            if state in ("finished", "failed", "cancelled", "died"):
+                print(f"\nRun {state}.", file=out, flush=True)
+                return 0 if state == "finished" else 1
+            if state == "waiting":
+                print("\nWaiting for a follow-up in its own terminal.", file=out, flush=True)
+                return 0
+            time.sleep(poll)
+    except KeyboardInterrupt:
+        print("\nDetached. The run keeps going; --status to check on it.", file=out, flush=True)
+        return 0
+
+
+def _print_log_tail(log_path: Path, out, lines: int = 40, verbose: bool = False) -> None:
+    """Last few lines of a finished run's log, so attaching to it still tells you something."""
+    try:
+        content = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        print(f"(no readable log at {log_path})", file=out, flush=True)
+        return
+    if not verbose:
+        content = [line for line in content if not log_line_is_noise(line)]
+    for line in content[-lines:]:
+        print(line, file=out, flush=True)
+
+
+# --on is only coherent for the commands that either report on a run or start one detached.
+# An interactive session over ssh has no terminal for curses to draw on, and --self over --on would
+# edit the *remote* box's roundtable checkout -- a different program than the one being invoked,
+# and sign-off territory per this repo's CLAUDE.md.
+REMOTE_CAPABLE_FLAGS = ("--status", "--attach", "--check-agents", "--detach", "--list-agents")
+
+
+def strip_remote_flag(argv: list[str]) -> list[str]:
+    """Remove --on/--on=HOST from an argument list, leaving what should run on the far side."""
+    remaining: list[str] = []
+    skip = False
+    for argument in argv:
+        if skip:
+            skip = False
+            continue
+        if argument == "--on":
+            skip = True
+            continue
+        if argument.startswith("--on="):
+            continue
+        remaining.append(argument)
+    return remaining
+
+
+def remote_command(target: str, argv: list[str]) -> list[str]:
+    """Build the ssh invocation that runs this command on another machine.
+
+    target is HOST or HOST:/path/to/roundtable.py. The bare form needs `roundtable` on the host's
+    *non-interactive* ssh PATH, which is not the same as a login shell's -- this project has been
+    bitten by a PATH that looked right and wasn't -- so the explicit path form exists for when it
+    isn't, and the caller reports that case clearly rather than passing on a bare 127.
+
+    Every argument is quoted: ssh concatenates its command words and hands the result to a remote
+    shell, so an objective containing quotes, $VARS or newlines would otherwise be reinterpreted
+    there. This is the one place in the program where a quoting mistake is worse than a crash.
+    """
+    host, separator, path = target.partition(":")
+    if not host:
+        raise ValueError("--on needs a host, e.g. --on octopi or --on octopi:/opt/roundtable.py")
+    executable = path if separator and path else "roundtable"
+    words = [executable] + strip_remote_flag(argv)
+    return ["ssh", host, " ".join(shlex.quote(word) for word in words)]
+
+
+def run_remote(target: str, argv: list[str]) -> int:
+    """Run this invocation on another machine, passing its output and exit code straight through.
+
+    ssh uses 255 for its own failures and 127 is the shell's "not found", so both are translated
+    into something actionable. Reporting either as an ordinary result would be the same
+    lying-about-state failure this feature exists to avoid: "no runs found" and "could not reach
+    the machine that has the runs" must not look alike.
+    """
+    try:
+        command = remote_command(target, argv)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if not shutil.which("ssh"):
+        print("--on needs an ssh client on PATH.", file=sys.stderr)
+        return 2
+    try:
+        code = subprocess.call(command)
+    except OSError as exc:
+        print(f"could not run ssh: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+    host = target.partition(":")[0]
+    if code == 255:
+        print(f"could not reach {host} over ssh — this says nothing about runs there.",
+              file=sys.stderr)
+    elif code == 127:
+        print(f"roundtable was not found on {host}'s ssh PATH. Install it there "
+              f"(ssh {host} roundtable --install), or point at it directly with "
+              f"--on {host}:/path/to/roundtable.py.", file=sys.stderr)
+    return code
 
 
 def positive_finite_float(value: str) -> float:
@@ -6149,6 +6349,17 @@ def build_parser() -> argparse.ArgumentParser:
                         help="report the runs recorded in --output-dir (default .roundtable) "
                              "— what they were asked to do, how far they got, and whether "
                              "they are still going — then exit")
+    parser.add_argument("--on", metavar="HOST",
+                        help="run this command on another machine over ssh, e.g. "
+                             "--status --on octopi, or --detach --on octopi \"task\". "
+                             "Takes HOST or HOST:/path/to/roundtable.py for when roundtable "
+                             "is not on that host's ssh PATH. Only the reporting and detached-"
+                             "start commands can run remotely; an interactive session cannot")
+    parser.add_argument("--attach", action="store_true",
+                        help="follow the newest run in --output-dir, printing its log as it "
+                             "goes, and stop when it does. Read-only: detaching again (Ctrl-C) "
+                             "leaves the run going. Prompt and board dumps are hidden; "
+                             "--debug shows the log unfiltered")
     parser.add_argument("--check-agents", action="store_true",
                         help="probe every installed agent CLI and report which ones can "
                              "actually take a turn right now — ready, out of quota, or "
@@ -6262,12 +6473,29 @@ def main() -> int:
         return install.main(remaining + extra)
     if remaining:
         parser.error(f"unrecognized arguments: {' '.join(remaining)}")
+    if args.on:
+        requested = [flag for flag in REMOTE_CAPABLE_FLAGS
+                     if getattr(args, flag.lstrip("-").replace("-", "_"), False)]
+        if not requested:
+            parser.error(
+                "--on works with " + ", ".join(REMOTE_CAPABLE_FLAGS) + ". An interactive "
+                "session needs a terminal ssh does not give it — use --detach --on to start "
+                "one there, then --status --on or --attach --on to watch it.")
+        if getattr(args, "self", False):
+            parser.error(
+                "--self with --on would edit that machine's own roundtable checkout, "
+                "which is a different program than the one you are running. Run it there "
+                "directly if that is what you mean.")
+        return run_remote(args.on, sys.argv[1:])
     if args.list_agents:
         print(list_agents())
         return 0
     if args.status:
         print(format_run_status(Path(args.output_dir or ".roundtable")))
         return 0
+    if args.attach:
+        return follow_run(Path(args.output_dir or ".roundtable"),
+                          verbose=getattr(args, "debug", False))
     if args.detach:
         # Validated here rather than in the child: a detached run that dies immediately on a
         # bad argument reports nothing useful, because nothing is watching its output.
