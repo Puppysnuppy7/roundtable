@@ -515,16 +515,78 @@ AGENT_EXECUTABLES: dict[str, str] = {
     "Aider": "aider", "Grok": "grok", "Qwen": "qwen",
 }
 
+# Lowercase spellings accepted by --agents, mapped back to the canonical display name. Built from
+# AGENT_NAMES so a new agent can never be selectable-but-unknown (or known-but-unselectable).
+AGENT_SLUGS: dict[str, str] = {name.lower(): name for name in AGENT_NAMES}
 
-def roster_awareness(speaker: str) -> str:
+
+class RosterError(ValueError):
+    """An --agents value that names nothing runnable."""
+
+
+def resolve_roster(spec: str | None, installed: Callable[[str], bool] | None = None
+                   ) -> tuple[str, ...]:
+    """Resolve an --agents value to the ordered subset of AGENT_NAMES that will take turns.
+
+    Roundtable's original contract was all six agents or nothing: verify_clis exits if any of the
+    six CLIs is missing, so a box where one is unauthenticated couldn't run at all, and a provider
+    whose quota was gone still got a seat. A roster makes "run the agents I actually have credit
+    for" expressible, which is the difference between reaching for roundtable and reaching for a
+    single CLI by hand.
+
+    None (the default) keeps every agent, so the historical behavior is unchanged unless asked for.
+    'all' is the same thing said explicitly. 'auto' keeps whichever CLIs are actually on PATH,
+    which is what makes a partially-installed machine usable instead of fatal.
+
+    Order always follows AGENT_NAMES, not the order given, so role rotation, synthesis order and
+    panel layout stay deterministic for a given set regardless of how it was typed.
+    """
+    if spec is None:
+        return AGENT_NAMES
+    on_path = installed if installed is not None else (
+        lambda name: shutil.which(AGENT_EXECUTABLES[name]) is not None)
+    normalized = spec.replace(",", " ").split()
+    if not normalized:
+        raise RosterError("--agents needs at least one agent name")
+    if len(normalized) == 1 and normalized[0].lower() in ("all", "auto"):
+        if normalized[0].lower() == "all":
+            return AGENT_NAMES
+        found = tuple(name for name in AGENT_NAMES if on_path(name))
+        if not found:
+            raise RosterError(
+                "--agents auto found none of the six agent CLIs on PATH; install at least one "
+                "(roundtable --install) or name the agents explicitly")
+        return found
+    chosen: list[str] = []
+    unknown: list[str] = []
+    for token in normalized:
+        name = AGENT_SLUGS.get(token.lower())
+        if name is None:
+            unknown.append(token)
+        elif name not in chosen:
+            chosen.append(name)
+    if unknown:
+        raise RosterError(
+            f"unknown agent(s): {', '.join(unknown)} — choose from "
+            f"{', '.join(sorted(AGENT_SLUGS))}, or 'all'/'auto'")
+    return tuple(name for name in AGENT_NAMES if name in chosen)
+
+
+def roster_awareness(speaker: str, roster: tuple[str, ...] | None = None) -> str:
     """Self-awareness block: name this agent and the other members of the table.
 
     Built only from AGENT_NAMES / AGENT_EXECUTABLES so prompt identity, --list-agents, and the
     CLIs a real run shells out to can never disagree. Empty for non-roster speakers (User, etc.).
+
+    roster is the subset actually taking turns this run (see resolve_roster). It must name only
+    the agents that will really speak: this block is what tells an agent who its peers are, and
+    it ends by forbidding invented peers -- so listing an agent that --agents excluded would have
+    roundtable itself inventing exactly the phantom colleagues it warns against.
     """
-    if speaker not in AGENT_NAMES:
+    roster = roster or AGENT_NAMES
+    if speaker not in roster:
         return ""
-    peers = [name for name in AGENT_NAMES if name != speaker]
+    peers = [name for name in roster if name != speaker]
     if not peers:
         return (
             f"\n\nYou are {speaker} (CLI `{AGENT_EXECUTABLES[speaker]}`), the sole member of this "
@@ -538,7 +600,7 @@ def roster_awareness(speaker: str) -> str:
         peers_sentence = f"The other members are {peer_list}."
     my_cli = AGENT_EXECUTABLES[speaker]
     return (
-        f"\n\nYou are {speaker} (CLI `{my_cli}`), one of {len(AGENT_NAMES)} members of this "
+        f"\n\nYou are {speaker} (CLI `{my_cli}`), one of {len(roster)} members of this "
         f"roundtable. {peers_sentence} Do not invent additional "
         "members or treat tools outside this roster as roundtable peers."
     )
@@ -614,6 +676,10 @@ class Session:
     # roundtable.py mid-run (see SelfRestartRequired). Persisted across restarts so the run stays
     # aware of its own edit-and-reload history instead of each new process looking pristine.
     restart_count: int = 0
+    # Which agents actually take turns (see resolve_roster). Persisted so --resume reopens the run
+    # with the same table it was recorded with: a two-agent transcript resumed as six would hand
+    # four agents a history they were never part of, and re-require four CLIs the box may not have.
+    roster: list[str] = field(default_factory=lambda: list(AGENT_NAMES))
 
 
 class SelfRestartRequired(RuntimeError):
@@ -1689,9 +1755,10 @@ DIBS_HINT = (
 )
 
 
-def extract_dibs(turns: list[Turn]) -> dict[str, str]:
+def extract_dibs(turns: list[Turn], roster: tuple[str, ...] | None = None) -> dict[str, str]:
     """Each named agent's most recent DIBS claim, later turns overriding earlier ones from the same
     agent — this is what each agent currently owns, not a full claim history."""
+    roster = roster or AGENT_NAMES
     claims: dict[str, str] = {}
     for turn in reversed(turns):
         if turn.speaker not in AGENT_NAMES or turn.speaker in claims:
@@ -1701,7 +1768,7 @@ def extract_dibs(turns: list[Turn]) -> dict[str, str]:
             claim = match.group(1).strip().strip("`*").strip()
             if claim:
                 claims[turn.speaker] = claim
-                if len(claims) == len(AGENT_NAMES):
+                if len(claims) == len(roster):
                     break
     return claims
 
@@ -1714,10 +1781,12 @@ class PromptContext:
     role_hints: dict[str, str]
     dibs_claims: dict[str, str]
     prompt_board_entries: str = ""
+    roster: tuple[str, ...] | None = None
 
 
 def prepare_prompt_context(objective: str, turns: list[Turn],
-                           workspace: Path | str | None = None, chat: bool = False) -> PromptContext:
+                           workspace: Path | str | None = None, chat: bool = False,
+                           roster: tuple[str, ...] | None = None) -> PromptContext:
     """Render and inspect a transcript once for prompts built from the same session state."""
     board_entries = extract_agent_prompt_entries(workspace) if workspace else ""
     return PromptContext(
@@ -1725,6 +1794,7 @@ def prepare_prompt_context(objective: str, turns: list[Turn],
         role_hints_for(objective, chat=chat),
         extract_dibs(turns),
         board_entries,
+        roster,
     )
 
 
@@ -1777,7 +1847,7 @@ def prompt_for(objective: str, turns: list[Turn], phase: str, speaker: str,
         board_entries_note = f"\n\nActive prompt board entries ({AGENT_PROMPT_FILE}):\n{context.prompt_board_entries}"
     status_hint = TASK_STATUS_HINT if task_status_check else ""
     vote_hint = RESTART_VOTE_HINT if restart_vote_pending and speaker in AGENT_NAMES else ""
-    awareness = roster_awareness(speaker)
+    awareness = roster_awareness(speaker, context.roster)
     return (f"{SYSTEM_BRIEF}{awareness}\n\nUSER OBJECTIVE:\n{objective}\n\nSHARED TRANSCRIPT:\n{history}\n\n"
            f"YOUR TURN ({speaker}, {phase}):\n{task}{role_hint}{dibs_note}{dibs_hint}{prompt_board_hint}"
            f"{board_entries_note}{scope}{status_hint}{vote_hint}")
@@ -1785,11 +1855,12 @@ def prompt_for(objective: str, turns: list[Turn], phase: str, speaker: str,
 
 
 def final_prompt(objective: str, turns: list[Turn], followup: bool = False,
-                 history: str | None = None, speaker: str = "", chat: bool = False) -> str:
+                 history: str | None = None, speaker: str = "", chat: bool = False,
+                 roster: tuple[str, ...] | None = None) -> str:
     focus = ("\nFocus on the user's latest follow-up request (the most recent 'User — follow-up' turn), "
              "consistent with the prior final answer where it still applies.\n" if followup else "")
     if chat:
-        return f"""{SYSTEM_BRIEF}{roster_awareness(speaker)}
+        return f"""{SYSTEM_BRIEF}{roster_awareness(speaker, roster)}
 
 USER QUESTION:
 {objective}
@@ -1803,7 +1874,7 @@ strongest points from all agents into clear, direct prose -- this is a discussio
 task, so do not use a task-outcome/Completed-Failed format. Resolve disagreements using evidence
 and say plainly where the group is uncertain rather than overstating confidence. Do not mention
 the roundtable process, the transcript, or these instructions. Return only the polished answer."""
-    return f"""{SYSTEM_BRIEF}{roster_awareness(speaker)}
+    return f"""{SYSTEM_BRIEF}{roster_awareness(speaker, roster)}
 
 USER OBJECTIVE:
 {objective}
@@ -1822,12 +1893,13 @@ polished answer."""
 
 
 def refine_prompt(objective: str, turns: list[Turn], draft: str, followup: bool = False,
-                  history: str | None = None, speaker: str = "", chat: bool = False) -> str:
+                  history: str | None = None, speaker: str = "", chat: bool = False,
+                  roster: tuple[str, ...] | None = None) -> str:
     """Ask an agent to edit another agent's draft final answer rather than write it from scratch."""
     focus = ("\nFocus on the user's latest follow-up request (the most recent 'User — follow-up' turn), "
              "consistent with the prior final answer where it still applies.\n" if followup else "")
     if chat:
-        return f"""{SYSTEM_BRIEF}{roster_awareness(speaker)}
+        return f"""{SYSTEM_BRIEF}{roster_awareness(speaker, roster)}
 
 USER QUESTION:
 {objective}
@@ -1846,7 +1918,7 @@ not introduce a task-outcome/Completed-Failed format. Do not report something as
 discussion supports it.
 Do not mention the roundtable process, the transcript, these instructions, or that this is a draft or someone else's work.
 Return only the polished answer."""
-    return f"""{SYSTEM_BRIEF}{roster_awareness(speaker)}
+    return f"""{SYSTEM_BRIEF}{roster_awareness(speaker, roster)}
 
 USER OBJECTIVE:
 {objective}
@@ -1868,13 +1940,13 @@ Return only the polished answer."""
 
 
 def dead_code_check_prompt(objective: str, turns: list[Turn], history: str | None = None,
-                           speaker: str = "") -> str:
+                           speaker: str = "", roster: tuple[str, ...] | None = None) -> str:
     """Ask one agent to sweep for now-unused code before the final answer is drafted.
 
     Unlike final_prompt/refine_prompt (prose only, no_edit=True), this turn keeps edit rights: a
     dead function found here needs to actually be deleted, not just mentioned in the write-up.
     """
-    return f"""{SYSTEM_BRIEF}{roster_awareness(speaker)}
+    return f"""{SYSTEM_BRIEF}{roster_awareness(speaker, roster)}
 
 USER OBJECTIVE:
 {objective}
@@ -1893,7 +1965,8 @@ what you found and did in a few sentences -- do not write the final answer here.
 
 
 def reassignment_prompt(objective: str, turns: list[Turn], phase: str, speaker: str,
-                        remaining: Iterable[str]) -> str:
+                        remaining: Iterable[str],
+                        roster: tuple[str, ...] | None = None) -> str:
     """Prompt for an agent that finished its turn while others in the same phase are still working:
     pick up different unclaimed work, or help a specific agent still in progress, instead of idling
     until the round closes."""
@@ -1902,7 +1975,7 @@ def reassignment_prompt(objective: str, turns: list[Turn], phase: str, speaker: 
     dibs_claims = extract_dibs(turns)
     claimed_note = ("; ".join(f"{name} has dibs on {claim}" for name, claim in dibs_claims.items())
                     if dibs_claims else "nothing yet claimed by name")
-    awareness = roster_awareness(speaker)
+    awareness = roster_awareness(speaker, roster)
     return (f"{SYSTEM_BRIEF}{awareness}\n\nUSER OBJECTIVE:\n{objective}\n\nSHARED TRANSCRIPT:\n{history}\n\n"
            f"YOUR TURN ({speaker}, {phase} · extra):\n"
            f"You already finished your part of this round while {still_working} are still working "
@@ -2011,9 +2084,17 @@ def load_session(path: Path) -> Session:
     restart_count = data.get("restart_count", 0)
     if not isinstance(restart_count, int) or isinstance(restart_count, bool) or restart_count < 0:
         raise ValueError("session field 'restart_count' must be a non-negative int")
+    # Sessions written before --agents existed have no roster; they were six-agent runs by
+    # definition, so absent means all six rather than an error.
+    roster = data.get("roster", list(AGENT_NAMES))
+    if (not isinstance(roster, list) or not roster
+            or any(name not in AGENT_NAMES for name in roster)):
+        raise ValueError(
+            f"session field 'roster' must be a non-empty list drawn from {', '.join(AGENT_NAMES)}")
     return Session(data["objective"], data["workspace"], data["rounds"],
                    data["started_at"], turns, final, queued_prompts=queued_prompts,
-                   restart_count=restart_count)
+                   restart_count=restart_count,
+                   roster=[name for name in AGENT_NAMES if name in roster])
 
 
 class RunLog:
@@ -2286,15 +2367,24 @@ class Display:
         self.started = time.monotonic()
         self.touch_mode = touch_mode
         self.hitboxes: dict[str, tuple[int, int, int, int]] = {}
-        self.scroll = {"Codex": 0, "Claude": 0, "Antigravity": 0, "Aider": 0, "Grok": 0, "Qwen": 0,
-                      "Final": 0, "Console": 0, "Code": 0}
+        # Instance-level overrides of the class roster attributes, narrowed to the agents actually
+        # playing. agent_grid() already lays panels out from a count, so a smaller table simply
+        # gets larger panels; the class attributes stay intact as "every agent roundtable knows".
+        roster = tuple(session.roster) or AGENT_NAMES
+        self.roster = roster
+        self.AGENTS = tuple(entry for entry in Display.AGENTS if entry[0] in roster)
+        self.PANEL_NAMES = tuple(name for name in Display.PANEL_NAMES
+                                 if name in roster or name in ("Final", "Code", "Console"))
+        self.SCROLL_NAMES = self.PANEL_NAMES
+        self.scroll = {name: 0 for name in
+                       tuple(roster) + ("Final", "Console", "Code")}
         # Keep activity visible when the operator has scrolled away from a live tail.
         self.unread = {name: 0 for name in self.scroll}
         self.expanded: str | None = None
         self.focused_panel: str | None = None
         self.show_help = False
         self.console_filter = 0
-        self.usage_names = ("Codex", "Claude", "Antigravity", "Aider", "Grok", "Qwen")
+        self.usage_names = roster
         self.turn_times: dict[str, list[float]] = {name: [] for name in self.usage_names}
         self.turn_outputs: dict[str, list[int]] = {name: [] for name in self.usage_names}
         self.activity_pulses: dict[str, deque[float]] = {
@@ -3387,9 +3477,10 @@ class Display:
             agent_turns[turn.speaker] += 1
 
         # Calculate average completion rate
-        total_agents = len(AGENT_NAMES)
+        roster = getattr(self, 'roster', AGENT_NAMES)
+        total_agents = len(roster)
         active_agents = len(self.active) if hasattr(self, 'active') else 0
-        completed_agents = len([name for name in AGENT_NAMES
+        completed_agents = len([name for name in roster
                                 if agent_turns.get(name, 0) > 0])
 
         return {
@@ -4340,7 +4431,7 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
     by_name = dict(agents)
     status(names, message)
     context = prepare_prompt_context(session.objective, session.turns, workspace=session.workspace,
-                                     chat=chat)
+                                     chat=chat, roster=tuple(session.roster))
     prompts = {
         name: prompt_for(session.objective, session.turns, phase, name, sequential=False,
                          scope=scope_hint(name, agent_speed) if agent_speed is not None else "",
@@ -4455,7 +4546,8 @@ def _run_parallel_phase(session: Session, agents: list[tuple[str, Agent]], phase
                                 for done_name, content in finished_results.items()
                             )
                             bonus_prompt = reassignment_prompt(
-                                session.objective, partial_turns, phase, name, remaining)
+                                session.objective, partial_turns, phase, name, remaining,
+                                roster=tuple(session.roster))
                             log_prompt(name, bonus_prompt)
                             tick(name, f"picking up extra work while "
                                         f"{', '.join(sorted(remaining))} finish")
@@ -4579,7 +4671,7 @@ def _run_sequential_phase(session: Session, agents: list[tuple[str, Agent]], pha
     for name, agent in agents:
         status([name], message)
         context = prepare_prompt_context(session.objective, session.turns, workspace=session.workspace,
-                                         chat=chat)
+                                         chat=chat, roster=tuple(session.roster))
         prompt = prompt_for(session.objective, session.turns, phase, name, sequential=True,
                             task_status_check=task_status_check,
                             restart_vote_pending=restart_vote_pending,
@@ -4711,6 +4803,20 @@ def phase_work_units(runner: Callable[..., None], agent_count: int = len(AGENT_N
     return agent_count if runner is _run_sequential_phase else 1
 
 
+def roster_agents(session: Session, codex: Agent, claude: Agent, antigravity: Agent, aider: Agent,
+                  grok: Agent, qwen: Agent) -> list[tuple[str, Agent]]:
+    """The (name, agent) pairs actually playing this run, in canonical order.
+
+    All six Agent objects are always constructed and passed around -- the call graph is built on
+    six-argument signatures -- so this is what narrows them to session.roster wherever "who is at
+    the table" is the real question.
+    """
+    everyone = [("Codex", codex), ("Claude", claude), ("Antigravity", antigravity),
+                ("Aider", aider), ("Grok", grok), ("Qwen", qwen)]
+    roster = tuple(session.roster) or AGENT_NAMES
+    return [pair for pair in everyone if pair[0] in roster]
+
+
 def pick_synthesizer(choice: str, session: Session, codex: Agent, claude: Agent, antigravity: Agent,
                      aider: Agent, grok: Agent, qwen: Agent) -> tuple[str, Agent]:
     """Choose who writes the final answer.
@@ -4718,11 +4824,12 @@ def pick_synthesizer(choice: str, session: Session, codex: Agent, claude: Agent,
     'rotate' spreads the role across agents by objective instead of always favoring one model,
     so the same session stays consistent across follow-ups while different sessions vary.
     """
-    options = [("Codex", codex), ("Claude", claude), ("Antigravity", antigravity), ("Aider", aider),
-              ("Grok", grok), ("Qwen", qwen)]
-    by_name = {"codex": 0, "claude": 1, "antigravity": 2, "aider": 3, "grok": 4, "qwen": 5}
+    options = roster_agents(session, codex, claude, antigravity, aider, grok, qwen)
+    by_name = {name.lower(): index for index, (name, _) in enumerate(options)}
     if choice in by_name:
         return options[by_name[choice]]
+    # An explicit --synthesizer naming an agent this run excluded can't draft: it never took a
+    # turn and has no context to synthesize from. Fall through to the rotation over the roster.
     index = int(hashlib.sha256(session.objective.encode()).hexdigest(), 16) % len(options)
     return options[index]
 
@@ -4745,8 +4852,7 @@ def synthesis_order(choice: str, session: Session, codex: Agent, claude: Agent, 
     preferred_first, when it names a live agent, overrides the drafter — used after an agent marks
     TASK STATUS: complete so the agent that finished the work writes the first draft.
     """
-    options = [("Codex", codex), ("Claude", claude), ("Antigravity", antigravity), ("Aider", aider),
-              ("Grok", grok), ("Qwen", qwen)]
+    options = roster_agents(session, codex, claude, antigravity, aider, grok, qwen)
     by_name = {name: agent for name, agent in options}
     if preferred_first and preferred_first in by_name:
         first_name, first_agent = preferred_first, by_name[preferred_first]
@@ -4754,8 +4860,11 @@ def synthesis_order(choice: str, session: Session, codex: Agent, claude: Agent, 
         first_name, first_agent = pick_synthesizer(choice, session, codex, claude, antigravity, aider,
                                                    grok, qwen)
     rest = [pair for pair in options if pair[0] != first_name]
-    index = int(hashlib.sha256((session.objective + first_name).encode()).hexdigest(), 16) % len(rest)
-    rest = rest[index:] + rest[:index]
+    # A one-agent roster has no refiners to rotate; the drafter is the whole relay.
+    if rest:
+        index = int(
+            hashlib.sha256((session.objective + first_name).encode()).hexdigest(), 16) % len(rest)
+        rest = rest[index:] + rest[:index]
     passes = max(1, min(passes, len(options)))
     return ([(first_name, first_agent)] + rest)[:passes]
 
@@ -4776,10 +4885,12 @@ def synthesize(session: Session, order: list[tuple[str, Agent]],
         status([name], f"{name} is {verb} the final answer")
         prompt = (
             final_prompt(
-                session.objective, session.turns, followup, history, speaker=name, chat=chat
+                session.objective, session.turns, followup, history, speaker=name, chat=chat,
+                roster=tuple(session.roster)
             ) if index == 0 else
             refine_prompt(
-                session.objective, session.turns, draft, followup, history, speaker=name, chat=chat
+                session.objective, session.turns, draft, followup, history, speaker=name,
+                chat=chat, roster=tuple(session.roster)
             )
         )
         log_prompt(name, prompt)
@@ -4822,7 +4933,8 @@ def run_dead_code_check(session: Session, name: str, agent: Agent,
     """
     status([name], f"{name} is checking for dead code")
     prompt = dead_code_check_prompt(
-        session.objective, session.turns, transcript(session.turns), speaker=name
+        session.objective, session.turns, transcript(session.turns), speaker=name,
+        roster=tuple(session.roster)
     )
     log_prompt(name, prompt)
     try:
@@ -5017,8 +5129,14 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
     # anything else (a brand-new objective, or a plain --resume of a run that already exited)
     # starts a fresh board. See start_agent_prompt_file.
     start_agent_prompt_file(Path(session.workspace), fresh=completed_phases is None)
-    agents = [("Codex", codex), ("Claude", claude), ("Antigravity", antigravity), ("Aider", aider),
-             ("Grok", grok), ("Qwen", qwen)]
+    # Single chokepoint for who is actually at the table: every phase runner, DIBS tally and
+    # progress count downstream iterates this list, so filtering here is what makes --agents real
+    # without reshaping the six-argument signatures the whole call graph is built on.
+    roster = tuple(session.roster) or AGENT_NAMES
+    agents = [(name, agent) for name, agent in
+              (("Codex", codex), ("Claude", claude), ("Antigravity", antigravity),
+               ("Aider", aider), ("Grok", grok), ("Qwen", qwen))
+              if name in roster]
     agent_speed: dict[str, list[float]] | None = {} if balance_load else None
     phase = "followup-proposal" if followup else "proposal"
     proposal_runner = _run_sequential_phase if collab == "sequential" else _run_parallel_phase
@@ -5240,7 +5358,8 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
     # this one does, or a crash here loses the very session state it exists to protect.
     output_dir = Path(getattr(args, "output_dir", None) or ".roundtable")
     run_log = RunLog(log_path_for(session, output_dir))
-    agents = (codex, claude, antigravity, aider, grok, qwen)
+    lineup = roster_agents(session, codex, claude, antigravity, aider, grok, qwen)
+    agents = tuple(agent for _name, agent in lineup)
     attach_agent_diagnostics(run_log, agents)
     log_run_context(run_log, args, session, agents, resumed, completed_phases)
     touch_mode = getattr(args, "touch_mode", None)
@@ -5259,9 +5378,7 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
         ui.busy = True
         stdscr.nodelay(True)
         if not getattr(args, "skip_preflight", False):
-            run_preflight([("Codex", codex), ("Claude", claude), ("Antigravity", antigravity),
-                           ("Aider", aider), ("Grok", grok), ("Qwen", qwen)],
-                          ui.tick, status, timeout=args.preflight_timeout)
+            run_preflight(lineup, ui.tick, status, timeout=args.preflight_timeout)
         else:
             run_log.write("info", "Preflight skipped by configuration")
             ui.log("Preflight skipped by configuration", kind="phase")
@@ -5357,12 +5474,22 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
         run_log.close()
 
 
-def verify_clis(mock: bool) -> None:
+def verify_clis(mock: bool, roster: tuple[str, ...] | None = None) -> None:
+    """Fail fast if a CLI this run needs isn't on PATH.
+
+    Only the roster is required. Roundtable used to demand all six unconditionally, which made a
+    box with one unauthenticated or uninstalled CLI unable to start at all -- the check ran after
+    the options screen, so you configured a run and then watched it exit.
+    """
     if mock:
         return
-    missing = [executable for executable in AGENT_EXECUTABLES.values() if not shutil.which(executable)]
+    roster = roster or AGENT_NAMES
+    missing = [AGENT_EXECUTABLES[name] for name in roster
+               if not shutil.which(AGENT_EXECUTABLES[name])]
     if missing:
-        raise SystemExit(f"Missing required CLI(s): {', '.join(missing)}")
+        raise SystemExit(
+            f"Missing required CLI(s): {', '.join(missing)}. Install them (roundtable --install), "
+            f"or run only the agents you have with --agents (e.g. --agents auto).")
 
 
 def list_agents() -> str:
@@ -5474,6 +5601,10 @@ def restart_arguments(args: argparse.Namespace, session_path: Path,
                     str(args.synthesis_passes), "--skip-preflight"))
     if getattr(args, "rounds", None) is not None:
         command.extend(("--rounds", str(args.rounds)))
+    # Without this the restarted process resolves an all-six roster and re-requires all six CLIs,
+    # so a --self run on a box that only has some of them would die at verify_clis mid-session.
+    if getattr(args, "agents", None):
+        command.extend(("--agents", args.agents))
     if getattr(args, "workspace", None):
         command.extend(("--workspace", str(args.workspace)))
     for option, value in (("--codex-model", args.codex_model),
@@ -5625,6 +5756,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--debug", action="store_true",
                         help="enable verbose diagnostic logging of agent sub-processes, PIDs, exit codes, and tracebacks")
     parser.add_argument("--mock", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--agents", default=None, metavar="LIST",
+                        help="which agents take part, comma-separated (e.g. --agents codex,grok). "
+                             "Only the named CLIs are required, preflighted, given panels and "
+                             "given turns, so a box where some agents aren't installed -- or a "
+                             "provider whose quota is gone -- no longer blocks a run. 'auto' uses "
+                             "whichever of the six are on PATH; 'all' (the default) uses every "
+                             "agent. Order is always canonical, however you type it")
     parser.add_argument("--list-agents", action="store_true",
                         help="print which of the six known AI CLIs (the other agents in the "
                              "roundtable) are installed on this machine, then exit without "
@@ -5769,7 +5907,10 @@ def main() -> int:
     if args.preflight_timeout is None:
         args.preflight_timeout = (EXTENDED_PREFLIGHT_TIMEOUT_SECONDS if args.extended_preflight
                                   else DEFAULT_PREFLIGHT_TIMEOUT_SECONDS)
-    verify_clis(args.mock)
+    try:
+        roster = resolve_roster(args.agents)
+    except RosterError as exc:
+        parser.error(str(exc))
     self_dir = Path(__file__).resolve().parent
     resumed = args.resume is not None
     if args.continue_after_restart and not resumed:
@@ -5785,11 +5926,19 @@ def main() -> int:
         session.workspace = str(workspace)
         if args.rounds is not None:
             session.rounds = args.rounds
+        # A resumed run keeps the table it was recorded with unless --agents explicitly changes it,
+        # so `--resume` alone can't silently re-seat four agents that were never in the transcript.
+        if args.agents is not None:
+            session.roster = list(roster)
+        roster = tuple(session.roster)
         args.output_dir = args.output_dir or str(resume_path.parent)
     else:
         workspace = Path(args.workspace or (self_dir if args.self else os.getcwd())
                          ).expanduser().resolve()
         args.output_dir = args.output_dir or ".roundtable"
+    # Checked once the roster is settled (a resumed session can carry its own), so only the CLIs
+    # this run will actually shell out to are required.
+    verify_clis(args.mock, roster)
     if not workspace.is_dir():
         parser.error(f"workspace is not a directory: {workspace}")
     if args.self:
@@ -5832,7 +5981,7 @@ def main() -> int:
             # should survive that truncation rather than the boilerplate note leading it.
             request = f"{request}\n\n{SELF_EDIT_NOTE}\n\n{self_test_sandbox_note(sandbox)}"
         session = Session(request, str(workspace), args.rounds if args.rounds is not None else 1,
-                          datetime.now(timezone.utc).isoformat(), [])
+                          datetime.now(timezone.utc).isoformat(), [], roster=list(roster))
     cls = MockAgent if args.mock else Agent
     elevated_all = "all" in args.elevated
     elevated = {
@@ -5870,7 +6019,8 @@ def main() -> int:
         except (AttributeError, ValueError):
             pass
         run_log = RunLog(log_path_for(session, Path(args.output_dir)))
-        agents = (codex, claude, antigravity, aider, grok, qwen)
+        lineup = roster_agents(session, codex, claude, antigravity, aider, grok, qwen)
+        agents = tuple(agent for _name, agent in lineup)
         attach_agent_diagnostics(run_log, agents)
         log_run_context(run_log, args, session, agents, resumed, completed_phases)
         summary = config_summary(args)
@@ -5890,9 +6040,7 @@ def main() -> int:
             run_log.write("prompt", f"[{name}] PROMPT:\n{prompt}")
         try:
             if not args.skip_preflight:
-                run_preflight([("Codex", codex), ("Claude", claude), ("Antigravity", antigravity),
-                               ("Aider", aider), ("Grok", grok), ("Qwen", qwen)],
-                              tick, status, timeout=args.preflight_timeout)
+                run_preflight(lineup, tick, status, timeout=args.preflight_timeout)
             else:
                 run_log.write("info", "Preflight skipped by configuration")
             conduct(session, codex, claude, antigravity, aider, grok, qwen, tick, status,

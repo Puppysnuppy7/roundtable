@@ -7353,5 +7353,176 @@ class RoundtableTests(unittest.TestCase):
         self.assertIn("⚡", rendered, "Self-awareness indicator should appear in agent panel for self sessions")
 
 
+class RosterSelectionTests(unittest.TestCase):
+    """--agents: run a subset of the table.
+
+    Roundtable's original contract was all six agents or nothing -- verify_clis exited if any of
+    the six CLIs was missing, and a provider whose quota was gone still got a seat and blocked the
+    round. These cover the subset actually taking turns, and the places that used to assume six.
+    """
+
+    def test_resolve_roster_defaults_to_every_agent(self):
+        self.assertEqual(roundtable.resolve_roster(None), roundtable.AGENT_NAMES)
+        self.assertEqual(roundtable.resolve_roster("all"), roundtable.AGENT_NAMES)
+
+    def test_resolve_roster_accepts_names_in_any_case_or_separator(self):
+        for spec in ("codex,grok", "Grok, Codex", "GROK codex", "codex,grok,codex"):
+            with self.subTest(spec=spec):
+                self.assertEqual(roundtable.resolve_roster(spec), ("Codex", "Grok"))
+
+    def test_resolve_roster_returns_canonical_order_not_typed_order(self):
+        """Role rotation, synthesis order and panel layout all key off position, so a given set
+        must resolve identically however it was typed."""
+        self.assertEqual(roundtable.resolve_roster("qwen,claude"), ("Claude", "Qwen"))
+        self.assertEqual(roundtable.resolve_roster("claude,qwen"), ("Claude", "Qwen"))
+
+    def test_resolve_roster_rejects_unknown_and_empty(self):
+        with self.assertRaises(roundtable.RosterError) as ctx:
+            roundtable.resolve_roster("codex,gpt5")
+        self.assertIn("gpt5", str(ctx.exception))
+        with self.assertRaises(roundtable.RosterError):
+            roundtable.resolve_roster("   ")
+
+    def test_resolve_roster_auto_keeps_only_installed_agents(self):
+        installed = {"Codex", "Qwen"}
+        self.assertEqual(roundtable.resolve_roster("auto", installed=installed.__contains__),
+                         ("Codex", "Qwen"))
+
+    def test_resolve_roster_auto_with_nothing_installed_is_an_error(self):
+        with self.assertRaises(roundtable.RosterError) as ctx:
+            roundtable.resolve_roster("auto", installed=lambda _name: False)
+        self.assertIn("PATH", str(ctx.exception))
+
+    def test_verify_clis_only_requires_the_roster(self):
+        """The whole point: a box missing four CLIs can still run the two it has."""
+        present = {"codex", "grok"}
+        with mock.patch.object(roundtable.shutil, "which",
+                               side_effect=lambda exe: "/usr/bin/" + exe if exe in present else None):
+            roundtable.verify_clis(False, ("Codex", "Grok"))  # must not raise
+            with self.assertRaises(SystemExit) as ctx:
+                roundtable.verify_clis(False, roundtable.AGENT_NAMES)
+        self.assertIn("--agents", str(ctx.exception))
+
+    def test_roster_awareness_names_only_agents_that_will_speak(self):
+        """This block ends by forbidding invented peers, so it must not invent any itself."""
+        note = roundtable.roster_awareness("Codex", ("Codex", "Grok"))
+        self.assertIn("one of 2 members", note)
+        self.assertIn("Grok", note)
+        for absent in ("Claude", "Antigravity", "Aider", "Qwen"):
+            self.assertNotIn(absent, note)
+
+    def test_roster_awareness_is_empty_for_an_excluded_agent(self):
+        self.assertEqual(roundtable.roster_awareness("Claude", ("Codex", "Grok")), "")
+
+    def test_prompts_describe_only_the_roster(self):
+        context = roundtable.prepare_prompt_context("Ship it", [], roster=("Codex", "Grok"))
+        prompt = roundtable.prompt_for("Ship it", [], "proposal", "Codex", context=context)
+        self.assertIn("one of 2 members", prompt)
+        self.assertNotIn("Antigravity", prompt)
+
+    def test_session_roster_round_trips_through_save_and_load(self):
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session("Goal", td, 0, "now", [], roster=["Codex", "Grok"])
+            json_path, _ = roundtable.save_session(session, Path(td))
+            self.assertEqual(roundtable.load_session(json_path).roster, ["Codex", "Grok"])
+
+    def test_session_written_before_agents_existed_loads_as_every_agent(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "legacy.json"
+            path.write_text(json.dumps({
+                "objective": "Goal", "workspace": td, "rounds": 0,
+                "started_at": "now", "turns": [], "final": "",
+            }), encoding="utf-8")
+            self.assertEqual(roundtable.load_session(path).roster, list(roundtable.AGENT_NAMES))
+
+    def test_load_session_rejects_a_roster_naming_an_unknown_agent(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "bad.json"
+            path.write_text(json.dumps({
+                "objective": "Goal", "workspace": td, "rounds": 0,
+                "started_at": "now", "turns": [], "final": "", "roster": ["Codex", "Bogus"],
+            }), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                roundtable.load_session(path)
+
+    def test_conduct_gives_turns_only_to_the_roster(self):
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session("Solve it", td, 1, "now", [],
+                                         roster=["Codex", "Grok"])
+            agents = [roundtable.MockAgent(name, Path(td)) for name in roundtable.AGENT_NAMES]
+            roundtable.conduct(session, *agents, lambda *_: None, lambda *_: None)
+            speakers = {turn.speaker for turn in session.turns} - {"Final"}
+            self.assertEqual(speakers, {"Codex", "Grok"})
+            self.assertTrue(session.final)
+
+    def test_conduct_with_a_single_agent_still_produces_a_final_answer(self):
+        """The degenerate case that makes roundtable competitive with just running one CLI."""
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session("Solve it", td, 0, "now", [], roster=["Codex"])
+            agents = [roundtable.MockAgent(name, Path(td)) for name in roundtable.AGENT_NAMES]
+            roundtable.conduct(session, *agents, lambda *_: None, lambda *_: None)
+            self.assertEqual({t.speaker for t in session.turns} - {"Final"}, {"Codex"})
+            self.assertTrue(session.final)
+
+    def test_synthesis_never_selects_an_agent_that_never_spoke(self):
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session("Solve it", td, 0, "now", [], roster=["Codex", "Grok"])
+            agents = {name: roundtable.MockAgent(name, Path(td))
+                      for name in roundtable.AGENT_NAMES}
+            ordered = [agents[name] for name in roundtable.AGENT_NAMES]
+            # 'rotate' hashes the objective, so sweep objectives to hit every rotation slot.
+            for objective in [f"objective {index}" for index in range(24)]:
+                session.objective = objective
+                name, _agent = roundtable.pick_synthesizer("rotate", session, *ordered)
+                self.assertIn(name, ("Codex", "Grok"), objective)
+                relay = roundtable.synthesis_order("rotate", session, *ordered, passes=6)
+                self.assertEqual({pair[0] for pair in relay}, {"Codex", "Grok"})
+
+    def test_explicit_synthesizer_outside_the_roster_falls_back_instead_of_drafting(self):
+        """--synthesizer claude with claude excluded must not hand the final answer to an agent
+        that has no context; it has taken no turn."""
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session("Solve it", td, 0, "now", [], roster=["Codex", "Grok"])
+            ordered = [roundtable.MockAgent(name, Path(td)) for name in roundtable.AGENT_NAMES]
+            name, _agent = roundtable.pick_synthesizer("claude", session, *ordered)
+            self.assertIn(name, ("Codex", "Grok"))
+
+    def test_roster_survives_a_self_restart(self):
+        """restart_arguments rebuilds the invocation; dropping --agents would make the restarted
+        process re-require all six CLIs and exit at verify_clis mid-run."""
+        args = roundtable.argparse.Namespace(
+            output_dir=None, collab="parallel", synthesizer="rotate",
+            synthesis_passes=6, rounds=1, workspace=None, agents="codex,grok",
+            codex_model=None, claude_model=None, antigravity_model=None, aider_model=None,
+            grok_model=None, qwen_model=None, reasoning_effort="auto", elevated=[],
+            plain=False, mock=False, balance_load=False, task_status_check=False,
+            reassign_idle=False, dead_code_check=False, chat=False, debug=False,
+            extended_preflight=True, preflight_timeout=None, touch=None)
+        setattr(args, "self", True)
+        command = roundtable.restart_arguments(args, Path("/tmp/session.json"), followup=False)
+        self.assertIn("--agents", command)
+        self.assertEqual(command[command.index("--agents") + 1], "codex,grok")
+
+    def test_display_shows_panels_only_for_the_roster(self):
+        session = roundtable.Session("Goal", ".", 0, "now", [], roster=["Codex", "Grok"])
+        screen = make_test_display().s
+        fresh = roundtable.Display.__new__(roundtable.Display)
+        with mock.patch.object(roundtable.curses, "has_colors", return_value=False), \
+             mock.patch.object(roundtable.curses, "curs_set"), \
+             mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "init_pair"), \
+             mock.patch.object(roundtable.curses, "start_color"), \
+             mock.patch.object(roundtable.curses, "use_default_colors"), \
+             mock.patch.object(roundtable, "WorkspaceMonitor", return_value=mock.Mock()):
+            roundtable.Display.__init__(fresh, screen, session)
+        self.assertEqual([entry[0] for entry in fresh.AGENTS], ["Codex", "Grok"])
+        self.assertEqual(fresh.usage_names, ("Codex", "Grok"))
+        for absent in ("Claude", "Antigravity", "Aider", "Qwen"):
+            self.assertNotIn(absent, fresh.PANEL_NAMES)
+            self.assertNotIn(absent, fresh.scroll)
+        for kept in ("Final", "Code", "Console"):
+            self.assertIn(kept, fresh.PANEL_NAMES)
+
+
 if __name__ == "__main__":
     unittest.main()
