@@ -694,6 +694,10 @@ class Session:
     # so an agent that was merely out of quota when the session was saved rejoins once its
     # quota resets, instead of being written out of the run permanently.
     requested_roster: list[str] = field(default_factory=lambda: list(AGENT_NAMES))
+    # Whether that roster was named with --agents rather than defaulted. A named roster is
+    # strict -- a missing CLI is an error, not a warning -- and resuming must not quietly
+    # relax that into a best-effort run with fewer agents than were asked for.
+    roster_explicit: bool = False
 
 
 class SelfRestartRequired(RuntimeError):
@@ -1775,7 +1779,11 @@ def extract_dibs(turns: list[Turn], roster: tuple[str, ...] | None = None) -> di
     roster = roster or AGENT_NAMES
     claims: dict[str, str] = {}
     for turn in reversed(turns):
-        if turn.speaker not in AGENT_NAMES or turn.speaker in claims:
+        # Filter on the roster, not on every agent roundtable knows: on a narrowed run a
+        # claim by an agent that has left the table would otherwise keep appearing in the
+        # "X has dibs on Y" line of every later prompt, pointing live agents away from work
+        # nobody is doing any more.
+        if turn.speaker not in roster or turn.speaker in claims:
             continue
         match = DIBS_PATTERN.search(turn.content)
         if match:
@@ -1802,11 +1810,12 @@ def prepare_prompt_context(objective: str, turns: list[Turn],
                            workspace: Path | str | None = None, chat: bool = False,
                            roster: tuple[str, ...] | None = None) -> PromptContext:
     """Render and inspect a transcript once for prompts built from the same session state."""
+    roster = roster or AGENT_NAMES
     board_entries = extract_agent_prompt_entries(workspace) if workspace else ""
     return PromptContext(
         transcript(turns) or "(No contributions yet.)",
         role_hints_for(objective, chat=chat),
-        extract_dibs(turns),
+        extract_dibs(turns, roster),
         board_entries,
         roster,
     )
@@ -2156,7 +2165,8 @@ def load_session(path: Path) -> Session:
     return Session(data["objective"], data["workspace"], data["rounds"],
                    data["started_at"], turns, final, queued_prompts=queued_prompts,
                    restart_count=restart_count,
-                   roster=list(requested), requested_roster=list(requested))
+                   roster=list(requested), requested_roster=list(requested),
+                   roster_explicit=bool(data.get("roster_explicit", False)))
 
 
 class RunLog:
@@ -3374,7 +3384,8 @@ class Display:
         gap = layout_params['gap']
         # Surface each agent's latest DIBS claim in the panel subtitle so ownership is
         # visible at a glance (claims already feed prompts; the GUI previously ignored them).
-        dibs_claims = extract_dibs(self.session.turns)
+        dibs_claims = extract_dibs(self.session.turns,
+                                   getattr(self, "roster", None))
         agents = [(name, icon, subtitle, curses.color_pair(color_num))
                  for name, icon, subtitle, color_num in self.AGENTS]
         _cols, placements = agent_grid(w, agent_area, len(agents), top=top, gap=gap,
@@ -3732,7 +3743,8 @@ class Display:
                   for name, icon, subtitle, color_num in self.AGENTS}
         if self.expanded in by_name:
             icon, color, subtitle = by_name[self.expanded]
-            claim = extract_dibs(self.session.turns).get(self.expanded)
+            claim = extract_dibs(self.session.turns,
+                                 getattr(self, "roster", None)).get(self.expanded)
             panel_sub = f"DIBS: {claim}" if claim else subtitle
             self._agent_panel(top, 1, height, w - 2, self.expanded, icon, panel_sub, color)
         elif self.expanded == "Console":
@@ -6645,6 +6657,7 @@ def main() -> int:
         # but an agent dropped for a transient reason does get re-tested rather than written out.
         if args.agents is not None:
             session.requested_roster = list(roster)
+            session.roster_explicit = True
         roster = tuple(session.requested_roster)
         args.output_dir = args.output_dir or str(resume_path.parent)
     else:
@@ -6654,7 +6667,11 @@ def main() -> int:
     # Checked once the roster is settled (a resumed session can carry its own), so only the CLIs
     # this run will actually shell out to are required.
     requested = roster
-    roster = verify_clis(args.mock, roster, explicit=args.agents is not None)
+    # A roster named on a previous run stays strict across --resume, even when this
+    # invocation did not repeat --agents.
+    explicit_roster = args.agents is not None or (
+        resumed and getattr(session, "roster_explicit", False))
+    roster = verify_clis(args.mock, roster, explicit=explicit_roster)
     if resumed:
         session.roster = list(roster)
         session.requested_roster = list(requested)
@@ -6701,7 +6718,8 @@ def main() -> int:
             request = f"{request}\n\n{SELF_EDIT_NOTE}\n\n{self_test_sandbox_note(sandbox)}"
         session = Session(request, str(workspace), args.rounds if args.rounds is not None else 1,
                           datetime.now(timezone.utc).isoformat(), [], roster=list(roster),
-                          requested_roster=list(requested))
+                          requested_roster=list(requested),
+                          roster_explicit=args.agents is not None)
     cls = MockAgent if args.mock else Agent
     elevated_all = "all" in args.elevated
     elevated = {

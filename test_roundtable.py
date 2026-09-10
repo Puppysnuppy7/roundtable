@@ -8520,6 +8520,47 @@ class ReviewFindingsTests(unittest.TestCase):
                 on_limit="wait")
             self.assertEqual([name for name, _ in survivors], ["Codex"])
 
+    def test_a_departed_agents_dibs_claim_leaves_the_prompts(self):
+        """extract_dibs gained a roster parameter that no caller passed, so a claim by an agent no
+        longer at the table kept steering live agents away from work nobody was doing."""
+        turns = [roundtable.Turn("Codex", "proposal", "DIBS: the parser"),
+                 roundtable.Turn("Qwen", "proposal", "DIBS: the tests")]
+        self.assertEqual(set(roundtable.extract_dibs(turns)), {"Codex", "Qwen"})
+        self.assertEqual(set(roundtable.extract_dibs(turns, ("Codex", "Grok"))), {"Codex"})
+
+    def test_prompt_context_filters_dibs_by_its_own_roster(self):
+        turns = [roundtable.Turn("Qwen", "proposal", "DIBS: the tests")]
+        context = roundtable.prepare_prompt_context("Goal", turns, roster=("Codex", "Grok"))
+        self.assertEqual(context.dibs_claims, {})
+        prompt = roundtable.prompt_for("Goal", turns, "review 1", "Codex", context=context)
+        self.assertNotIn("has dibs", prompt)
+
+    def test_an_explicitly_named_roster_stays_strict_across_resume(self):
+        """verify_clis is strict only for a named roster, but nothing recorded that it HAD been
+        named -- so resuming without --agents downgraded an exact-roster contract to best-effort."""
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session("Goal", td, 0, "2026-09-10T00:00:00+00:00", [],
+                                         roster=["Codex", "Grok"],
+                                         requested_roster=["Codex", "Grok"],
+                                         roster_explicit=True)
+            json_path, _ = roundtable.save_session(session, Path(td))
+            self.assertTrue(roundtable.load_session(json_path).roster_explicit)
+
+    def test_a_defaulted_roster_does_not_become_strict(self):
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session("Goal", td, 0, "2026-09-10T00:00:00+00:00", [])
+            json_path, _ = roundtable.save_session(session, Path(td))
+            self.assertFalse(roundtable.load_session(json_path).roster_explicit)
+
+    def test_sessions_written_before_this_field_default_to_not_strict(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "old.json"
+            path.write_text(json.dumps({
+                "objective": "Goal", "workspace": td, "rounds": 0, "started_at": "now",
+                "turns": [], "final": "", "roster": ["Codex"],
+            }), encoding="utf-8")
+            self.assertFalse(roundtable.load_session(path).roster_explicit)
+
 
 if __name__ == "__main__":
     unittest.main()
