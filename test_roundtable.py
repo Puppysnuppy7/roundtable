@@ -7629,6 +7629,99 @@ class UsageLimitPolicyTests(unittest.TestCase):
         command = roundtable.restart_arguments(args, Path("/tmp/session.json"), followup=False)
         self.assertNotIn("--on-limit", command)
 
+    def test_a_capped_drafter_hands_the_draft_down_the_relay(self):
+        """--on-limit drop must not stall at the last step. Drafting is the one turn a run cannot
+        finish without, so a capped drafter passes it on rather than waiting or aborting."""
+        with tempfile.TemporaryDirectory() as td:
+            capped = self._LimitedAgent("Codex", Path(td))
+            capped.attempts = 0
+            order = [("Codex", capped), ("Grok", roundtable.MockAgent("Grok", Path(td)))]
+            session = roundtable.Session("Solve it", td, 0, "now", [], roster=["Codex", "Grok"])
+            lines = []
+            with mock.patch.object(roundtable, "_wait_for_agent_availability") as waited:
+                final = roundtable.synthesize(session, order,
+                                              lambda name, line: lines.append(line),
+                                              lambda *_: None, on_limit="drop")
+            waited.assert_not_called()
+            self.assertTrue(final)
+            self.assertIn("Grok", final)
+            self.assertTrue(any("handing the draft to Grok" in line for line in lines), lines)
+
+    def test_a_capped_drafter_with_nobody_left_still_fails_loudly(self):
+        """Better a clear failure than a silent empty final answer."""
+        with tempfile.TemporaryDirectory() as td:
+            capped = self._LimitedAgent("Codex", Path(td))
+            session = roundtable.Session("Solve it", td, 0, "now", [], roster=["Codex"])
+            with self.assertRaises(RuntimeError):
+                roundtable.synthesize(session, [("Codex", capped)], lambda *_: None,
+                                      lambda *_: None, on_limit="drop")
+
+    def test_a_capped_drafter_still_waits_under_the_default_policy(self):
+        with tempfile.TemporaryDirectory() as td:
+            capped = self._LimitedAgent("Codex", Path(td))
+            order = [("Codex", capped), ("Grok", roundtable.MockAgent("Grok", Path(td)))]
+            session = roundtable.Session("Solve it", td, 0, "now", [], roster=["Codex", "Grok"])
+            with mock.patch.object(roundtable, "_wait_for_agent_availability") as waited:
+                final = roundtable.synthesize(session, order, lambda *_: None, lambda *_: None)
+            waited.assert_called_once()
+            self.assertTrue(final)
+
+    def test_a_failed_drafter_that_is_not_a_quota_problem_still_aborts(self):
+        """drop is about quota specifically; a genuinely broken drafter must not be papered over."""
+        with tempfile.TemporaryDirectory() as td:
+            broken = roundtable.MockAgent("Codex", Path(td))
+            broken.run = mock.Mock(side_effect=RuntimeError("segfault in the CLI"))
+            order = [("Codex", broken), ("Grok", roundtable.MockAgent("Grok", Path(td)))]
+            session = roundtable.Session("Solve it", td, 0, "now", [], roster=["Codex", "Grok"])
+            with self.assertRaises(RuntimeError):
+                roundtable.synthesize(session, order, lambda *_: None, lambda *_: None,
+                                      on_limit="drop")
+
+
+class NarrowedRosterLayoutTests(unittest.TestCase):
+    """The panel grid is computed from a count, so a smaller table must still lay out cleanly."""
+
+    def test_agent_grid_places_every_panel_inside_the_area_for_small_rosters(self):
+        for count in (1, 2, 3, 6):
+            with self.subTest(count=count):
+                _cols, placements = roundtable.agent_grid(160, 30, count, top=4, gap=2,
+                                                          min_row_height=6, row_gap=1)
+                self.assertEqual(len(placements), count)
+                for y, x, panel_h, panel_w in placements:
+                    self.assertGreater(panel_h, 0)
+                    self.assertGreater(panel_w, 0)
+                    self.assertGreaterEqual(x, 0)
+                    self.assertLessEqual(x + panel_w, 160)
+                    self.assertGreaterEqual(y, 4)
+
+    def test_draw_renders_a_two_agent_dashboard_without_the_others(self):
+        session = roundtable.Session("Goal", "/tmp", 0, "now", [], roster=["Codex", "Grok"])
+        display = make_test_display()
+        display.session = session
+        display.roster = ("Codex", "Grok")
+        display.AGENTS = tuple(entry for entry in roundtable.Display.AGENTS
+                               if entry[0] in display.roster)
+        display.PANEL_NAMES = tuple(name for name in roundtable.Display.PANEL_NAMES
+                                    if name in display.roster
+                                    or name in ("Final", "Code", "Console"))
+        display.SCROLL_NAMES = display.PANEL_NAMES
+        with mock.patch.object(roundtable.curses, "color_pair", return_value=0), \
+             mock.patch.object(roundtable.curses, "has_colors", return_value=False):
+            display.draw()
+        rendered = display.s.text()
+        self.assertIn("CODEX", rendered.upper())
+        self.assertIn("GROK", rendered.upper())
+        for absent in ("ANTIGRAVITY", "AIDER", "QWEN"):
+            self.assertNotIn(absent, rendered.upper())
+
+    def test_phase_work_units_counts_the_actual_table(self):
+        """A sequential relay costs one unit per agent; the count must not be pinned at six."""
+        self.assertEqual(roundtable.phase_work_units(roundtable._run_sequential_phase, 2), 2)
+        self.assertEqual(roundtable.phase_work_units(roundtable._run_sequential_phase, 6), 6)
+        self.assertEqual(roundtable.phase_work_units(roundtable._run_parallel_phase, 2), 1)
+        self.assertEqual(roundtable.phase_work_units(roundtable._run_sequential_phase),
+                         len(roundtable.AGENT_NAMES))
+
 
 if __name__ == "__main__":
     unittest.main()

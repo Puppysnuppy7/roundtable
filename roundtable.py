@@ -4809,8 +4809,15 @@ def format_completion_estimate(seconds: float) -> str:
     return f"est. ~{hours}h {minutes}m left" if minutes else f"est. ~{hours}h left"
 
 
-def phase_work_units(runner: Callable[..., None], agent_count: int = len(AGENT_NAMES)) -> int:
-    """Approximate wall-time units for a collaboration phase."""
+def phase_work_units(runner: Callable[..., None], agent_count: int | None = None) -> int:
+    """Approximate wall-time units for a collaboration phase.
+
+    A sequential relay costs one unit per agent; a parallel phase costs one regardless. The
+    count must be resolved at call time, not bound as a default at import time -- with --agents
+    the table is only known once a run starts.
+    """
+    if agent_count is None:
+        agent_count = len(AGENT_NAMES)
     return agent_count if runner is _run_sequential_phase else 1
 
 
@@ -4885,20 +4892,28 @@ def synthesize(session: Session, order: list[tuple[str, Agent]],
                log_prompt: Callable[[str, str], None] = lambda *_: None,
                followup: bool = False,
                step_complete: Callable[[int], None] = lambda *_: None,
-               chat: bool = False) -> str:
+               chat: bool = False, on_limit: str = "wait") -> str:
     """Produce the final answer as a relay: one agent drafts it, the rest refine it in turn,
-    so the result is a merge shaped by all of them rather than the output of a single agent."""
+    so the result is a merge shaped by all of them rather than the output of a single agent.
+
+    Drafting is the one turn the run cannot finish without, so a failed drafter normally
+    aborts. Under on_limit="drop" a drafter that is merely out of quota hands the draft to
+    the next agent in the relay instead: --on-limit exists to stop one exhausted provider
+    from blocking a run, and it would be a poor trade to convert that stall into a crash at
+    the last step. Only a genuine failure with nobody left to draft still aborts.
+    """
     draft = ""
+    drafted = False
     contributors: list[str] = []
     history = transcript(session.turns)
     for index, (name, agent) in enumerate(order):
-        verb = "drafting" if index == 0 else "refining"
+        verb = "drafting" if not drafted else "refining"
         status([name], f"{name} is {verb} the final answer")
         prompt = (
             final_prompt(
                 session.objective, session.turns, followup, history, speaker=name, chat=chat,
                 roster=tuple(session.roster)
-            ) if index == 0 else
+            ) if not drafted else
             refine_prompt(
                 session.objective, session.turns, draft, followup, history, speaker=name,
                 chat=chat, roster=tuple(session.roster)
@@ -4917,16 +4932,27 @@ def synthesize(session: Session, order: list[tuple[str, Agent]],
                 threading.Event(), no_edit=True, suggested_effort="medium",
                 # A refinement is optional once a valid draft exists. Avoid repeating a provider's
                 # full timeout only to lose that draft if the retry fails too.
-                transient_retries=1 if index == 0 else 0)
+                transient_retries=1 if not drafted else 0, on_limit=on_limit)
         except RuntimeError as exc:
-            if index == 0 or str(exc) == f"{agent.name} cancelled":
+            if str(exc) == f"{agent.name} cancelled":
                 raise
             detail = str(exc).strip().splitlines()[-1] if str(exc).strip() else "no response"
-            tick(name, f"refinement skipped after failure: {detail}")
+            if not drafted:
+                # Nobody has drafted yet. Pass the draft down the relay only if this was a
+                # quota drop and someone is left to take it; otherwise fail as before.
+                handed_on = (on_limit == "drop" and usage_limit_detail(str(exc))
+                             and index + 1 < len(order))
+                if not handed_on:
+                    raise
+                tick(name, f"out of quota ({detail}) — handing the draft to "
+                           f"{order[index + 1][0]}")
+            else:
+                tick(name, f"refinement skipped after failure: {detail}")
         else:
             draft = normalize_final_answer(candidate)
             if draft != candidate.strip():
                 tick(name, "discarded an earlier duplicated final-answer block")
+            drafted = True
             contributors.append(name)
         step_complete(1)
     status([], "Final answer complete")
@@ -4936,7 +4962,8 @@ def synthesize(session: Session, order: list[tuple[str, Agent]],
 def run_dead_code_check(session: Session, name: str, agent: Agent,
                         tick: Callable[[str, str], None],
                         status: Callable[[Iterable[str], str], None],
-                        log_prompt: Callable[[str, str], None] = lambda *_: None) -> None:
+                        log_prompt: Callable[[str, str], None] = lambda *_: None,
+                        on_limit: str = "wait") -> None:
     """Run one agent through a dead-code sweep before the synthesis relay drafts the final answer.
 
     A soft failure here (the agent errors out) is not fatal to the run -- it just means synthesis
@@ -4951,7 +4978,7 @@ def run_dead_code_check(session: Session, name: str, agent: Agent,
     try:
         content = _run_with_retry(
             agent, prompt, lambda line: tick(name, line), threading.Event(),
-            suggested_effort="medium", transient_retries=0)
+            suggested_effort="medium", transient_retries=0, on_limit=on_limit)
     except RuntimeError as exc:
         tick(name, f"dead-code check skipped after failure: {exc}")
         return
@@ -5161,12 +5188,13 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
                f"Agents are developing solutions {style}")
     completed_phases = completed_phases or set()
     remaining_phase_units = (
-        phase_work_units(proposal_runner) if phase not in completed_phases else 0)
+        phase_work_units(proposal_runner, len(agents)) if phase not in completed_phases else 0)
     for planned_round in range(1, session.rounds + 1):
         planned_phase = (f"followup-review {planned_round}" if followup
                          else f"review {planned_round}")
         if planned_phase not in completed_phases:
-            remaining_phase_units += phase_work_units(_phase_runner(collab, planned_round))
+            remaining_phase_units += phase_work_units(_phase_runner(collab, planned_round),
+                                                      len(agents))
     remaining_synthesis_units = (0 if "consensus" in completed_phases
                                  else max(1, min(synthesis_passes, len(agents))))
     if dead_code_check and "dead-code-check" not in completed_phases and "consensus" not in completed_phases:
@@ -5273,7 +5301,7 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
             proposal_runner, session, agents, phase, estimated_tick, estimated_status, message,
             log_prompt, agent_speed, task_status_check, reassign_idle, stagger, chat=chat,
             on_limit=effective_on_limit)
-        estimator.complete(phase_work_units(proposal_runner))
+        estimator.complete(phase_work_units(proposal_runner, len(agents)))
         note_phase_completion(completed_by)
         if self_mode and session.rounds >= 1 and source_fingerprint() != restart_baseline:
             review_vote_pending = True
@@ -5285,7 +5313,7 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
             for later in range(round_no, session.rounds + 1):
                 later_phase = (f"followup-review {later}" if followup else f"review {later}")
                 if later_phase not in completed_phases:
-                    abandoned += phase_work_units(_phase_runner(collab, later))
+                    abandoned += phase_work_units(_phase_runner(collab, later), len(agents))
             if abandoned:
                 estimator.abandon(abandoned)
                 abandon_operation_steps(sum(
@@ -5308,7 +5336,7 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
                 restart_vote_pending=asking_vote_this_round, chat=chat,
                 on_limit=effective_on_limit,
             )
-            estimator.complete(phase_work_units(runner))
+            estimator.complete(phase_work_units(runner, len(agents)))
             if task_status_check and completed_by:
                 note_phase_completion(completed_by)
             elif reviews_after_complete is not None:
@@ -5335,7 +5363,7 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
         checker_name, checker_agent = pick_synthesizer(
             synthesizer, session, codex, claude, antigravity, aider, grok, qwen)
         run_dead_code_check(session, checker_name, checker_agent, estimated_tick, estimated_status,
-                            log_prompt)
+                            log_prompt, on_limit=effective_on_limit)
         # The dead-code check itself has edit rights, so re-verify after it too rather than
         # trusting its own report of what it removed.
         verify_self_edit_turn(session, checker_agent, lambda line: estimated_tick(checker_name, line))
@@ -5361,7 +5389,7 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
     order = synthesis_order(synthesizer, session, codex, claude, antigravity, aider, grok, qwen,
                             effective_passes, preferred_first=preferred_drafter)
     session.final = synthesize(session, order, estimated_tick, estimated_status, log_prompt, followup,
-                               estimator.complete, chat=chat)
+                               estimator.complete, chat=chat, on_limit=effective_on_limit)
     session.turns.append(Turn("Final", "consensus", session.final))
     checkpoint()
 
