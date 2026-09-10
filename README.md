@@ -168,6 +168,11 @@ Useful options:
                        always canonical, however you type it. A one-agent roster is valid and
                        still produces a final answer. The roster is saved with the session, so
                        --resume reopens the same table.
+--detach               Run in the background and return the terminal immediately (implies
+                       --plain). Check on it with --status. Survives the terminal, not the
+                       machine.
+--status               Report the runs recorded in --output-dir — what they were asked to
+                       do, how far they got, and whether they are still going — then exit.
 --check-agents         Probe every installed agent and report which can take a turn right
                        now — ready, out of quota, or needing a login — then exit. Exits
                        non-zero if none are usable. --list-agents only answers whether
@@ -529,6 +534,45 @@ The UI automatically adjusts when you resize your terminal window, maintaining p
 preventing display corruption. Expanded panels remain open; if a compact layout hides the focused
 Console panel, keyboard focus moves to the nearest visible panel instead of leaving Enter attached
 to an invisible target.
+
+## Detached runs
+
+A roundtable session can take a long time, and holding a terminal open for it is the reason it
+often doesn't get started. `--detach` runs it in the background and gives the terminal straight
+back:
+
+```bash
+$ roundtable --detach -r 2 "work out why the checkout test is flaky"
+Running in the background (pid 884972 on octopi).
+Check on it:  roundtable --status --output-dir .roundtable
+Console log:  .roundtable/detached-20260910-180421.out
+```
+
+`--status` reports what was asked, how far it got, and whether it is still going — readable from
+any machine that can reach the output directory, so a run started on one box can be checked from
+another:
+
+```text
+$ roundtable --status
+running   work out why the checkout test is flaky
+           agents=Codex,Claude,Grok turns=6 host=octopi pid=884972 updated=2026-09-10T18:14:02+00:00
+           phase: Step 3/5 · Agents are reviewing in parallel · round 1/2
+           log:  .roundtable/roundtable-20260910-180421-743209.log
+```
+
+The status file is written at every phase boundary, separately from the transcript, and is never
+read back by the run itself — if it goes missing or stale, `--status` says so and nothing else is
+affected.
+
+**A detached run survives the terminal, not the machine.** It is detached from the controlling
+terminal's process group, so closing the terminal or logging out won't signal it — but it still
+stops if the box sleeps, reboots or loses power. On a laptop that suspends, `--detach` mostly buys
+you a free terminal; on an always-on box it buys you an actual background run.
+
+`--status` never claims a run is going when it isn't. On the machine that owns the process it
+checks the pid directly and reports `died` if it is gone; from another machine, where the pid means
+nothing, a run that has been quiet for a long time is reported as `stale` rather than asserted to
+be alive.
 
 ## Touchscreen and convertible use
 

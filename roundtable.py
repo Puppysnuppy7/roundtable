@@ -230,6 +230,7 @@ import queue
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import tempfile
 import textwrap
@@ -2031,6 +2032,48 @@ def log_path_for(session: Session, output_dir: Path) -> Path:
     """Path to this session's activity log — pairs with its .json/.md transcript."""
     output_dir.mkdir(parents=True, exist_ok=True)
     return artifact_paths_for(session, output_dir)[2]
+
+
+def status_path_for(session: Session, output_dir: Path) -> Path:
+    """Path to this session's status file — pairs with its .json/.md/.log artifacts.
+
+    Deliberately not a .json extension despite holding JSON: `.roundtable/*.json` is the
+    obvious way to find a session to --resume, and a status file that answers that glob is a
+    file people will try to resume and fail to.
+    """
+    return output_dir / f"roundtable-{_session_stamp(session)}.status"
+
+
+def write_run_status(session: Session, output_dir: Path, state: str, phase: str = "") -> None:
+    """Record a detached run's progress where another machine can read it.
+
+    Deliberately a separate file from the session transcript, written atomically and never read
+    back by the run itself. A run's transcript is load-bearing -- --resume and --self restarts read
+    it -- so progress reporting must not change when or how often it lands on disk. If this file is
+    missing, stale or corrupt, --status says so and nothing else in the program notices.
+
+    pid and host are recorded so a reader can tell a live run from one that died with its machine:
+    on the same host the pid can be probed directly, and from elsewhere the timestamp is all there
+    is to go on.
+    """
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(status_path_for(session, output_dir), json.dumps({
+            "objective": session.objective,
+            "workspace": session.workspace,
+            "state": state,
+            "phase": phase,
+            "roster": list(session.roster),
+            "turns": len(session.turns),
+            "has_final": bool(session.final),
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            "started_at": session.started_at,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }, indent=2) + "\n")
+    except OSError:
+        # Status reporting is never worth failing a run over.
+        pass
 
 
 def save_session(session: Session, output_dir: Path) -> tuple[Path, Path]:
@@ -5688,6 +5731,137 @@ def check_agents(timeout: float = EXTENDED_PREFLIGHT_TIMEOUT_SECONDS,
     return "\n".join(lines), ready
 
 
+# A detached run refreshes its status at every phase boundary. A single phase is one full turn
+# from each agent, which against real CLIs runs to minutes, so "no update in this long" is the
+# earliest point at which silence is more likely a dead process than a slow one.
+STATUS_STALE_AFTER_SECONDS = 45 * 60
+
+
+def _process_is_running(pid: int) -> bool:
+    """Whether a pid exists on this machine. Never raises."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Exists, owned by someone else. Still a live process.
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def describe_run_state(record: dict, now: datetime | None = None) -> str:
+    """Classify one status record, without ever claiming a dead run is still going.
+
+    A process killed with its machine -- a laptop suspended, an OOM, a pulled plug -- leaves a
+    status file that says "running" forever. On the machine that owns the pid that can be checked
+    outright. From anywhere else the timestamp is the only evidence there is, so a run that has
+    gone quiet is reported as last-seen rather than asserted to be alive: a status display that
+    confidently reports phantom work is worse than one that admits it cannot tell.
+    """
+    state = str(record.get("state", "unknown"))
+    if state in ("finished", "failed", "cancelled"):
+        return state
+    now = now or datetime.now(timezone.utc)
+    try:
+        updated = datetime.fromisoformat(str(record.get("updated_at")))
+    except (TypeError, ValueError):
+        return "unknown"
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    age = (now - updated).total_seconds()
+    same_host = str(record.get("host", "")) == socket.gethostname()
+    if same_host:
+        return "running" if _process_is_running(int(record.get("pid", 0) or 0)) else "died"
+    return "running" if age < STATUS_STALE_AFTER_SECONDS else "stale"
+
+
+def read_run_statuses(output_dir: Path) -> list[dict]:
+    """Every readable status record in a directory, newest first. Unreadable files are skipped."""
+    records = []
+    try:
+        paths = sorted(output_dir.glob("roundtable-*.status"))
+    except OSError:
+        return []
+    for path in paths:
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(record, dict):
+            record["path"] = str(path)
+            records.append(record)
+    records.sort(key=lambda item: str(item.get("updated_at", "")), reverse=True)
+    return records
+
+
+def format_run_status(output_dir: Path, limit: int = 10) -> str:
+    """Human-readable report of the runs recorded in an output directory."""
+    records = read_run_statuses(output_dir)
+    if not records:
+        return (f"No runs recorded in {output_dir}. A detached run writes its status there; "
+                f"pass --output-dir to look somewhere else.")
+    lines = []
+    for record in records[:limit]:
+        state = describe_run_state(record)
+        objective = " ".join(str(record.get("objective", "")).split())
+        if len(objective) > 60:
+            objective = objective[:57] + "..."
+        roster = ",".join(record.get("roster") or []) or "?"
+        detail = [f"{state:<8}", f"{objective or '(no objective)'}"]
+        lines.append("  ".join(detail))
+        lines.append(f"           agents={roster} turns={record.get('turns', '?')} "
+                     f"host={record.get('host', '?')} pid={record.get('pid', '?')} "
+                     f"updated={record.get('updated_at', '?')}")
+        if record.get("phase"):
+            lines.append(f"           phase: {record['phase']}")
+        log = str(record.get("path", "")).replace(".status", ".log")
+        lines.append(f"           log:  {log}")
+        if state == "died":
+            lines.append("           (process is gone — the run stopped before finishing)")
+        elif state == "stale":
+            lines.append("           (no update in a while, and it is on another host — "
+                         "check there to be sure)")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def detach_command(argv: list[str]) -> list[str]:
+    """Rebuild this invocation for the background process.
+
+    --detach is dropped (the child is the run, not another launcher) and --plain forced: the child
+    has no terminal, and the curses UI would be drawing to nothing.
+    """
+    command = [sys.executable, str(Path(__file__).resolve())]
+    command += [argument for argument in argv if argument != "--detach"]
+    if "--plain" not in command:
+        command.append("--plain")
+    return command
+
+
+def start_detached(argv: list[str], output_dir: Path) -> tuple[int, Path]:
+    """Launch this run in the background, surviving the terminal that started it.
+
+    start_new_session detaches the child from the controlling terminal's process group, so closing
+    the terminal or logging out does not signal it. The child still dies with the machine -- this
+    buys independence from the session, not from the hardware, which matters on a laptop that
+    sleeps.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    console = output_dir / f"detached-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.out"
+    handle = console.open("w", encoding="utf-8", errors="replace")
+    try:
+        process = subprocess.Popen(
+            detach_command(argv), stdin=subprocess.DEVNULL, stdout=handle, stderr=handle,
+            start_new_session=True, cwd=os.getcwd())
+    finally:
+        handle.close()
+    return process.pid, console
+
+
 def positive_finite_float(value: str) -> float:
     """Argparse type for positive, finite timeout values."""
     number = float(value)
@@ -5955,6 +6129,17 @@ def build_parser() -> argparse.ArgumentParser:
                              "finishes with the others; 'wait' holds the whole round until "
                              "the provider's reported reset time, which can be hours. "
                              "Ignored for a one-agent roster, which has no round left to save")
+    parser.add_argument("--detach", action="store_true",
+                        help="run in the background and return the terminal immediately, "
+                             "instead of holding it for the whole session. Implies --plain. "
+                             "Check on it later with --status, from this machine or any "
+                             "other that can read the output directory. The run survives "
+                             "the terminal, not the machine: it still stops if the box "
+                             "sleeps or reboots")
+    parser.add_argument("--status", action="store_true",
+                        help="report the runs recorded in --output-dir (default .roundtable) "
+                             "— what they were asked to do, how far they got, and whether "
+                             "they are still going — then exit")
     parser.add_argument("--check-agents", action="store_true",
                         help="probe every installed agent CLI and report which ones can "
                              "actually take a turn right now — ready, out of quota, or "
@@ -6070,6 +6255,26 @@ def main() -> int:
         parser.error(f"unrecognized arguments: {' '.join(remaining)}")
     if args.list_agents:
         print(list_agents())
+        return 0
+    if args.status:
+        print(format_run_status(Path(args.output_dir or ".roundtable")))
+        return 0
+    if args.detach:
+        # Validated here rather than in the child: a detached run that dies immediately on a
+        # bad argument reports nothing useful, because nothing is watching its output.
+        if not args.objective and sys.stdin.isatty():
+            parser.error("--detach needs an objective on the command line — "
+                         "there is no terminal to prompt in")
+        output_dir = Path(args.output_dir or ".roundtable")
+        try:
+            pid, console = start_detached(sys.argv[1:], output_dir)
+        except OSError as exc:
+            print(f"could not start a detached run: {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
+            return 1
+        print(f"Running in the background (pid {pid} on {socket.gethostname()}).")
+        print(f"Check on it:  roundtable --status --output-dir {output_dir}")
+        print(f"Console log:  {console}")
         return 0
     if args.check_agents:
         report, ready = check_agents(
@@ -6256,8 +6461,10 @@ def main() -> int:
             label = ", ".join(names) or "complete"
             run_log.write("phase", f"[{label}] {message}")
             print(f"[{label}] {message}", flush=True)
+            write_run_status(session, Path(args.output_dir), "running", message)
         def log_prompt(name: str, prompt: str) -> None:
             run_log.write("prompt", f"[{name}] PROMPT:\n{prompt}")
+        write_run_status(session, Path(args.output_dir), "running", "starting")
         try:
             if not args.skip_preflight:
                 lineup = run_preflight(lineup, tick, status,
@@ -6276,6 +6483,7 @@ def main() -> int:
                    checkpoint=checkpoint, completed_phases=completed_phases,
                    on_limit=getattr(args, "on_limit", "drop"))
             successful_paths = save_session(session, Path(args.output_dir))
+            write_run_status(session, Path(args.output_dir), "finished", "complete")
             run_log.write(
                 "artifact",
                 f"session saved json={successful_paths[0]} markdown={successful_paths[1]} "
@@ -6293,6 +6501,7 @@ def main() -> int:
             return 0
         except KeyboardInterrupt:
             run_log.write("error", "Cancelled by user")
+            write_run_status(session, Path(args.output_dir), "cancelled", "cancelled")
             if session.turns:
                 paths = save_session(session, Path(args.output_dir))
                 run_log.write(
@@ -6305,6 +6514,8 @@ def main() -> int:
         except Exception as exc:
             run_log.write("error", str(exc))
             run_log.write("debug", traceback.format_exc())
+            write_run_status(session, Path(args.output_dir), "failed",
+                             str(exc).splitlines()[0] if str(exc).strip() else "failed")
             if getattr(args, "debug", False):
                 traceback.print_exc()
             checkpoint_paths = None

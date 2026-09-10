@@ -3,13 +3,14 @@ import inspect
 import io
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -3018,8 +3019,8 @@ class RoundtableTests(unittest.TestCase):
             # Exempt: flags that print something and exit rather than configuring a session,
             # plus --plain, which selects a UI rather than an option within one.
             and action.dest not in (
-                "plain", "list_agents", "check_agents", "install", "update", "bugsend",
-                "list_keys", "auth_setup",
+                "plain", "list_agents", "check_agents", "status", "detach", "install",
+                "update", "bugsend", "list_keys", "auth_setup",
             )
         }
         toggle_names = {name for name, _ in roundtable.OPTION_TOGGLES}
@@ -8013,6 +8014,130 @@ class CheckAgentsTests(unittest.TestCase):
                 self.assertEqual(set(os.listdir(td)), before)
             finally:
                 os.chdir(original)
+
+
+class DetachedRunTests(unittest.TestCase):
+    """--detach / --status: dispatch a run, get the terminal back, check on it from anywhere.
+
+    The correctness burden is entirely in not lying about a run that is no longer going.
+    """
+
+    @staticmethod
+    def _record(**overrides):
+        record = {
+            "objective": "do the thing", "workspace": "/tmp", "state": "running",
+            "phase": "proposal", "roster": ["Codex"], "turns": 1, "has_final": False,
+            "pid": os.getpid(), "host": socket.gethostname(),
+            "started_at": "2026-09-10T00:00:00+00:00",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        record.update(overrides)
+        return record
+
+    def test_a_live_process_on_this_host_reads_as_running(self):
+        self.assertEqual(roundtable.describe_run_state(self._record()), "running")
+
+    def test_a_dead_process_on_this_host_reads_as_died_not_running(self):
+        """The failure this classification exists to prevent: a status file that claims work is
+        happening long after the process is gone."""
+        dead = self._record(pid=self._unused_pid())
+        self.assertEqual(roundtable.describe_run_state(dead), "died")
+
+    def test_a_fresh_record_from_another_host_reads_as_running(self):
+        self.assertEqual(
+            roundtable.describe_run_state(self._record(host="some-other-box")), "running")
+
+    def test_a_quiet_record_from_another_host_reads_as_stale_not_running(self):
+        """Another machine's pid means nothing here, so silence is all the evidence there is."""
+        old = datetime.now(timezone.utc) - timedelta(
+            seconds=roundtable.STATUS_STALE_AFTER_SECONDS + 60)
+        record = self._record(host="some-other-box", updated_at=old.isoformat())
+        self.assertEqual(roundtable.describe_run_state(record), "stale")
+
+    def test_terminal_states_are_reported_verbatim_whatever_the_pid_says(self):
+        for state in ("finished", "failed", "cancelled"):
+            with self.subTest(state=state):
+                record = self._record(state=state, pid=self._unused_pid())
+                self.assertEqual(roundtable.describe_run_state(record), state)
+
+    def test_an_unparseable_timestamp_is_unknown_rather_than_a_guess(self):
+        record = self._record(host="some-other-box", updated_at="not a date")
+        self.assertEqual(roundtable.describe_run_state(record), "unknown")
+
+    def test_status_round_trips_through_a_real_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session("Goal", td, 0, "2026-09-10T00:00:00+00:00", [],
+                                         roster=["Codex", "Grok"])
+            roundtable.write_run_status(session, Path(td), "running", "proposal")
+            records = roundtable.read_run_statuses(Path(td))
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["roster"], ["Codex", "Grok"])
+            self.assertEqual(records[0]["phase"], "proposal")
+
+    def test_the_status_file_is_not_mistaken_for_a_session_transcript(self):
+        """`.roundtable/*.json` is how people find a session to --resume; a status file answering
+        that glob is a file someone will try to resume and fail to."""
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session("Goal", td, 0, "2026-09-10T00:00:00+00:00", [])
+            roundtable.write_run_status(session, Path(td), "running", "proposal")
+            roundtable.save_session(session, Path(td))
+            transcripts = list(Path(td).glob("*.json"))
+            self.assertEqual(len(transcripts), 1)
+            roundtable.load_session(transcripts[0])  # must not raise
+
+    def test_a_failing_status_write_never_breaks_a_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session("Goal", td, 0, "2026-09-10T00:00:00+00:00", [])
+            with mock.patch.object(roundtable, "atomic_write_text",
+                                   side_effect=OSError("disk full")):
+                roundtable.write_run_status(session, Path(td), "running", "proposal")
+
+    def test_status_report_says_so_when_there_is_nothing_recorded(self):
+        with tempfile.TemporaryDirectory() as td:
+            report = roundtable.format_run_status(Path(td))
+            self.assertIn("No runs recorded", report)
+
+    def test_status_report_flags_a_dead_run_in_the_text(self):
+        with tempfile.TemporaryDirectory() as td:
+            session = roundtable.Session("Goal", td, 0, "2026-09-10T00:00:00+00:00", [])
+            roundtable.write_run_status(session, Path(td), "running", "proposal")
+            path = roundtable.status_path_for(session, Path(td))
+            record = json.loads(path.read_text())
+            record["pid"] = self._unused_pid()
+            path.write_text(json.dumps(record))
+            report = roundtable.format_run_status(Path(td))
+            self.assertIn("died", report)
+            self.assertIn("stopped before finishing", report)
+
+    def test_unreadable_status_files_are_skipped_not_fatal(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "roundtable-broken.status").write_text("{not json", encoding="utf-8")
+            self.assertEqual(roundtable.read_run_statuses(Path(td)), [])
+            self.assertIn("No runs recorded", roundtable.format_run_status(Path(td)))
+
+    def test_detach_command_drops_detach_and_forces_plain(self):
+        """The child is the run, not another launcher, and it has no terminal to draw a TUI on."""
+        command = roundtable.detach_command(["--detach", "--agents", "codex", "objective"])
+        self.assertNotIn("--detach", command)
+        self.assertIn("--plain", command)
+        self.assertIn("objective", command)
+        self.assertEqual(command[:1], [sys.executable])
+
+    def test_detach_command_keeps_an_explicit_plain_only_once(self):
+        command = roundtable.detach_command(["--detach", "--plain", "objective"])
+        self.assertEqual(command.count("--plain"), 1)
+
+    @staticmethod
+    def _unused_pid() -> int:
+        """A pid that is not running. Searches upward rather than assuming any fixed value."""
+        for candidate in range(400000, 500000):
+            try:
+                os.kill(candidate, 0)
+            except ProcessLookupError:
+                return candidate
+            except OSError:
+                continue
+        raise unittest.SkipTest("could not find an unused pid")
 
 
 if __name__ == "__main__":
