@@ -242,7 +242,7 @@ from collections import Counter, deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, TextIO
+from typing import Callable, Iterable, Iterator, Sequence, TextIO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
@@ -4934,28 +4934,31 @@ def phase_work_units(runner: Callable[..., None], agent_count: int | None = None
     return agent_count if runner is _run_sequential_phase else 1
 
 
-def roster_agents(session: Session, codex: Agent, claude: Agent, antigravity: Agent, aider: Agent,
-                  grok: Agent, qwen: Agent) -> list[tuple[str, Agent]]:
+def roster_agents(session: Session, agents: Sequence[Agent]) -> list[tuple[str, Agent]]:
     """The (name, agent) pairs actually playing this run, in canonical order.
 
-    All six Agent objects are always constructed and passed around -- the call graph is built on
-    six-argument signatures -- so this is what narrows them to session.roster wherever "who is at
-    the table" is the real question.
+    Every Agent is always constructed and passed around; this narrows them to session.roster
+    wherever "who is at the table" is the real question.
+
+    agents is positional and pairs 1:1 with AGENT_NAMES. That ordering is load-bearing, not
+    cosmetic -- pick_synthesizer rotates by hashing to an index in this list, so a short or
+    reordered sequence would silently pick the wrong drafter rather than fail. Hence the assert.
     """
-    everyone = [("Codex", codex), ("Claude", claude), ("Antigravity", antigravity),
-                ("Aider", aider), ("Grok", grok), ("Qwen", qwen)]
+    if len(agents) != len(AGENT_NAMES):
+        raise ValueError(
+            f"expected {len(AGENT_NAMES)} agents in AGENT_NAMES order, got {len(agents)}")
     roster = tuple(session.roster) or AGENT_NAMES
-    return [pair for pair in everyone if pair[0] in roster]
+    return [(name, agent) for name, agent in zip(AGENT_NAMES, agents) if name in roster]
 
 
-def pick_synthesizer(choice: str, session: Session, codex: Agent, claude: Agent, antigravity: Agent,
-                     aider: Agent, grok: Agent, qwen: Agent) -> tuple[str, Agent]:
+def pick_synthesizer(choice: str, session: Session,
+                     agents: Sequence[Agent]) -> tuple[str, Agent]:
     """Choose who writes the final answer.
 
     'rotate' spreads the role across agents by objective instead of always favoring one model,
     so the same session stays consistent across follow-ups while different sessions vary.
     """
-    options = roster_agents(session, codex, claude, antigravity, aider, grok, qwen)
+    options = roster_agents(session, agents)
     by_name = {name.lower(): index for index, (name, _) in enumerate(options)}
     if choice in by_name:
         return options[by_name[choice]]
@@ -4971,8 +4974,7 @@ def pick_synthesizer(choice: str, session: Session, codex: Agent, claude: Agent,
 EARLY_COMPLETE_SYNTHESIS_PASSES = 2
 
 
-def synthesis_order(choice: str, session: Session, codex: Agent, claude: Agent, antigravity: Agent,
-                    aider: Agent, grok: Agent, qwen: Agent, passes: int = 6,
+def synthesis_order(choice: str, session: Session, agents: Sequence[Agent], passes: int = 6,
                     *, preferred_first: str | None = None) -> list[tuple[str, Agent]]:
     """Full relay order for the final answer: who drafts it, then who refines it, in turn.
 
@@ -4983,13 +4985,12 @@ def synthesis_order(choice: str, session: Session, codex: Agent, claude: Agent, 
     preferred_first, when it names a live agent, overrides the drafter — used after an agent marks
     TASK STATUS: complete so the agent that finished the work writes the first draft.
     """
-    options = roster_agents(session, codex, claude, antigravity, aider, grok, qwen)
+    options = roster_agents(session, agents)
     by_name = {name: agent for name, agent in options}
     if preferred_first and preferred_first in by_name:
         first_name, first_agent = preferred_first, by_name[preferred_first]
     else:
-        first_name, first_agent = pick_synthesizer(choice, session, codex, claude, antigravity, aider,
-                                                   grok, qwen)
+        first_name, first_agent = pick_synthesizer(choice, session, agents)
     rest = [pair for pair in options if pair[0] != first_name]
     # A one-agent roster has no refiners to rotate; the drafter is the whole relay.
     if rest:
@@ -5287,8 +5288,7 @@ def _run_phase(runner: Callable[..., str | None], session: Session, agents: list
     return runner(session, agents, phase, tick, status, message, log_prompt)
 
 
-def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, aider: Agent,
-            grok: Agent, qwen: Agent,
+def conduct(session: Session, all_agents: Sequence[Agent],
             tick: Callable[[str, str], None],
             status: Callable[[Iterable[str], str], None],
             followup: bool = False, collab: str = "parallel", synthesizer: str = "rotate",
@@ -5308,16 +5308,15 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
     # starts a fresh board. See start_agent_prompt_file.
     start_agent_prompt_file(Path(session.workspace), fresh=completed_phases is None)
     # Single chokepoint for who is actually at the table: every phase runner, DIBS tally and
-    # progress count downstream iterates this list, so filtering here is what makes --agents real
-    # without reshaping the six-argument signatures the whole call graph is built on.
+    # progress count downstream iterates this list, so filtering here is what makes --agents real.
     roster = tuple(session.roster) or AGENT_NAMES
     # Dropping a rate-limited agent only helps when someone else can carry the phase.
     # With a one-agent table there is no round left to save, so wait for the reset.
     effective_on_limit = "wait" if len(roster) < 2 else on_limit
-    agents = [(name, agent) for name, agent in
-              (("Codex", codex), ("Claude", claude), ("Antigravity", antigravity),
-               ("Aider", aider), ("Grok", grok), ("Qwen", qwen))
-              if name in roster]
+    # Two distinct things, deliberately named apart: all_agents is the full positional sequence
+    # (needed by pick_synthesizer/synthesis_order, which re-derive the lineup themselves), while
+    # agents is the (name, agent) pairs actually playing, which every phase runner expects.
+    agents = roster_agents(session, all_agents)
     agent_speed: dict[str, list[float]] | None = {} if balance_load else None
     phase = "followup-proposal" if followup else "proposal"
     proposal_runner = _run_sequential_phase if collab == "sequential" else _run_parallel_phase
@@ -5499,7 +5498,7 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
     drain_queued_prompts(session)
     if dead_code_check and "dead-code-check" not in completed_phases:
         checker_name, checker_agent = pick_synthesizer(
-            synthesizer, session, codex, claude, antigravity, aider, grok, qwen)
+            synthesizer, session, all_agents)
         run_dead_code_check(session, checker_name, checker_agent, estimated_tick, estimated_status,
                             log_prompt, on_limit=effective_on_limit)
         # The dead-code check itself has edit rights, so re-verify after it too rather than
@@ -5524,7 +5523,7 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
             abandon_operation_steps(abandoned_synth)
             estimated_status(
                 [], "Objective marked complete — using a shorter final synthesis")
-    order = synthesis_order(synthesizer, session, codex, claude, antigravity, aider, grok, qwen,
+    order = synthesis_order(synthesizer, session, all_agents,
                             effective_passes, preferred_first=preferred_drafter)
     session.final = synthesize(session, order, estimated_tick, estimated_status, log_prompt, followup,
                                estimator.complete, chat=chat, on_limit=effective_on_limit)
@@ -5533,7 +5532,7 @@ def conduct(session: Session, codex: Agent, claude: Agent, antigravity: Agent, a
 
 
 def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
-            codex: Agent, claude: Agent, antigravity: Agent, aider: Agent, grok: Agent, qwen: Agent,
+            agents: Sequence[Agent],
             resumed: bool = False, checkpoint: Callable[[], None] = lambda: None,
             completed_phases: set[str] | None = None) -> int:
     suppress_focus_reporting()
@@ -5542,10 +5541,12 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
     # this one does, or a crash here loses the very session state it exists to protect.
     output_dir = Path(getattr(args, "output_dir", None) or ".roundtable")
     run_log = RunLog(log_path_for(session, output_dir))
-    lineup = roster_agents(session, codex, claude, antigravity, aider, grok, qwen)
-    agents = tuple(agent for _name, agent in lineup)
-    attach_agent_diagnostics(run_log, agents)
-    log_run_context(run_log, args, session, agents, resumed, completed_phases)
+    lineup = roster_agents(session, agents)
+    # Named 'active', not 'agents': the full positional sequence must survive for conduct(), which
+    # re-derives its own lineup from session.roster. Shadowing it here would double-filter.
+    active = tuple(agent for _name, agent in lineup)
+    attach_agent_diagnostics(run_log, active)
+    log_run_context(run_log, args, session, active, resumed, completed_phases)
     touch_mode = getattr(args, "touch_mode", None)
     if touch_mode is None:
         touch_mode = getattr(args, "touch", None)
@@ -5598,7 +5599,7 @@ def run_tui(stdscr: curses.window, args: argparse.Namespace, session: Session,
         while True:
             ui.busy = True
             stdscr.nodelay(True)
-            conduct(session, codex, claude, antigravity, aider, grok, qwen, ui.tick, status,
+            conduct(session, agents, ui.tick, status,
                    followup,
                    collab=args.collab, synthesizer=args.synthesizer, log_prompt=ui.log_prompt,
                    balance_load=args.balance_load, task_status_check=args.task_status_check,
@@ -6737,7 +6738,10 @@ def main() -> int:
     aider = cls("Aider", workspace, args.aider_model, elevated=elevated["aider"], debug=args.debug)
     grok = cls("Grok", workspace, args.grok_model, elevated=elevated["grok"], debug=args.debug)
     qwen = cls("Qwen", workspace, args.qwen_model, elevated=elevated["qwen"], debug=args.debug)
-    for agent in (codex, claude, antigravity, aider, grok, qwen):
+    # Canonical order, matching AGENT_NAMES. roster_agents() zips against that order, so this
+    # sequence is the single place the mapping from position to agent is established.
+    agents = (codex, claude, antigravity, aider, grok, qwen)
+    for agent in agents:
         agent.reasoning_effort = args.reasoning_effort
     followup = (args.continue_after_restart == "followup" if continuing else resumed)
     current_turns = session.turns
@@ -6757,10 +6761,10 @@ def main() -> int:
         except (AttributeError, ValueError):
             pass
         run_log = RunLog(log_path_for(session, Path(args.output_dir)))
-        lineup = roster_agents(session, codex, claude, antigravity, aider, grok, qwen)
-        agents = tuple(agent for _name, agent in lineup)
-        attach_agent_diagnostics(run_log, agents)
-        log_run_context(run_log, args, session, agents, resumed, completed_phases)
+        lineup = roster_agents(session, agents)
+        active = tuple(agent for _name, agent in lineup)
+        attach_agent_diagnostics(run_log, active)
+        log_run_context(run_log, args, session, active, resumed, completed_phases)
         summary = config_summary(args)
         run_log.write("phase", summary)
         print(summary, flush=True)
@@ -6787,7 +6791,7 @@ def main() -> int:
                 session.roster = [name for name, _agent in lineup]
             else:
                 run_log.write("info", "Preflight skipped by configuration")
-            conduct(session, codex, claude, antigravity, aider, grok, qwen, tick, status,
+            conduct(session, agents, tick, status,
                    followup=followup,
                    collab=args.collab, synthesizer=args.synthesizer, log_prompt=log_prompt,
                    balance_load=args.balance_load, task_status_check=args.task_status_check,
@@ -6856,7 +6860,7 @@ def main() -> int:
         _, md_path = successful_paths
         print(f"\n{session.final}\n\nTranscript: {md_path}\nLog: {run_log.path}")
     else:
-        code = curses.wrapper(run_tui, args, session, codex, claude, antigravity, aider, grok, qwen,
+        code = curses.wrapper(run_tui, args, session, agents,
                               followup, checkpoint, completed_phases)
         _, md_path, log_path = artifact_paths_for(session, Path(args.output_dir))
         if md_path.exists():

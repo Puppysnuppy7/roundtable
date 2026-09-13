@@ -1161,7 +1161,7 @@ class RoundtableTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             session = roundtable.Session("Solve it", td, 1, "now", [])
             agents = [roundtable.MockAgent(name, Path(td)) for name in roundtable.AGENT_NAMES]
-            roundtable.conduct(session, *agents, lambda *_: None, lambda *_: None)
+            roundtable.conduct(session, agents, lambda *_: None, lambda *_: None)
             self.assertEqual([t.speaker for t in session.turns],
                              list(roundtable.AGENT_NAMES) + list(roundtable.AGENT_NAMES) + ["Final"])
             self.assertTrue(session.final)
@@ -1482,7 +1482,7 @@ class RoundtableTests(unittest.TestCase):
             logged: list[tuple[str, str]] = []
             session = roundtable.Session("Solve it", td, 1, "now", [])
             agents = [roundtable.MockAgent(name, Path(td)) for name in roundtable.AGENT_NAMES]
-            roundtable.conduct(session, *agents, lambda *_: None,
+            roundtable.conduct(session, agents, lambda *_: None,
                                lambda *_: None, synthesizer="claude",
                                log_prompt=lambda name, p: logged.append((name, p)))
             names_logged = [name for name, _ in logged]
@@ -1499,7 +1499,7 @@ class RoundtableTests(unittest.TestCase):
                 [roundtable.Turn("Final", "consensus", "First answer"),
                  roundtable.Turn("User", "follow-up", "Now add search")], "First answer")
             agents = [roundtable.MockAgent(name, Path(td)) for name in roundtable.AGENT_NAMES]
-            roundtable.conduct(session, *agents,
+            roundtable.conduct(session, agents,
                                lambda *_: None, lambda *_: None,
                                followup=True)
             self.assertEqual([t.phase for t in session.turns if t.speaker == "Final"],
@@ -2257,7 +2257,7 @@ class RoundtableTests(unittest.TestCase):
                     raise roundtable.SelfRestartRequired
 
             with self.assertRaises(roundtable.SelfRestartRequired):
-                roundtable.conduct(session, *agents, lambda *_: None, lambda *_: None,
+                roundtable.conduct(session, agents, lambda *_: None, lambda *_: None,
                                    checkpoint=changed_during_synthesis)
 
             self.assertTrue(session.final)
@@ -2276,7 +2276,7 @@ class RoundtableTests(unittest.TestCase):
             with mock.patch.object(roundtable, "synthesize",
                                    side_effect=AssertionError("consensus ran twice")):
                 roundtable.conduct(
-                    session, *agents, lambda *_: None, lambda *_: None,
+                    session, agents, lambda *_: None, lambda *_: None,
                     completed_phases={"proposal", "consensus"},
                 )
 
@@ -2304,7 +2304,7 @@ class RoundtableTests(unittest.TestCase):
                     roundtable, "source_fingerprint", side_effect=["baseline", "changed"]):
                 with self.assertRaises(roundtable.SelfRestartRequired):
                     roundtable.conduct(
-                        session, *(agents[name] for name in roundtable.AGENT_NAMES),
+                        session, [agents[name] for name in roundtable.AGENT_NAMES],
                         lambda *_: None, capture_status, checkpoint=checkpoint)
             codex_prompts = agents["Codex"].received_prompts
             self.assertEqual(len(codex_prompts), 2)
@@ -2332,7 +2332,7 @@ class RoundtableTests(unittest.TestCase):
                     roundtable, "source_fingerprint", side_effect=["baseline", "changed"]):
                 with self.assertRaises(roundtable.SelfRestartRequired):
                     roundtable.conduct(
-                        session, *(agents[name] for name in roundtable.AGENT_NAMES),
+                        session, [agents[name] for name in roundtable.AGENT_NAMES],
                         lambda *_: None, lambda *_: None, checkpoint=checkpoint)
             codex_prompts = agents["Codex"].received_prompts
             self.assertEqual(len(codex_prompts), 3)  # proposal, review 1 (vote), review 2 (no vote)
@@ -2356,7 +2356,7 @@ class RoundtableTests(unittest.TestCase):
                     roundtable, "source_fingerprint", side_effect=["baseline", "changed"]):
                 with self.assertRaises(roundtable.SelfRestartRequired):
                     roundtable.conduct(
-                        session, *(agents[name] for name in roundtable.AGENT_NAMES),
+                        session, [agents[name] for name in roundtable.AGENT_NAMES],
                         lambda *_: None, lambda *_: None, checkpoint=checkpoint)
             checkpoint.assert_called_once()
 
@@ -2370,7 +2370,7 @@ class RoundtableTests(unittest.TestCase):
             with mock.patch.object(
                     roundtable, "source_fingerprint", side_effect=["baseline", "changed"]):
                 with self.assertRaises(roundtable.SelfRestartRequired):
-                    roundtable.conduct(session, *agents, lambda *_: None, lambda *_: None,
+                    roundtable.conduct(session, agents, lambda *_: None, lambda *_: None,
                                        checkpoint=checkpoint)
             checkpoint.assert_called_once()
 
@@ -2385,7 +2385,7 @@ class RoundtableTests(unittest.TestCase):
             with mock.patch.object(
                     roundtable, "source_fingerprint", side_effect=["baseline", "changed"]):
                 with self.assertRaises(roundtable.SelfRestartRequired):
-                    roundtable.conduct(session, *agents, lambda *_: None, lambda *_: None,
+                    roundtable.conduct(session, agents, lambda *_: None, lambda *_: None,
                                        checkpoint=checkpoint)
             checkpoint.assert_called_once()
 
@@ -2400,7 +2400,7 @@ class RoundtableTests(unittest.TestCase):
             with mock.patch.object(
                     roundtable, "source_fingerprint", side_effect=["same", "same", "same"]):
                 roundtable.conduct(
-                    session, *(agents[name] for name in roundtable.AGENT_NAMES),
+                    session, [agents[name] for name in roundtable.AGENT_NAMES],
                     lambda *_: None, lambda *_: None, checkpoint=checkpoint)
             for prompt in agents["Codex"].received_prompts:
                 self.assertNotIn("RESTART:", prompt)
@@ -4323,7 +4323,7 @@ class RoundtableTests(unittest.TestCase):
             agents = [roundtable.MockAgent(name, Path(td)) for name in roundtable.AGENT_NAMES]
             with mock.patch.object(roundtable, "verify_self_edit_turn") as verify:
                 roundtable.conduct(
-                    session, *agents, lambda *_: None, lambda *_: None,
+                    session, agents, lambda *_: None, lambda *_: None,
                     dead_code_check=True, completed_phases={"proposal"})
             verify.assert_called_once()
 
@@ -4383,7 +4383,7 @@ class RoundtableTests(unittest.TestCase):
             workspace = Path(td)
             session = roundtable.Session("Parallel task", td, 0, "now", [])
             agents = [ConcurrentAgent(name, workspace) for name in roundtable.AGENT_NAMES]
-            roundtable.conduct(session, *agents, lambda *_: None, lambda *_: None)
+            roundtable.conduct(session, agents, lambda *_: None, lambda *_: None)
             self.assertEqual(ConcurrentAgent.maximum, len(roundtable.AGENT_NAMES))
             self.assertEqual([turn.speaker for turn in session.turns],
                              list(roundtable.AGENT_NAMES) + ["Final"])
@@ -4463,7 +4463,7 @@ class RoundtableTests(unittest.TestCase):
             workspace = Path(td)
             session = roundtable.Session("Balance conduct", td, 1, "now", [])
             agents = [StaggeredAgent(name, workspace) for name in delays]
-            roundtable.conduct(session, *agents, lambda *_: None, lambda *_: None,
+            roundtable.conduct(session, agents, lambda *_: None, lambda *_: None,
                                balance_load=True,
                                log_prompt=lambda name, p: seen_prompts.append((name, p)))
             antigravity_prompt = next(p for name, p in seen_prompts
@@ -4513,7 +4513,7 @@ class RoundtableTests(unittest.TestCase):
             workspace = Path(td)
             session = roundtable.Session("Sequential task", td, 0, "now", [])
             agents = [LockStepAgent(name, workspace) for name in roundtable.AGENT_NAMES]
-            roundtable.conduct(session, *agents, lambda *_: None, lambda *_: None, collab="sequential")
+            roundtable.conduct(session, agents, lambda *_: None, lambda *_: None, collab="sequential")
             self.assertEqual(LockStepAgent.maximum, 1)
             self.assertEqual([t.speaker for t in session.turns],
                              list(roundtable.AGENT_NAMES) + ["Final"])
@@ -4537,7 +4537,7 @@ class RoundtableTests(unittest.TestCase):
             workspace = Path(td)
             session = roundtable.Session("Mixed task", td, 2, "now", [])
             agents = [TrackingAgent(name, workspace) for name in roundtable.AGENT_NAMES]
-            roundtable.conduct(session, *agents, lambda *_: None, lambda *_: None, collab="mixed")
+            roundtable.conduct(session, agents, lambda *_: None, lambda *_: None, collab="mixed")
             phases = [t.phase for t in session.turns]
             self.assertIn("review 1", phases)
             self.assertIn("review 2", phases)
@@ -4565,7 +4565,7 @@ class RoundtableTests(unittest.TestCase):
             agents = [TimedAgent(name, Path(td)) for name in roundtable.AGENT_NAMES]
             statuses = []
             roundtable.conduct(
-                session, *agents, lambda *_: None,
+                session, agents, lambda *_: None,
                 lambda active, message: statuses.append((tuple(active), message)),
                 synthesis_passes=2)
 
@@ -4586,7 +4586,7 @@ class RoundtableTests(unittest.TestCase):
             ]
             statuses = []
             roundtable.conduct(
-                session, *agents, lambda *_: None,
+                session, agents, lambda *_: None,
                 lambda active, message: statuses.append((tuple(active), message)),
                 synthesis_passes=2, stagger=0)
 
@@ -4604,25 +4604,25 @@ class RoundtableTests(unittest.TestCase):
             claude = agents["Claude"]
             session_a = roundtable.Session("Objective A", td, 0, "now", [])
             session_b = roundtable.Session("A very different objective", td, 0, "now", [])
-            rotated_a = roundtable.pick_synthesizer("rotate", session_a, *agents.values())[0]
-            rotated_a_again = roundtable.pick_synthesizer("rotate", session_a, *agents.values())[0]
-            rotated_b = roundtable.pick_synthesizer("rotate", session_b, *agents.values())[0]
+            rotated_a = roundtable.pick_synthesizer("rotate", session_a, list(agents.values()))[0]
+            rotated_a_again = roundtable.pick_synthesizer("rotate", session_a, list(agents.values()))[0]
+            rotated_b = roundtable.pick_synthesizer("rotate", session_b, list(agents.values()))[0]
             self.assertEqual(rotated_a, rotated_a_again)
             self.assertIn(rotated_a, roundtable.AGENT_NAMES)
             self.assertIn(rotated_b, roundtable.AGENT_NAMES)
-            forced = roundtable.pick_synthesizer("claude", session_a, *agents.values())
+            forced = roundtable.pick_synthesizer("claude", session_a, list(agents.values()))
             self.assertEqual(forced, ("Claude", claude))
 
     def test_synthesis_order_includes_everyone_starting_with_the_chosen_drafter(self):
         with tempfile.TemporaryDirectory() as td:
             agents = {name: roundtable.MockAgent(name, Path(td)) for name in roundtable.AGENT_NAMES}
             session = roundtable.Session("Objective", td, 0, "now", [])
-            order = roundtable.synthesis_order("claude", session, *agents.values())
+            order = roundtable.synthesis_order("claude", session, list(agents.values()))
             self.assertEqual([name for name, _ in order][0], "Claude")
             self.assertEqual({name for name, _ in order}, set(roundtable.AGENT_NAMES))
             self.assertEqual(len(order), len(roundtable.AGENT_NAMES))
             # Stable for the same objective, but the trailing order need not match agent-list order.
-            again = roundtable.synthesis_order("claude", session, *agents.values())
+            again = roundtable.synthesis_order("claude", session, list(agents.values()))
             self.assertEqual([name for name, _ in order], [name for name, _ in again])
 
     def test_synthesis_order_limits_passes_without_changing_the_drafter(self):
@@ -4630,14 +4630,14 @@ class RoundtableTests(unittest.TestCase):
             agents = {name: roundtable.MockAgent(name, Path(td)) for name in roundtable.AGENT_NAMES}
             claude = agents["Claude"]
             session = roundtable.Session("Objective", td, 0, "now", [])
-            full = roundtable.synthesis_order("claude", session, *agents.values())
-            fast = roundtable.synthesis_order("claude", session, *agents.values(), 1)
+            full = roundtable.synthesis_order("claude", session, list(agents.values()))
+            fast = roundtable.synthesis_order("claude", session, list(agents.values()), 1)
             self.assertEqual(fast, full[:1])
             self.assertEqual(fast[0], ("Claude", claude))
             self.assertEqual(
-                len(roundtable.synthesis_order("claude", session, *agents.values(), 0)), 1)
+                len(roundtable.synthesis_order("claude", session, list(agents.values()), 0)), 1)
             self.assertEqual(
-                len(roundtable.synthesis_order("claude", session, *agents.values(), 10)),
+                len(roundtable.synthesis_order("claude", session, list(agents.values()), 10)),
                 len(roundtable.AGENT_NAMES))
 
     def test_synthesis_order_preferred_first_overrides_chosen_drafter(self):
@@ -4645,12 +4645,12 @@ class RoundtableTests(unittest.TestCase):
             agents = {name: roundtable.MockAgent(name, Path(td)) for name in roundtable.AGENT_NAMES}
             session = roundtable.Session("Objective", td, 0, "now", [])
             order = roundtable.synthesis_order(
-                "claude", session, *agents.values(), preferred_first="Grok")
+                "claude", session, list(agents.values()), preferred_first="Grok")
             self.assertEqual(order[0][0], "Grok")
             self.assertEqual({name for name, _ in order}, set(roundtable.AGENT_NAMES))
             # Unknown or empty preferred names fall back to --synthesizer selection.
             fallback = roundtable.synthesis_order(
-                "claude", session, *agents.values(), preferred_first="NotAnAgent")
+                "claude", session, list(agents.values()), preferred_first="NotAnAgent")
             self.assertEqual(fallback[0][0], "Claude")
 
     def test_synthesize_relays_a_draft_through_every_agent_in_order(self):
@@ -4832,7 +4832,7 @@ class RoundtableTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             session = roundtable.Session("Goal", td, 0, "now", [])
             agents = [roundtable.MockAgent(name, Path(td)) for name in roundtable.AGENT_NAMES]
-            roundtable.conduct(session, *agents, lambda *_: None, lambda *_: None,
+            roundtable.conduct(session, agents, lambda *_: None, lambda *_: None,
                                dead_code_check=True)
         phases = [turn.phase for turn in session.turns]
         self.assertIn("dead-code-check", phases)
@@ -4849,7 +4849,7 @@ class RoundtableTests(unittest.TestCase):
                     roundtable, "run_dead_code_check",
                     side_effect=AssertionError("dead-code check ran twice")):
                 roundtable.conduct(
-                    session, *agents, lambda *_: None, lambda *_: None, dead_code_check=True,
+                    session, agents, lambda *_: None, lambda *_: None, dead_code_check=True,
                     completed_phases={"proposal", "dead-code-check"})
         self.assertEqual(
             [turn.phase for turn in session.turns].count("dead-code-check"), 1)
@@ -4925,7 +4925,7 @@ class RoundtableTests(unittest.TestCase):
             with mock.patch.object(
                     roundtable, "run_dead_code_check",
                     side_effect=AssertionError("dead-code check ran in chat mode")):
-                roundtable.conduct(session, *agents, lambda *_: None, lambda *_: None,
+                roundtable.conduct(session, agents, lambda *_: None, lambda *_: None,
                                    dead_code_check=True, chat=True)
         self.assertNotIn("dead-code-check", [turn.phase for turn in session.turns])
 
@@ -4942,7 +4942,7 @@ class RoundtableTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             session = roundtable.Session("Question", td, 1, "now", [])
             agents = [RecordingAgent(name, Path(td)) for name in roundtable.AGENT_NAMES]
-            roundtable.conduct(session, *agents, lambda *_: None, lambda *_: None, chat=True)
+            roundtable.conduct(session, agents, lambda *_: None, lambda *_: None, chat=True)
         self.assertTrue(no_edit_seen)
         self.assertTrue(all(no_edit_seen))
 
@@ -5431,7 +5431,7 @@ class RoundtableTests(unittest.TestCase):
             workspace = Path(td)
             session = roundtable.Session("Physics demo", td, 1, "now", [])
             agents = [DoneOnceAgent(name, workspace) for name in roundtable.AGENT_NAMES]
-            roundtable.conduct(session, *agents, lambda *_: None, lambda *_: None,
+            roundtable.conduct(session, agents, lambda *_: None, lambda *_: None,
                                synthesizer="codex", task_status_check=True)
             proposal_speakers = [t.speaker for t in session.turns if t.phase == "proposal"]
             review_speakers = [t.speaker for t in session.turns if t.phase == "review 1"]
@@ -5460,7 +5460,7 @@ class RoundtableTests(unittest.TestCase):
             agents = [RecordingAgent(name, workspace) for name in roundtable.AGENT_NAMES]
             RecordingAgent.review_phases = []
             roundtable.conduct(
-                session, *agents, lambda *_: None, lambda *_: None,
+                session, agents, lambda *_: None, lambda *_: None,
                 synthesizer="codex", synthesis_passes=1, task_status_check=True,
                 completed_phases={"proposal"}, stagger=0,
             )
@@ -5505,7 +5505,7 @@ class RoundtableTests(unittest.TestCase):
             agents = [RecordingAgent(name, workspace) for name in roundtable.AGENT_NAMES]
             RecordingAgent.review_phases = []
             roundtable.conduct(
-                session, *agents, lambda *_: None, lambda *_: None,
+                session, agents, lambda *_: None, lambda *_: None,
                 synthesizer="codex", synthesis_passes=1, task_status_check=True,
                 completed_phases={"proposal", "review 1"}, stagger=0,
             )
@@ -5536,7 +5536,7 @@ class RoundtableTests(unittest.TestCase):
             workspace = Path(td)
             session = roundtable.Session("Physics demo", td, 0, "now", [])
             agents = [RealisticAgent(name, workspace) for name in roundtable.AGENT_NAMES]
-            roundtable.conduct(session, *agents, lambda *_: None, lambda *_: None,
+            roundtable.conduct(session, agents, lambda *_: None, lambda *_: None,
                                synthesizer="codex", task_status_check=True)
             self.assertTrue(session.final)
             self.assertEqual([t.phase for t in session.turns], ["proposal", "consensus"])
@@ -5559,7 +5559,7 @@ class RoundtableTests(unittest.TestCase):
             agents = [DoneAgent(name, workspace) for name in roundtable.AGENT_NAMES]
             statuses: list[str] = []
             roundtable.conduct(
-                session, *agents, lambda *_: None,
+                session, agents, lambda *_: None,
                 lambda _active, message: statuses.append(message),
                 synthesizer="codex", synthesis_passes=1, task_status_check=True, stagger=0,
             )
@@ -5597,7 +5597,7 @@ class RoundtableTests(unittest.TestCase):
             agents = [DoneAgent(name, workspace) for name in roundtable.AGENT_NAMES]
             statuses: list[str] = []
             roundtable.conduct(
-                session, *agents, lambda *_: None,
+                session, agents, lambda *_: None,
                 lambda _active, message: statuses.append(message),
                 synthesizer="rotate", synthesis_passes=6, task_status_check=True, stagger=0,
             )
@@ -6264,7 +6264,7 @@ class RoundtableTests(unittest.TestCase):
              mock.patch("roundtable.save_session", return_value=("/tmp/s.json", "/tmp/s.md")), \
              mock.patch("roundtable.finalize_agent_prompt_file") as finalize_board, \
              mock.patch("roundtable.suppress_focus_reporting"):
-            ret = roundtable.run_tui(stdscr, args, session, None, None, None, None, None, None,
+            ret = roundtable.run_tui(stdscr, args, session, [None]*6,
                                      resumed=False)
 
         self.assertEqual(ret, 0)
@@ -6295,7 +6295,7 @@ class RoundtableTests(unittest.TestCase):
              mock.patch("roundtable.save_session", return_value=("/tmp/s.json", "/tmp/s.md")), \
              mock.patch("roundtable.finalize_agent_prompt_file"), \
              mock.patch("roundtable.suppress_focus_reporting"):
-            ret = roundtable.run_tui(stdscr, args, session, None, None, None, None, None, None,
+            ret = roundtable.run_tui(stdscr, args, session, [None]*6,
                                      resumed=False)
 
         self.assertEqual(ret, 0)
@@ -6332,7 +6332,7 @@ class RoundtableTests(unittest.TestCase):
              mock.patch("roundtable.curses.endwin"), \
              mock.patch("roundtable.suppress_focus_reporting"):
             ret = roundtable.run_tui(
-                stdscr, args, session, None, None, None, None, None, None, resumed=False,
+                stdscr, args, session, [None]*6, resumed=False,
                 checkpoint=lambda: None)
 
         self.assertEqual(ret, 0)
@@ -6370,7 +6370,7 @@ class RoundtableTests(unittest.TestCase):
              mock.patch("roundtable.save_session", return_value=("/tmp/s.json", "/tmp/s.md")), \
              mock.patch("roundtable.suppress_focus_reporting"):
             ret = roundtable.run_tui(
-                stdscr, args, session, None, None, None, None, None, None, resumed=True,
+                stdscr, args, session, [None]*6, resumed=True,
                 completed_phases={"followup-proposal"})
 
         self.assertEqual(ret, 0)
@@ -6585,7 +6585,7 @@ class RoundtableTests(unittest.TestCase):
                  roundtable.Turn("Final", "consensus", "Completed\n\nDone")],
                 "Completed\n\nDone")
             agents = [roundtable.MockAgent(name, workspace) for name in roundtable.AGENT_NAMES]
-            roundtable.conduct(session, *agents, lambda *_: None, lambda *_: None,
+            roundtable.conduct(session, agents, lambda *_: None, lambda *_: None,
                                completed_phases={"proposal", "consensus"})
             self.assertEqual(path.read_text(encoding="utf-8"), "leftover board content")
 
@@ -6594,7 +6594,7 @@ class RoundtableTests(unittest.TestCase):
             path.write_text("leftover board content", encoding="utf-8")
             session = roundtable.Session("Goal", td, 0, "now", [])
             agents = [roundtable.MockAgent(name, workspace) for name in roundtable.AGENT_NAMES]
-            roundtable.conduct(session, *agents, lambda *_: None, lambda *_: None,
+            roundtable.conduct(session, agents, lambda *_: None, lambda *_: None,
                                completed_phases=None)
             self.assertEqual(path.read_text(encoding="utf-8"), roundtable.AGENT_PROMPT_TEMPLATE)
 
@@ -7119,8 +7119,8 @@ class RoundtableTests(unittest.TestCase):
                      mock.patch.object(roundtable.curses, "has_colors", return_value=False), \
                      mock.patch("roundtable.finalize_agent_prompt_file"), \
                      mock.patch("roundtable.suppress_focus_reporting"):
-                    ret = roundtable.run_tui(stdscr, args, session, None, None, None, None,
-                                             None, None, resumed=False)
+                    ret = roundtable.run_tui(stdscr, args, session, [None]*6,
+                                             resumed=False)
                 saved = list((Path(td) / ".roundtable").glob("*.json"))
             finally:
                 os.chdir(original_cwd)
@@ -7154,8 +7154,8 @@ class RoundtableTests(unittest.TestCase):
                      mock.patch.object(roundtable.curses, "has_colors", return_value=False), \
                      mock.patch("roundtable.finalize_agent_prompt_file"), \
                      mock.patch("roundtable.suppress_focus_reporting"):
-                    ret = roundtable.run_tui(stdscr, args, session, None, None, None, None,
-                                             None, None, resumed=False)
+                    ret = roundtable.run_tui(stdscr, args, session, [None]*6,
+                                             resumed=False)
                 saved = list((Path(td) / ".roundtable").glob("*.json"))
             finally:
                 os.chdir(original_cwd)
@@ -7186,8 +7186,8 @@ class RoundtableTests(unittest.TestCase):
              mock.patch.object(roundtable, "save_session",
                                return_value=(Path("/tmp/s.json"), Path("/tmp/s.md"))), \
              mock.patch.object(roundtable, "finalize_agent_prompt_file"):
-            roundtable.run_tui(mock.Mock(), args, session, mock.Mock(), mock.Mock(),
-                              mock.Mock(), mock.Mock(), mock.Mock(), mock.Mock())
+            roundtable.run_tui(mock.Mock(), args, session,
+                              [mock.Mock() for _ in range(6)])
         mock_ui.log.assert_any_call("Preflight skipped by configuration", kind="phase")
 
     def test_display_scroll_focused_panel_when_unexpanded(self):
@@ -7480,7 +7480,7 @@ class RosterSelectionTests(unittest.TestCase):
                                          roster=["Codex"],
                                          requested_roster=["Codex", "Grok"])
             agents = [roundtable.MockAgent(name, Path(td)) for name in roundtable.AGENT_NAMES]
-            roundtable.conduct(session, *agents, lambda *_: None, lambda *_: None)
+            roundtable.conduct(session, agents, lambda *_: None, lambda *_: None)
             self.assertEqual({t.speaker for t in session.turns} - {"Final"}, {"Codex"})
 
     def test_session_written_before_agents_existed_loads_as_every_agent(self):
@@ -7507,7 +7507,7 @@ class RosterSelectionTests(unittest.TestCase):
             session = roundtable.Session("Solve it", td, 1, "now", [],
                                          roster=["Codex", "Grok"])
             agents = [roundtable.MockAgent(name, Path(td)) for name in roundtable.AGENT_NAMES]
-            roundtable.conduct(session, *agents, lambda *_: None, lambda *_: None)
+            roundtable.conduct(session, agents, lambda *_: None, lambda *_: None)
             speakers = {turn.speaker for turn in session.turns} - {"Final"}
             self.assertEqual(speakers, {"Codex", "Grok"})
             self.assertTrue(session.final)
@@ -7517,7 +7517,7 @@ class RosterSelectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             session = roundtable.Session("Solve it", td, 0, "now", [], roster=["Codex"])
             agents = [roundtable.MockAgent(name, Path(td)) for name in roundtable.AGENT_NAMES]
-            roundtable.conduct(session, *agents, lambda *_: None, lambda *_: None)
+            roundtable.conduct(session, agents, lambda *_: None, lambda *_: None)
             self.assertEqual({t.speaker for t in session.turns} - {"Final"}, {"Codex"})
             self.assertTrue(session.final)
 
@@ -7530,9 +7530,9 @@ class RosterSelectionTests(unittest.TestCase):
             # 'rotate' hashes the objective, so sweep objectives to hit every rotation slot.
             for objective in [f"objective {index}" for index in range(24)]:
                 session.objective = objective
-                name, _agent = roundtable.pick_synthesizer("rotate", session, *ordered)
+                name, _agent = roundtable.pick_synthesizer("rotate", session, ordered)
                 self.assertIn(name, ("Codex", "Grok"), objective)
-                relay = roundtable.synthesis_order("rotate", session, *ordered, passes=6)
+                relay = roundtable.synthesis_order("rotate", session, ordered, passes=6)
                 self.assertEqual({pair[0] for pair in relay}, {"Codex", "Grok"})
 
     def test_explicit_synthesizer_outside_the_roster_falls_back_instead_of_drafting(self):
@@ -7541,7 +7541,7 @@ class RosterSelectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             session = roundtable.Session("Solve it", td, 0, "now", [], roster=["Codex", "Grok"])
             ordered = [roundtable.MockAgent(name, Path(td)) for name in roundtable.AGENT_NAMES]
-            name, _agent = roundtable.pick_synthesizer("claude", session, *ordered)
+            name, _agent = roundtable.pick_synthesizer("claude", session, ordered)
             self.assertIn(name, ("Codex", "Grok"))
 
     def test_roster_survives_a_self_restart(self):
@@ -7640,7 +7640,7 @@ class UsageLimitPolicyTests(unittest.TestCase):
             agents["Codex"] = self._LimitedAgent("Codex", Path(td))
             ordered = [agents[name] for name in roundtable.AGENT_NAMES]
             with mock.patch.object(roundtable, "_wait_for_agent_availability") as waited:
-                roundtable.conduct(session, *ordered, lambda *_: None, lambda *_: None,
+                roundtable.conduct(session, ordered, lambda *_: None, lambda *_: None,
                                    on_limit="drop")
             waited.assert_not_called()
             proposals = [t.speaker for t in session.turns if t.phase == "proposal"]
@@ -7657,7 +7657,7 @@ class UsageLimitPolicyTests(unittest.TestCase):
             agents["Codex"] = self._LimitedAgent("Codex", Path(td))
             ordered = [agents[name] for name in roundtable.AGENT_NAMES]
             with mock.patch.object(roundtable, "_wait_for_agent_availability") as waited:
-                roundtable.conduct(session, *ordered, lambda *_: None, lambda *_: None,
+                roundtable.conduct(session, ordered, lambda *_: None, lambda *_: None,
                                    on_limit="drop")
             waited.assert_called_once()
 
