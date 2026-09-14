@@ -1,16 +1,13 @@
 # Roundtable
 
-A dependency-free terminal table where the Codex, Claude Code, Antigravity, Aider, Grok Build, and
-Qwen Code CLIs solve a problem together as equally as possible — six agents spanning five labs
-(OpenAI, Anthropic, Google, xAI, Alibaba) plus a model-agnostic sixth pinned to Mistral's Codestral
-by default, so no two agents are running the same underlying model. Each agent is nudged toward one
-of six complementary lanes — sandboxed execution and testing, architecture and reasoning, breadth
-and stress-testing the others' work, fast narrowly-scoped diffs, skeptical verification, or
-integrating the group's approaches into one plan — so six parallel attempts produce complementary
-contributions instead of six competing full solutions. Which agent gets which lane rotates by
+A dependency-free terminal table where Codex, Claude Code, Antigravity, Aider, Grok Build,
+Qwen Code, Muse Code, and Kimi Code collaborate. The eight agents span OpenAI, Anthropic,
+Google, Mistral (through Aider's default Codestral model), xAI, Alibaba, Meta, and Moonshot.
+Each agent gets a complementary role: execution, reasoning, breadth, focused edits,
+verification, integration, cross-file consistency, or failure cases. Roles rotate by
 objective, so no agent is permanently typecast into the same role run after run. Each working prompt
 also makes the agent self-aware of the roster: it is told its own display name and CLI, and the
-names and CLIs of the other five members, derived from the same `AGENT_NAMES` /
+names and CLIs of the other members, derived from the same `AGENT_NAMES` /
 `AGENT_EXECUTABLES` maps that drive preflight and `--list-agents` — so agents do not invent extra
 peers or rediscover membership by grepping source. The same identity context follows an agent into
 reassignment, final synthesis/refinement, and the dead-code check instead of disappearing when its
@@ -20,7 +17,7 @@ list what the others already claimed, so the round-by-round split of the task st
 agents pick up something new instead of redoing each other's ground. Every agent's prompt also
 points at a shared, append-only `AGENT_PROMPTS.md` scratch board in the workspace, so an agent can
 leave a note, question, or candidate solution for the others to read on a later turn — treated as
-untrusted peer input, never as authoritative as the user's objective. All six develop proposals,
+untrusted peer input, never as authoritative as the user's objective. All agents develop proposals,
 then review the shared transcript in each configured round, coordinating in parallel, in a strict
 relay, or a mix of both (`--collab`). The final answer is itself a relay: one agent drafts it, and
 the rest refine it in turn, so the result is shaped by all of them instead of authored by whichever
@@ -39,9 +36,9 @@ already on `PATH`, else the first other writable directory under your home, else
 command works with `PATHEXT`; elsewhere it uses a symlink with a copy fallback. An unrelated
 existing command is left untouched unless you pass `--force`; a previous install created by this
 script (symlink, matching `.cmd` shim, or copy of `roundtable.py`) is refreshed in place without
-`--force`. It then installs whichever of the six agent CLIs it has a
+`--force`. It then installs whichever of the eight agent CLIs it has a
 verified command for: `npm install -g @openai/codex` (Codex), `npm install -g
-@anthropic-ai/claude-code` (Claude), `pipx install aider-chat` (Aider), `npm install -g
+@anthropic-ai/claude-code` (Claude), `pipx install --force aider-install` followed by `aider-install` (Aider), `npm install -g
 @xai-official/grok` (Grok), and `npm install -g @qwen-code/qwen-code` (Qwen) — each skipped if
 already on `PATH`, and skipped with an explanation if the required package manager (`npm`/`pipx`)
 isn't. Antigravity (`agy`) has no package-manager install command this script can verify (its
@@ -50,8 +47,8 @@ reports whether the CLI is already present rather than guessing an install comma
 yourself per the vendor's own instructions. `--skip-clis` links only the `roundtable` command;
 `--only Codex Aider ...` restricts CLI installation to specific agents; `--dry-run` prints what
 would happen without changing anything. Exit status is non-zero if linking fails or any attempted
-CLI auto-install fails (or cannot run because its package manager is missing); missing agy is
-informational and does not fail the install. All still need authenticating after install — see below.
+CLI auto-install fails (or cannot run because its package manager is missing); missing manually installed agents are
+informational and do not fail the install. All still need authenticating after install — see below.
 You can also run `roundtable --install` once the command is already on `PATH` (or
 `python3 roundtable.py --install` from the repo). Extra installer flags after `--install`
 (`--dry-run`, `--skip-clis`, `--only …`, `--bin-dir`, `--force`) are forwarded to
@@ -75,6 +72,12 @@ package, which this installer does not manage. The installer deliberately does n
 roundtable` (it keeps a small local agent-name manifest, checked by tests against
 `AGENT_EXECUTABLES`) so it can still start on a Windows Python that lacks `curses`.
 
+Muse and Kimi are recognized by the installer but require manual installation from the
+[Muse Code documentation](https://dev.meta.ai/docs/muse-code/) and
+[Kimi Code documentation](https://www.kimi.com/code/docs/en/kimi-code-cli/getting-started).
+The Kimi integration targets Kimi Code's `-p` headless interface, not the older Python
+`kimi-cli` interface that requires `--print`.
+
 ## Authenticate the agents
 
 After installing the CLIs, run the guided setup:
@@ -83,8 +86,8 @@ After installing the CLIs, run the guided setup:
 roundtable --auth-setup
 ```
 
-It prompts with hidden input for the three API-key paths Roundtable uses by default: Aider's
-`MISTRAL_API_KEY`, Grok's optional `XAI_API_KEY`, and Qwen's `OPENAI_API_KEY`. Press Enter to skip
+It prompts with hidden input for Aider's `MISTRAL_API_KEY`, Grok's optional `XAI_API_KEY`,
+Qwen's `OPENAI_API_KEY`, Muse's `META_API_KEY`, and Kimi's `KIMI_MODEL_API_KEY`. Press Enter to skip
 any provider you do not have a key for. Values are stored in `~/.roundtable/keys.env`, locked to
 the current user where the platform supports it, and are never printed. Existing environment
 variables take priority over stored values.
@@ -95,17 +98,23 @@ use `grok login --device-code` instead of an API key. For direct or scripted adm
 `roundtable --clear-key NAME`. Key commands intentionally require an interactive terminal so a
 secret cannot accidentally land in shell history, command arguments, or piped logs.
 
+For Muse, use `muse login` or save `META_API_KEY`. For Kimi, use its configured login/model
+or save `KIMI_MODEL_API_KEY`; with a direct key, Roundtable supplies `KIMI_MODEL_NAME`
+(default `kimi-for-coding`) if absent. An existing `KIMI_MODEL_NAME` is preserved.
+`--kimi-model` selects a model alias explicitly; custom endpoints can be set with
+`KIMI_MODEL_BASE_URL`. See [Kimi environment configuration](https://www.kimi.com/code/docs/en/kimi-code-cli/configuration/env-vars.html).
+
 ## Run it
 
-Roundtable runs with whichever of its six agent CLIs (`codex`, `claude`, `agy`, `aider`, `grok`,
-`qwen`) are actually available right now. One that isn't installed is skipped with a warning,
+Roundtable runs with whichever of its eight agent CLIs (`codex`, `claude`, `agy`, `aider`, `grok`,
+`qwen`, `muse`, `kimi`) are actually available right now. One that isn't installed is skipped with a warning,
 one that fails its startup check is dropped, and one that is out of quota leaves the round
 rather than holding it — only an empty table stops a run. `roundtable --list-agents` reports
 which are currently found on `PATH`.
 
 Name agents explicitly with `--agents codex,grok` when you want a specific table; an explicitly
 named agent that is missing is an error rather than a warning, since you asked for it. Use
-`--agents all` to require all six, and `--strict-preflight` to fail if any of them fails its
+`--agents all` to require all eight, and `--strict-preflight` to fail if any of them fails its
 check.
 
 To see who can actually take a turn before committing to a run — the "which of my accounts
@@ -130,7 +139,7 @@ each installed agent the same one-word connectivity prompt a real run does — a
 against each provider, small enough to ignore occasionally but not free to poll in a loop.
 Aider is
 model-agnostic — it defaults to `mistral/codestral-latest` here specifically so it doesn't just
-duplicate one of the five lab-native agents; point `--aider-model` at a different provider if you'd
+duplicate one of the seven lab-native agents; point `--aider-model` at a different provider if you'd
 rather it run as something else.
 
 ```bash
@@ -163,8 +172,8 @@ Useful options:
 --agents LIST          Which agents take part, comma-separated (e.g. --agents codex,grok).
                        Only the named CLIs are required, preflighted, given panels and given
                        turns, so a box where some agents are not installed — or a provider
-                       whose quota is gone — no longer blocks a run. "auto" uses whichever of
-                       the six are on PATH; "all" (the default) uses every agent. Order is
+                       whose quota is gone — no longer blocks a run. "auto" (the default) uses whichever of
+                       the eight are on PATH; "all" requires every agent. Order is
                        always canonical, however you type it. A one-agent roster is valid and
                        still produces a final answer. The roster is saved with the session, so
                        --resume reopens the same table.
@@ -202,9 +211,11 @@ Useful options:
 --antigravity-model MODEL
                        Override the configured Antigravity model
 --aider-model MODEL    Model for Aider, in LiteLLM naming (default: mistral/codestral-latest, kept
-                       distinct from the five lab-native agents below)
+                       distinct from the seven lab-native agents below)
 --grok-model MODEL     Override the configured Grok model
 --qwen-model MODEL     Override the configured Qwen model
+--muse-model MODEL     Override Muse's configured model
+--kimi-model MODEL     Override Kimi's configured model alias
 --reasoning-effort LEVEL
                        auto (default), low, medium, or high. Auto uses low effort for connectivity
                        checks, each CLI's default for working turns, and medium for final synthesis.
@@ -213,10 +224,10 @@ Useful options:
                        because reasoning-effort support varies by provider/model.
 --collab MODE          parallel (default), sequential (strict relay through every agent), or mixed
                        (parallel proposal, then rounds alternate relay/parallel)
---synthesizer WHO      codex, claude, antigravity, aider, grok, qwen, or rotate — who drafts the
+--synthesizer WHO      codex, claude, antigravity, aider, grok, qwen, muse, kimi, or rotate — who drafts the
                        final answer first, before the others refine it in turn (default: rotate by
                        objective)
---synthesis-passes 1-6 Number of sequential final-answer calls: one draft plus up to five
+--synthesis-passes 1-8 Number of sequential final-answer calls: one draft plus up to seven
                        refinements (default: 6; use 1 for the lowest latency and model usage)
 --balance-load         Give an agent running notably slower than the others a narrower-scoped
                        prompt in later parallel phases, instead of the same full task
@@ -242,15 +253,15 @@ Useful options:
                        --no-extended-preflight for the tighter timeout; either way, ignored if
                        --preflight-timeout is set explicitly
 --debug                Enable verbose diagnostic logging of sub-process commands, PIDs, exit codes, and tracebacks
---elevated AGENT       Run codex, claude, antigravity, aider, grok, qwen, or all with that CLI's
-                       own permission-bypass flag instead of the sandboxed default (repeatable).
+--elevated AGENT       Run codex, claude, antigravity, aider, grok, qwen, muse, kimi, or all with that CLI's
+                       own permission-bypass flag (repeatable; Kimi's headless mode is already automatic).
                        Dangerous — see Safety model.
 --plain                Stream a non-fullscreen version (also used in pipes)
 --output-dir PATH      Where Markdown, JSON, and log files are saved
 --resume SESSION.json  Resume a saved session; an objective argument becomes the follow-up
 --touch / --no-touch   Override automatic touchscreen detection
---list-agents          Print which of the six known AI CLIs (codex, claude, agy, aider, grok,
-                       qwen) are actually installed on this machine, then exit -- no objective,
+--list-agents          Print which of the eight known AI CLIs (codex, claude, agy, aider, grok,
+                       qwen, muse, kimi) are actually installed on this machine, then exit -- no objective,
                        TTY, or preflight required
 ```
 
@@ -265,7 +276,7 @@ roundtable --resume .roundtable/roundtable-20260718-120000-000000.json \
 Without follow-up text, fullscreen mode opens the follow-up editor. Plain or piped mode requires the
 follow-up as an argument or on standard input.
 
-Before the real task starts, all six CLIs get a quick "reply OK" preflight check (90s timeout each
+Before the real task starts, all eight CLIs get a quick "reply OK" preflight check (90s timeout each
 by default, run concurrently). This exists so a hung or unauthenticated CLI fails fast with a named
 reason instead of leaving every panel stuck on "waiting for task" with no explanation. Override the
 per-agent timeout with `--preflight-timeout`, or skip the check entirely with `--skip-preflight` if
@@ -284,7 +295,7 @@ sandbox, or Aider/Qwen against certain providers) rather than the model call its
 is on by default for exactly this reason; pass `--no-extended-preflight` for the tighter 25s if you'd
 rather fail fast. Explicit `--preflight-timeout` takes precedence over either.
 
-Launching all six agent subprocesses in the same instant can itself cause a real CPU/memory
+Launching all eight agent subprocesses in the same instant can itself cause a real CPU/memory
 contention spike on modest hardware, pushing every agent's response past its timeout — including ones
 that are individually fast. To avoid that, agent subprocesses are staggered by a fraction of a second
 each rather than all spawned at once; they still all run concurrently overall, and each agent's own
@@ -295,12 +306,13 @@ agent has already completed and verified the objective. Load-balancing timings l
 an agent's actual turn, not its intentional stagger delay. Checkpoint resumes preserve that verified
 completion state, so restarting a run does not restore review rounds that were already made redundant.
 
-The fullscreen view provides evenly spaced live Codex, Claude, Antigravity, Aider, Grok, and Qwen
+The fullscreen view provides evenly spaced live Codex, Claude, Antigravity, Aider, Grok, Qwen, Muse, and Kimi
 panes, independent working/waiting states, and agent-specific activity tickers next to agent names
 (a pulsing circle for Codex, an asterisk pulse for Claude, moving braille dots for Antigravity, a
-rotating quadrant for Aider, a dashing line for Grok, and a spinning arc for Qwen). On tall enough
-terminals the six panes lay out as a 2×3 grid (roughly double the panel width of a single six-wide
-row); shorter terminals keep one row of six so the outcome/monitor band still fits. A one-line roster
+rotating quadrant for Aider, a dashing line for Grok, a spinning arc for Qwen, bars for Muse,
+and moon phases for Kimi). On tall enough
+terminals the eight panes lay out as a 2×4 grid (roughly double the panel width of a single eight-wide
+row); shorter terminals keep one row of eight so the outcome/monitor band still fits. A one-line roster
 under the status line shows each agent's icon and ● working / ↻ retrying / ⏳ rate-limited /
 ✓ done / ✗ failed / ○ waiting mark at a glance. While a phase is running, the status line also
 reports how many agents are currently working and how many have finished that phase (and, when
@@ -330,7 +342,7 @@ shows `+N new`; returning to the live tail with `End`, ↓, or a downward wheel 
 
 Once the first task phase completes, phase status lines also show a coarse completion estimate.
 It is derived only from wall time observed in the current run and the remaining scheduled work:
-a parallel phase counts as one wall-time unit, a sequential six-agent relay as six, and each final
+a parallel phase counts as one wall-time unit, a sequential eight-agent relay as eight, and each final
 synthesis pass as one. No estimate is shown before there is real timing evidence, and bonus work,
 retries, or unusually different later phases can move it; treat it as an operational ETA, not a
 deadline. Time spent waiting for a provider usage limit to reset is excluded from later latency
@@ -385,9 +397,9 @@ shortcut, the modal shows as many as fit and a trailing `+N more — resize tall
 line rather than truncating silently. In any expanded panel,
 the arrow keys scroll one line; Page Up/Page Down move a screen at a time; and Home/End jump to the
 oldest/latest content, so long output remains navigable without a mouse.
-For keyboard-only navigation, `Tab` and `Shift-Tab` move a visible focus highlight through the six
+For keyboard-only navigation, `Tab` and `Shift-Tab` move a visible focus highlight through the eight
 agent panels, Task Outcome, Code Monitor, and Console; press `Enter` to expand or collapse the
-selected panel. The direct `1`–`6`, `f` (outcome), `m` (code monitor), and `0` (console) shortcuts
+selected panel. The direct `1`–`8`, `f` (outcome), `m` (code monitor), and `0` (console) shortcuts
 remain available.
 
 In a parallel phase, agents finish independently but the transcript only advances once every agent
@@ -432,8 +444,8 @@ workspace and reports the real pass/fail result (`independent verification: PASS
 taken at face value; ground truth is checked after every single turn that could have changed the
 code. Concurrent post-turn checks in a parallel phase are serialized, and a workspace whose
 `roundtable.py` / `test_roundtable.py` / `README.md` content matches the last verification reuses
-that result instead of spawning another full suite (so six agents finishing over unchanged source
-pay for one suite, not six). Changing any of those files invalidates the cache for that workspace;
+that result instead of spawning another full suite (so eight agents finishing over unchanged source
+pay for one suite, not eight). Changing any of those files invalidates the cache for that workspace;
 timeouts and launch failures are not cached. This still adds real wall-clock time to a `--self` run
 when source actually changes, but catches an overclaiming or hallucinating agent immediately rather
 than after the fact. It costs nothing outside `--self` (there is no known test command for an
@@ -468,9 +480,9 @@ operator does not need the console open to notice a blocked turn. These events a
 warnings, not fatal errors; exhausted retries still surface as failures.
 
 Final synthesis uses six sequential model calls by default: the chosen synthesizer drafts, then the
-other five agents refine in turn. For a faster, lower-cost run, `--synthesis-passes 1` returns the
-first draft directly; values up to `5` keep that many refinements. The selected `--synthesizer` is
-normally the drafter, and the default of six preserves the full roundtable review. With
+five other agents refine in turn. For a faster, lower-cost run, `--synthesis-passes 1` returns the
+first draft directly; larger values add one refinement per extra pass, capped at the active roster. The selected `--synthesizer` is
+normally the drafter, and `--synthesis-passes 8` includes all eight agents; the default remains six calls. With
 `--task-status-check`, once an agent has marked the objective complete (and at most one verification
 review has run), synthesis is automatically capped at draft + one refine so the final answer does
 not spend five more full CLI turns on polish; under `--synthesizer rotate`, the agent that declared
@@ -489,9 +501,9 @@ agent to check current progress (`git status`/`git diff`, re-reading relevant fi
 anything else, since time has passed and its own earlier partial work, or another agent's in a
 shared `--self` workspace, may already cover part of the task.
 
-Any panel — Codex, Claude, Antigravity, Aider, Grok, Qwen, the task outcome, the code monitor, or the
+Any panel — Codex, Claude, Antigravity, Aider, Grok, Qwen, Muse, Kimi, the task outcome, the code monitor, or the
 console — can be expanded to full-screen for its complete, un-truncated content: press
-`1`-`6`/`f`/`m`/`0`, or click/tap the panel. The code monitor title also shows compact `+N ~M −D`
+`1`-`8`/`f`/`m`/`0`, or click/tap the panel. The code monitor title also shows compact `+N ~M −D`
 change counts when files have been added, modified, or deleted.
 The same key, a click on the expanded panel, or `Esc`/`q` collapses it back to the dashboard. Keyboard
 shortcuts are only live while agents are working (not while typing a follow-up, so digits still type
@@ -622,10 +634,10 @@ terminal does not expose the digitizer automatically, or `--no-touch` when worki
 By default, Codex runs with `workspace-write`; Claude runs with `acceptEdits`; Antigravity runs
 sandboxed in `accept-edits` mode; Aider auto-accepts edits but is kept from suggesting or running
 shell commands; Grok runs with its own `acceptEdits` permission mode plus its `workspace` sandbox
-profile; Qwen runs with its `auto-edit` approval mode. All six receive the same working directory
-and may edit it, so use a version-controlled project and review the resulting diff. None of these
-defaults ask the agent to confirm file edits, but they do stop it short of running arbitrary shell
-commands unsandboxed or unconfirmed — in headless mode that can surface as an agent silently
+profile; Qwen runs with its `auto-edit` approval mode. Muse uses `--disable-approval`
+with `--trust-workspace`, retaining its sandbox. Kimi's `-p` mode uses automatic approval
+and has no separate elevated mode; Roundtable does not add OS sandboxing around it. All agents receive the same working directory
+and may edit it, so use a version-controlled project and review the resulting diff. These defaults allow file edits. The CLI-specific restrictions can still prevent shell commands — in headless mode that can surface as an agent silently
 declining a step it needed (for example Antigravity soft-denying a `Bash` tool call and returning a
 short explanation instead of real output). On editing turns, Aider discovers an existing git
 repository so its model receives a repository map, but Roundtable disables Aider's automatic
@@ -639,11 +651,11 @@ against the real CLI, that flag launches a container-backed sandbox and hangs in
 than failing cleanly when no container runtime is reachable, so its approval mode is the only gate
 by default.
 
-`--elevated AGENT` (repeatable; `codex`, `claude`, `antigravity`, `aider`, `grok`, `qwen`, or `all`)
+`--elevated AGENT` (repeatable; `codex`, `claude`, `antigravity`, `aider`, `grok`, `qwen`, `muse`, `kimi`, or `all`)
 swaps that agent's sandboxing for its CLI's own permission-bypass flag
 (`--dangerously-bypass-approvals-and-sandbox` for Codex, `--dangerously-skip-permissions` for Claude
 and Antigravity, `--suggest-shell-commands` for Aider, `bypassPermissions` for Grok, `yolo` for
-Qwen), so it can run shell commands freely instead of hitting that wall. This is off by default and
+Qwen, and `--yolo` for Muse; Kimi is unchanged), so it can run shell commands freely instead of hitting that wall. This is off by default and
 does what its name says: an elevated agent can run any command in your workspace without asking.
 Only use it in a project you trust the agents in, and still review the diff.
 

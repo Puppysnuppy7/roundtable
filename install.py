@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-"""Installer for roundtable and the six AI CLIs it drives.
+"""Installer for roundtable and the eight AI CLIs it drives.
 
-Links `roundtable.py` onto PATH as `roundtable`, then installs whichever of the
-AGENT_EXECUTABLES entries (see roundtable.py) it has a verified install command for. One of
-the six -- Antigravity (`agy`) -- has no package-manager install command known to this script
-(its official installer is a `curl | bash` / `irm | iex` script, not a registry package -- see
-the note above CLI_INSTALLERS), so it only reports whether it is present; it never guesses a
-curl/npm/pip command for it.
+Links `roundtable.py` onto PATH as `roundtable`, then installs agents with verified
+package-manager commands. Antigravity, Muse, and Kimi are detected and reported;
+install those CLIs using their vendor instructions. Never guess installation commands.
 
 Usage:
     python3 install.py                 # link roundtable + install all installable CLIs
@@ -50,6 +47,8 @@ AGENT_EXECUTABLES: dict[str, str] = {
     "Aider": "aider",
     "Grok": "grok",
     "Qwen": "qwen",
+    "Muse": "muse",
+    "Kimi": "kimi",
 }
 AGENT_NAMES: tuple[str, ...] = tuple(AGENT_EXECUTABLES)
 
@@ -65,6 +64,8 @@ CLI_INSTALLERS: dict[str, list[str] | list[list[str]] | None] = {
     "codex": ["npm", "install", "-g", "@openai/codex"],
     "claude": ["npm", "install", "-g", "@anthropic-ai/claude-code"],
     "agy": None,
+    "muse": None,
+    "kimi": None,
     # Not `pipx install aider-chat` directly: aider-chat hard-pins numpy==1.26.4, which has no
     # cp313 wheel on any platform (verified via PyPI's own JSON API, not just observed on one
     # machine) -- pip's naive resolver chokes on it. aider-install's own installer uses uv's

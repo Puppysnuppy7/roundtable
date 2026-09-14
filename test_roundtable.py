@@ -105,9 +105,8 @@ def make_test_display(h=48, w=160, turns=None):
     display.started = time.monotonic()
     display.touch_mode = False
     display.hitboxes = {}
-    display.scroll = {"Codex": 0, "Claude": 0, "Antigravity": 0, "Aider": 0, "Grok": 0, "Qwen": 0,
-                      "Final": 0, "Console": 0, "Code": 0}
-    display.usage_names = ("Codex", "Claude", "Antigravity", "Aider", "Grok", "Qwen")
+    display.scroll = dict.fromkeys(roundtable.Display.PANEL_NAMES, 0)
+    display.usage_names = roundtable.AGENT_NAMES
     display.turn_times = {name: [] for name in display.usage_names}
     display.turn_outputs = {name: [] for name in display.usage_names}
     display.activity_pulses = {name: roundtable.deque(maxlen=200) for name in display.usage_names}
@@ -143,6 +142,66 @@ class RoundtableTests(unittest.TestCase):
         # prior case's PASS/FAIL cannot leak into a later assertion about subprocess calls.
         roundtable.clear_self_verification_cache()
 
+    def test_muse_and_kimi_headless_commands(self):
+        for elevated in (False, True):
+            with self.subTest(elevated=elevated):
+                muse = roundtable.Agent("Muse", Path("/tmp/work"), "custom-model",
+                                        elevated=elevated)
+                command = muse.command("Solve this")
+                self.assertEqual(command[:2], ["muse", "exec"])
+                self.assertEqual(command[-3:], ["--model", "custom-model", "Solve this"])
+                self.assertEqual("--yolo" in command, elevated)
+                self.assertEqual("--disable-approval" in command, not elevated)
+                self.assertEqual("--trust-workspace" in command, not elevated)
+                kimi = roundtable.Agent("Kimi", Path("/tmp/work"), "configured-alias",
+                                        elevated=elevated)
+                self.assertEqual(kimi.command("Solve this"),
+                                 ["kimi", "--output-format", "text", "-m", "configured-alias",
+                                  "-p", "Solve this"])
+        # Do not override a vendor's existing login/configuration with an invented alias.
+        self.assertNotIn("-m", roundtable.Agent("Kimi", Path("/tmp")).command("Hi"))
+        self.assertIsNone(roundtable.build_parser().parse_args([]).kimi_model)
+
+    def test_kimi_environment_model_setup_preserves_user_configuration(self):
+        cases = [
+            ({}, None, None),
+            ({"KIMI_MODEL_API_KEY": "test-key"}, None, "kimi-for-coding"),
+            ({"KIMI_MODEL_API_KEY": "test-key"}, "chosen-model", "chosen-model"),
+            ({"KIMI_MODEL_API_KEY": "test-key", "KIMI_MODEL_NAME": "user-model"},
+             None, "user-model"),
+        ]
+        for environment, model, expected in cases:
+            with self.subTest(model=model, expected=expected), \
+                 tempfile.TemporaryDirectory() as td, \
+                 mock.patch.dict(os.environ, environment, clear=True), \
+                 mock.patch.object(roundtable.subprocess, "Popen", side_effect=OSError("stop")) as launch:
+                with self.assertRaisesRegex(RuntimeError, "failed to start process"):
+                    roundtable.Agent("Kimi", Path(td), model).run("Hi", lambda *_: None)
+                self.assertEqual(launch.call_args.kwargs["env"].get("KIMI_MODEL_NAME"), expected)
+                self.assertEqual(os.environ.get("KIMI_MODEL_NAME"), environment.get("KIMI_MODEL_NAME"))
+
+    def test_eight_agent_grid_has_two_rows_and_all_panels_fit(self):
+        for width in (72, 120, 160, 240):
+            with self.subTest(width=width):
+                columns, panels = roundtable.agent_grid(width, 17, 8)
+                self.assertEqual(columns, 4)
+                self.assertEqual(len(panels), 8)
+                self.assertEqual(len({y for y, _, _, _ in panels}), 2)
+                for y, x, height, panel_width in panels:
+                    self.assertGreaterEqual(height, 8)
+                    self.assertLessEqual(y + height, 22)
+                    self.assertGreaterEqual(x, 0)
+                    self.assertLessEqual(x + panel_width, width)
+
+    def test_new_agent_model_overrides_survive_restart(self):
+        parser = roundtable.build_parser()
+        args = parser.parse_args(["Task", "--agents", "muse,kimi", "--muse-model", "meta-alias",
+                                  "--kimi-model", "moonshot-alias", "--synthesis-passes", "8"])
+        command = roundtable.restart_arguments(args, Path("/tmp/session.json"), followup=False)
+        self.assertEqual(command[command.index("--muse-model") + 1], "meta-alias")
+        self.assertEqual(command[command.index("--kimi-model") + 1], "moonshot-alias")
+        self.assertEqual(command[command.index("--synthesis-passes") + 1], "8")
+
     def test_work_event_strips_terminal_codes_and_labels_common_operations(self):
         self.assertEqual(roundtable.work_event("\x1b[32mReading app.py\x1b[0m"),
                          "⌕ Reading app.py")
@@ -175,7 +234,7 @@ class RoundtableTests(unittest.TestCase):
             )
 
     def test_active_agent_boxes_show_their_own_work_feeds(self):
-        display = make_test_display(w=240)
+        display = make_test_display(w=320)
         display.busy = True
         display.active = {"Codex", "Claude"}
         display.work_activity["Codex"].extend([
@@ -1161,7 +1220,8 @@ class RoundtableTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             session = roundtable.Session("Solve it", td, 1, "now", [])
             agents = [roundtable.MockAgent(name, Path(td)) for name in roundtable.AGENT_NAMES]
-            roundtable.conduct(session, agents, lambda *_: None, lambda *_: None)
+            roundtable.conduct(session, agents, lambda *_: None, lambda *_: None,
+                               synthesis_passes=len(roundtable.AGENT_NAMES))
             self.assertEqual([t.speaker for t in session.turns],
                              list(roundtable.AGENT_NAMES) + list(roundtable.AGENT_NAMES) + ["Final"])
             self.assertTrue(session.final)
@@ -1484,6 +1544,7 @@ class RoundtableTests(unittest.TestCase):
             agents = [roundtable.MockAgent(name, Path(td)) for name in roundtable.AGENT_NAMES]
             roundtable.conduct(session, agents, lambda *_: None,
                                lambda *_: None, synthesizer="claude",
+                               synthesis_passes=len(roundtable.AGENT_NAMES),
                                log_prompt=lambda name, p: logged.append((name, p)))
             names_logged = [name for name, _ in logged]
             # proposal + review round 1 + one relay step in the final merge, for every agent
@@ -1872,8 +1933,8 @@ class RoundtableTests(unittest.TestCase):
             with mock.patch.object(sys, "argv", argv), \
                  mock.patch.object(roundtable, "MockAgent", RecordingAgent):
                 roundtable.main()
-            self.assertEqual(captured, {"Codex": False, "Claude": False, "Antigravity": True,
-                                        "Aider": False, "Grok": False, "Qwen": False})
+            self.assertEqual(captured, {name: name == "Antigravity"
+                                        for name in roundtable.AGENT_NAMES})
 
     def test_task_status_check_flag_reaches_conduct(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2291,7 +2352,8 @@ class RoundtableTests(unittest.TestCase):
             session = roundtable.Session(
                 f"Improve gui\n\n{roundtable.SELF_EDIT_NOTE}", td, 1, "now", [])
             votes = {"Codex": "now", "Claude": "now", "Antigravity": "now",
-                    "Aider": "later", "Grok": "later", "Qwen": "now"}
+                    "Aider": "later", "Grok": "later", "Qwen": "now",
+                    "Muse": "now", "Kimi": "now"}
             agents = {name: RestartVotingAgent(name, Path(td), votes[name])
                      for name in roundtable.AGENT_NAMES}
             checkpoint = mock.Mock(side_effect=roundtable.SelfRestartRequired)
@@ -2313,7 +2375,7 @@ class RoundtableTests(unittest.TestCase):
             checkpoint.assert_called_once()
             tally_lines = [m for m in status_messages if m.startswith("RESTART vote:")]
             self.assertEqual(len(tally_lines), 1)
-            self.assertIn("now=4 later=2 → restarting now", tally_lines[0])
+            self.assertIn("now=6 later=2 → restarting now", tally_lines[0])
             self.assertIn("now: Codex, Claude, Antigravity, Qwen", tally_lines[0])
             self.assertIn("later: Aider, Grok", tally_lines[0])
 
@@ -2324,7 +2386,8 @@ class RoundtableTests(unittest.TestCase):
             session = roundtable.Session(
                 f"Improve gui\n\n{roundtable.SELF_EDIT_NOTE}", td, 2, "now", [])
             votes = {"Codex": "later", "Claude": "later", "Antigravity": "later",
-                    "Aider": "now", "Grok": "now", "Qwen": "later"}
+                    "Aider": "now", "Grok": "now", "Qwen": "later",
+                    "Muse": "later", "Kimi": "later"}
             agents = {name: RestartVotingAgent(name, Path(td), votes[name])
                      for name in roundtable.AGENT_NAMES}
             checkpoint = mock.Mock(side_effect=roundtable.SelfRestartRequired)
@@ -2869,17 +2932,24 @@ class RoundtableTests(unittest.TestCase):
             roundtable.AGENT_EXECUTABLES.update(original)
 
     def test_agent_roster_stays_aligned_across_names_executables_ui_and_spinners(self):
-        """The six AIs must agree everywhere they are named: display order, CLI map, TUI panels,
-        and spinner keys. Adding a seventh agent without updating all of these is a real bug."""
+        """Every agent must agree everywhere it is named: display order, CLI map, TUI panels,
+        spinner keys, role hints and expand keybinds. Adding an agent without updating all of
+        these is a real bug, so this is a deliberate tripwire -- update it consciously."""
         names = roundtable.AGENT_NAMES
-        self.assertEqual(names, ("Codex", "Claude", "Antigravity", "Aider", "Grok", "Qwen"))
+        self.assertEqual(names, ("Codex", "Claude", "Antigravity", "Aider", "Grok", "Qwen",
+                                 "Muse", "Kimi"))
         self.assertEqual(tuple(roundtable.AGENT_EXECUTABLES), names)
         self.assertEqual(
             dict(roundtable.AGENT_EXECUTABLES),
             {"Codex": "codex", "Claude": "claude", "Antigravity": "agy",
-             "Aider": "aider", "Grok": "grok", "Qwen": "qwen"},
+             "Aider": "aider", "Grok": "grok", "Qwen": "qwen",
+             "Muse": "muse", "Kimi": "kimi"},
         )
-        self.assertEqual(roundtable.Display.PANEL_NAMES[:6], names)
+        self.assertEqual(roundtable.Display.PANEL_NAMES[:len(names)], names)
+        self.assertEqual(tuple(entry[0] for entry in roundtable.Display.AGENTS), names)
+        # Every agent needs a way to expand its panel, or it is unreachable in the TUI.
+        self.assertEqual(
+            set(v for v in roundtable.Display.EXPAND_KEYS.values() if v in names), set(names))
         self.assertEqual(set(roundtable.AGENT_SPINNERS), set(names))
         self.assertEqual(len(roundtable.ROLE_HINTS_BY_SLOT), len(names))
         self.assertEqual(set(roundtable.role_hints_for("roster-lock")), set(names))
@@ -3236,9 +3306,10 @@ class RoundtableTests(unittest.TestCase):
                  mock.patch.object(roundtable.sys.stdin, "isatty", return_value=True), \
                  mock.patch.dict(os.environ, {
                      "MISTRAL_API_KEY": "", "XAI_API_KEY": "", "OPENAI_API_KEY": "",
+                     "META_API_KEY": "", "KIMI_MODEL_API_KEY": "",
                  }), \
                  mock.patch("getpass.getpass",
-                            side_effect=["mistral-secret", "", "qwen-secret"]), \
+                            side_effect=["mistral-secret", "", "qwen-secret", "meta-secret", "kimi-secret"]), \
                  mock.patch("builtins.print",
                             side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
                 result = roundtable._run_key_command_from_cli(["--auth-setup"])
@@ -3247,10 +3318,14 @@ class RoundtableTests(unittest.TestCase):
             self.assertEqual(loaded, {
                 "MISTRAL_API_KEY": "mistral-secret",
                 "OPENAI_API_KEY": "qwen-secret",
+                "META_API_KEY": "meta-secret",
+                "KIMI_MODEL_API_KEY": "kimi-secret",
             })
             body = "\n".join(printed)
             self.assertNotIn("mistral-secret", body)
             self.assertNotIn("qwen-secret", body)
+            self.assertNotIn("meta-secret", body)
+            self.assertNotIn("kimi-secret", body)
             self.assertIn("codex login", body)
             self.assertIn("grok login --device-code", body)
 
@@ -3670,7 +3745,7 @@ class RoundtableTests(unittest.TestCase):
         self.assertFalse(any("marked the task complete" in text for text in tick_logs))
 
     def test_failed_agent_panel_shows_failure_state(self):
-        display = make_test_display(h=30, w=160)
+        display = make_test_display(h=30, w=216)
         display.busy = True
         display.active = set()
         display.phase_failed = {"Codex"}
@@ -3780,14 +3855,14 @@ class RoundtableTests(unittest.TestCase):
         self.assertLessEqual(len(compact), 67)
         self.assertIn("ctrl+c cancel", compact)
         self.assertIn("i add prompt", compact)
-        self.assertIn("1-6/f/0", compact)
+        self.assertIn("1-8/f/0", compact)
         self.assertIn("? help", compact)
         self.assertNotIn("…", compact)
 
         wide = roundtable.dashboard_hint(120, touch_mode=False, busy=False)
         self.assertIn("c filter", wide)
         self.assertIn("click panel", wide)
-        self.assertIn("1-6/f/0/m", wide)
+        self.assertIn("1-8/f/0/m", wide)
         self.assertIn("transcript autosaved", wide)
         self.assertNotIn("add prompt", wide)
 
@@ -3795,7 +3870,7 @@ class RoundtableTests(unittest.TestCase):
         compact = roundtable.expanded_hint(67, touch_mode=False)
         self.assertLessEqual(len(compact), 67)
         self.assertIn("Esc/q collapse", compact)
-        self.assertIn("1-6/f/0/", compact)  # Updated to include the 'm' panel option
+        self.assertIn("1-8/f/0/", compact)  # Updated to include the 'm' panel option
         self.assertIn("↑/↓", compact)
         self.assertIn("scroll", compact)
         self.assertNotIn("…", compact)
@@ -4336,7 +4411,7 @@ class RoundtableTests(unittest.TestCase):
             display.draw()
         header_row = display.s.grid[5]
         border_cols = [i for i, ch in enumerate(header_row) if ch in "╭╮"]
-        self.assertEqual(len(border_cols), 12, display.s.text())
+        self.assertEqual(len(border_cols), 2 * len(roundtable.AGENT_NAMES), display.s.text())
 
     def test_followup_editor_reserves_its_own_bottom_band(self):
         class Screen:
@@ -4450,8 +4525,8 @@ class RoundtableTests(unittest.TestCase):
             self.assertNotIn("tightly scoped", seen_prompts["Antigravity"])
 
     def test_conduct_balance_load_scopes_slower_agent_in_review_round(self):
-        delays = {"Codex": 0.02, "Claude": 0.02, "Antigravity": 0.32, "Aider": 0.02, "Grok": 0.02,
-                 "Qwen": 0.02}
+        delays = dict.fromkeys(roundtable.AGENT_NAMES, 0.02)
+        delays["Antigravity"] = 0.32
         seen_prompts: list[tuple[str, str]] = []
 
         class StaggeredAgent(roundtable.Agent):
@@ -4617,12 +4692,14 @@ class RoundtableTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             agents = {name: roundtable.MockAgent(name, Path(td)) for name in roundtable.AGENT_NAMES}
             session = roundtable.Session("Objective", td, 0, "now", [])
-            order = roundtable.synthesis_order("claude", session, list(agents.values()))
+            order = roundtable.synthesis_order("claude", session, list(agents.values()),
+                                               passes=len(roundtable.AGENT_NAMES))
             self.assertEqual([name for name, _ in order][0], "Claude")
             self.assertEqual({name for name, _ in order}, set(roundtable.AGENT_NAMES))
             self.assertEqual(len(order), len(roundtable.AGENT_NAMES))
             # Stable for the same objective, but the trailing order need not match agent-list order.
-            again = roundtable.synthesis_order("claude", session, list(agents.values()))
+            again = roundtable.synthesis_order("claude", session, list(agents.values()),
+                                               passes=len(roundtable.AGENT_NAMES))
             self.assertEqual([name for name, _ in order], [name for name, _ in again])
 
     def test_synthesis_order_limits_passes_without_changing_the_drafter(self):
@@ -4645,7 +4722,8 @@ class RoundtableTests(unittest.TestCase):
             agents = {name: roundtable.MockAgent(name, Path(td)) for name in roundtable.AGENT_NAMES}
             session = roundtable.Session("Objective", td, 0, "now", [])
             order = roundtable.synthesis_order(
-                "claude", session, list(agents.values()), preferred_first="Grok")
+                "claude", session, list(agents.values()), preferred_first="Grok",
+                passes=len(roundtable.AGENT_NAMES))
             self.assertEqual(order[0][0], "Grok")
             self.assertEqual({name for name, _ in order}, set(roundtable.AGENT_NAMES))
             # Unknown or empty preferred names fall back to --synthesizer selection.
@@ -5960,7 +6038,7 @@ class RoundtableTests(unittest.TestCase):
 
     def test_agent_panel_keeps_usage_in_compact_state_when_it_fits(self):
         """When full '● working · 95% used' is too long, still show '● work · 95%' if possible."""
-        display = make_test_display(h=25, w=120)
+        display = make_test_display(h=25, w=160)
         display.busy = True
         display.active = {"Codex"}
         display.usage_percent["Codex"] = 95.0
@@ -5968,13 +6046,13 @@ class RoundtableTests(unittest.TestCase):
              mock.patch.object(roundtable.curses, "has_colors", return_value=False):
             display.draw()
         rendered = display.s.text()
-        # At 120 cols the full label is still too wide for a six-agent row, so the compact
+        # At 160 cols the full label is still too wide for a eight-agent row, so the compact
         # form must retain the percentage rather than dropping the gauge entirely.
         self.assertIn("● work · 95%", rendered)
         self.assertNotIn("● working · 95% used", rendered)
 
     def test_draw_renders_work_monitoring_counters(self):
-        display = make_test_display(h=30, w=240)
+        display = make_test_display(h=30, w=320)
         display.work_reads["Codex"] = 12
         display.work_execs["Codex"] = 8
         display.work_writes["Codex"] = 4
@@ -6019,7 +6097,7 @@ class RoundtableTests(unittest.TestCase):
             self.assertIn("ANTIGRAVITY", rendered)
 
     def test_draw_renders_ticker_only_for_active_agent(self):
-        display = make_test_display(h=30, w=120)
+        display = make_test_display(h=30, w=160)
         display.busy = True
         display.active = {"Claude"}
         display.frame = 3
@@ -6079,7 +6157,7 @@ class RoundtableTests(unittest.TestCase):
                 # Every box-drawing corner char from _box must survive untouched; if a
                 # header overran its column it would clobber one of these.
                 border_cols = [i for i, ch in enumerate(header_row) if ch in "╭╮"]
-                self.assertEqual(len(border_cols), 12, display.s.text())
+                self.assertEqual(len(border_cols), 2 * len(roundtable.AGENT_NAMES), display.s.text())
 
     def test_agent_panel_rows_never_overrun_borders_at_minimum_width(self):
         display = make_test_display(h=25, w=72)
@@ -6097,7 +6175,7 @@ class RoundtableTests(unittest.TestCase):
                     self.assertEqual(display.s.grid[row][right], "│", display.s.text())
                 self.assertEqual(display.s.grid[bottom][right], "╯")
         rendered = display.s.text()
-        self.assertIn("● work", rendered)
+        self.assertIn("● w", rendered)
         self.assertNotIn("-0.0s", rendered)
 
     def test_agent_header_is_clipped_to_panel_width(self):
@@ -6264,7 +6342,7 @@ class RoundtableTests(unittest.TestCase):
              mock.patch("roundtable.save_session", return_value=("/tmp/s.json", "/tmp/s.md")), \
              mock.patch("roundtable.finalize_agent_prompt_file") as finalize_board, \
              mock.patch("roundtable.suppress_focus_reporting"):
-            ret = roundtable.run_tui(stdscr, args, session, [None]*6,
+            ret = roundtable.run_tui(stdscr, args, session, [None]*len(roundtable.AGENT_NAMES),
                                      resumed=False)
 
         self.assertEqual(ret, 0)
@@ -6295,7 +6373,7 @@ class RoundtableTests(unittest.TestCase):
              mock.patch("roundtable.save_session", return_value=("/tmp/s.json", "/tmp/s.md")), \
              mock.patch("roundtable.finalize_agent_prompt_file"), \
              mock.patch("roundtable.suppress_focus_reporting"):
-            ret = roundtable.run_tui(stdscr, args, session, [None]*6,
+            ret = roundtable.run_tui(stdscr, args, session, [None]*len(roundtable.AGENT_NAMES),
                                      resumed=False)
 
         self.assertEqual(ret, 0)
@@ -6332,7 +6410,7 @@ class RoundtableTests(unittest.TestCase):
              mock.patch("roundtable.curses.endwin"), \
              mock.patch("roundtable.suppress_focus_reporting"):
             ret = roundtable.run_tui(
-                stdscr, args, session, [None]*6, resumed=False,
+                stdscr, args, session, [None]*len(roundtable.AGENT_NAMES), resumed=False,
                 checkpoint=lambda: None)
 
         self.assertEqual(ret, 0)
@@ -6370,7 +6448,7 @@ class RoundtableTests(unittest.TestCase):
              mock.patch("roundtable.save_session", return_value=("/tmp/s.json", "/tmp/s.md")), \
              mock.patch("roundtable.suppress_focus_reporting"):
             ret = roundtable.run_tui(
-                stdscr, args, session, [None]*6, resumed=True,
+                stdscr, args, session, [None]*len(roundtable.AGENT_NAMES), resumed=True,
                 completed_phases={"followup-proposal"})
 
         self.assertEqual(ret, 0)
@@ -6912,7 +6990,7 @@ class RoundtableTests(unittest.TestCase):
         self.assertEqual(display.focused_panel, "Console")
 
     def test_focused_panel_title_is_visually_marked(self):
-        display = make_test_display(h=30, w=100)
+        display = make_test_display(h=30, w=136)
         display.focused_panel = "Codex"
         calls = []
         original_put = display._put
@@ -7119,7 +7197,7 @@ class RoundtableTests(unittest.TestCase):
                      mock.patch.object(roundtable.curses, "has_colors", return_value=False), \
                      mock.patch("roundtable.finalize_agent_prompt_file"), \
                      mock.patch("roundtable.suppress_focus_reporting"):
-                    ret = roundtable.run_tui(stdscr, args, session, [None]*6,
+                    ret = roundtable.run_tui(stdscr, args, session, [None]*len(roundtable.AGENT_NAMES),
                                              resumed=False)
                 saved = list((Path(td) / ".roundtable").glob("*.json"))
             finally:
@@ -7154,7 +7232,7 @@ class RoundtableTests(unittest.TestCase):
                      mock.patch.object(roundtable.curses, "has_colors", return_value=False), \
                      mock.patch("roundtable.finalize_agent_prompt_file"), \
                      mock.patch("roundtable.suppress_focus_reporting"):
-                    ret = roundtable.run_tui(stdscr, args, session, [None]*6,
+                    ret = roundtable.run_tui(stdscr, args, session, [None]*len(roundtable.AGENT_NAMES),
                                              resumed=False)
                 saved = list((Path(td) / ".roundtable").glob("*.json"))
             finally:
@@ -7187,7 +7265,7 @@ class RoundtableTests(unittest.TestCase):
                                return_value=(Path("/tmp/s.json"), Path("/tmp/s.md"))), \
              mock.patch.object(roundtable, "finalize_agent_prompt_file"):
             roundtable.run_tui(mock.Mock(), args, session,
-                              [mock.Mock() for _ in range(6)])
+                              [mock.Mock() for _ in roundtable.AGENT_NAMES])
         mock_ui.log.assert_any_call("Preflight skipped by configuration", kind="phase")
 
     def test_display_scroll_focused_panel_when_unexpanded(self):
@@ -7551,7 +7629,8 @@ class RosterSelectionTests(unittest.TestCase):
             output_dir=None, collab="parallel", synthesizer="rotate",
             synthesis_passes=6, rounds=1, workspace=None, agents="codex,grok",
             codex_model=None, claude_model=None, antigravity_model=None, aider_model=None,
-            grok_model=None, qwen_model=None, reasoning_effort="auto", elevated=[],
+            grok_model=None, qwen_model=None, muse_model=None, kimi_model=None,
+            reasoning_effort="auto", elevated=[],
             plain=False, mock=False, balance_load=False, task_status_check=False,
             reassign_idle=False, dead_code_check=False, chat=False, debug=False,
             extended_preflight=True, preflight_timeout=None, touch=None)
@@ -7666,7 +7745,8 @@ class UsageLimitPolicyTests(unittest.TestCase):
             output_dir=None, collab="parallel", synthesizer="rotate",
             synthesis_passes=6, rounds=1, workspace=None, agents=None, on_limit="wait",
             codex_model=None, claude_model=None, antigravity_model=None, aider_model=None,
-            grok_model=None, qwen_model=None, reasoning_effort="auto", elevated=[],
+            grok_model=None, qwen_model=None, muse_model=None, kimi_model=None,
+            reasoning_effort="auto", elevated=[],
             plain=False, mock=False, balance_load=False, task_status_check=False,
             reassign_idle=False, dead_code_check=False, chat=False, debug=False,
             extended_preflight=True, preflight_timeout=None, touch=None)
@@ -7679,7 +7759,8 @@ class UsageLimitPolicyTests(unittest.TestCase):
             output_dir=None, collab="parallel", synthesizer="rotate",
             synthesis_passes=6, rounds=1, workspace=None, agents=None, on_limit="drop",
             codex_model=None, claude_model=None, antigravity_model=None, aider_model=None,
-            grok_model=None, qwen_model=None, reasoning_effort="auto", elevated=[],
+            grok_model=None, qwen_model=None, muse_model=None, kimi_model=None,
+            reasoning_effort="auto", elevated=[],
             plain=False, mock=False, balance_load=False, task_status_check=False,
             reassign_idle=False, dead_code_check=False, chat=False, debug=False,
             extended_preflight=True, preflight_timeout=None, touch=None)

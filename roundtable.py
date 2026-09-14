@@ -131,6 +131,8 @@ def _run_key_command_from_cli(argv: list[str] | None = None) -> int:
             ("Aider (Mistral/Codestral)", "MISTRAL_API_KEY"),
             ("Grok", "XAI_API_KEY"),
             ("Qwen (OpenAI-compatible provider)", "OPENAI_API_KEY"),
+            ("Muse (Meta)", "META_API_KEY"),
+            ("Kimi (Moonshot)", "KIMI_MODEL_API_KEY"),
         )
         saved: list[str] = []
         print(f"API keys are stored in {keys_path} with user-only permissions.")
@@ -508,13 +510,15 @@ def verify_self_edit_turn(session: "Session", agent: "Agent", tick: Callable[[st
     tick(f"independent verification: {'PASS' if passed else 'FAIL'} — {detail}")
 
 
-AGENT_NAMES: tuple[str, ...] = ("Codex", "Claude", "Antigravity", "Aider", "Grok", "Qwen")
+AGENT_NAMES: tuple[str, ...] = ("Codex", "Claude", "Antigravity", "Aider", "Grok", "Qwen",
+                                "Muse", "Kimi")
 
 # Canonical mapping from display name to the CLI executable roundtable shells out to. Kept as the
 # single source of truth so verify_clis, log_run_context, and --list-agents can't drift apart.
 AGENT_EXECUTABLES: dict[str, str] = {
     "Codex": "codex", "Claude": "claude", "Antigravity": "agy",
     "Aider": "aider", "Grok": "grok", "Qwen": "qwen",
+    "Muse": "muse", "Kimi": "kimi",
 }
 
 # Lowercase spellings accepted by --agents, mapped back to the canonical display name. Built from
@@ -565,7 +569,7 @@ def resolve_roster(spec: str | None, installed: Callable[[str], bool] | None = N
         found = tuple(name for name in AGENT_NAMES if on_path(name))
         if not found:
             raise RosterError(
-                "--agents auto found none of the six agent CLIs on PATH; install at least one "
+                "--agents auto found none of the known agent CLIs on PATH; install at least one "
                 "(roundtable --install) or name the agents explicitly")
         return found
     chosen: list[str] = []
@@ -633,10 +637,15 @@ ROLE_HINTS_BY_SLOT: tuple[str, ...] = (
     "checks yourself, and flag anything that looks unverified or overstated.",
     "Your edge here is integration: reconcile the different approaches proposed so far into one "
     "coherent plan, resolving conflicts between them explicitly rather than just picking a side.",
+    "Your edge here is scale: hold the whole change in view at once -- check that it is consistent "
+    "across every file it touches, and name anything the others fixed locally that breaks "
+    "elsewhere.",
+    "Your edge here is the failure case: assume this will be run on real data by someone who did "
+    "not write it, and say concretely how it breaks -- bad input, missing state, wrong assumptions.",
 )
 
 
-# Chat mode's equivalent of ROLE_HINTS_BY_SLOT: the same six complementary lanes, reframed for an
+# Chat mode's equivalent of ROLE_HINTS_BY_SLOT: the same complementary lanes, reframed for an
 # open discussion/question instead of a coding task (no sandboxed execution, no diffs to land).
 CHAT_ROLE_HINTS_BY_SLOT: tuple[str, ...] = (
     "Your edge here is grounding: back up claims with specifics rather than asserting something as "
@@ -651,11 +660,18 @@ CHAT_ROLE_HINTS_BY_SLOT: tuple[str, ...] = (
     "flag anything that looks unverified or overstated.",
     "Your edge here is integration: reconcile the different views proposed so far into one coherent "
     "answer, resolving disagreements between them explicitly rather than just picking a side.",
+    "Your edge here is scale: keep the whole question in view rather than one slice of it, and say "
+    "where an answer that is right in isolation stops being right in context.",
+    "Your edge here is the failure case: say concretely where this advice stops working -- the "
+    "conditions, edge cases, or assumptions under which the group's answer would be wrong.",
 )
 
 
 def role_hints_for(objective: str, chat: bool = False) -> dict[str, str]:
-    """Assign the six role hints to the six agents, rotated by objective.
+    """Assign one role hint per agent, rotated by objective.
+
+    There is one hint per slot in AGENT_NAMES order -- adding an agent without adding a hint would
+    silently leave it with no role, so the counts are asserted below.
 
     Stable across follow-ups in the same session (same objective), but varies session to session so
     each agent leads execution, reasoning, breadth, fast narrow diffs, verification, and integration
@@ -664,6 +680,9 @@ def role_hints_for(objective: str, chat: bool = False) -> dict[str, str]:
     offset = int(hashlib.sha256(("roles:" + objective).encode()).hexdigest(), 16) % len(AGENT_NAMES)
     rotated = AGENT_NAMES[offset:] + AGENT_NAMES[:offset]
     hints = CHAT_ROLE_HINTS_BY_SLOT if chat else ROLE_HINTS_BY_SLOT
+    if len(hints) != len(AGENT_NAMES):
+        raise ValueError(
+            f"{len(AGENT_NAMES)} agents but {len(hints)} role hints -- every agent needs a slot")
     return dict(zip(rotated, hints))
 
 
@@ -853,11 +872,11 @@ def dashboard_hint(width: int, touch_mode: bool, busy: bool) -> str:
     else:
         add_prompt = " · i add prompt" if busy else ""
         choices = [
-            f"ctrl+c cancel{add_prompt} · Tab select · Enter expand · 1-6/f/0/m · click panel · "
+            f"ctrl+c cancel{add_prompt} · Tab select · Enter expand · 1-8/f/0/m · click panel · "
             "c filter · ? help · transcript autosaved",
-            f"ctrl+c cancel{add_prompt} · 1-6/f/0/m expand · click panel · ? help",
-            f"ctrl+c cancel{add_prompt} · 1-6/f/0/m expand · ? help",
-            f"ctrl+c cancel{add_prompt} · 1-6/f/0/m expand",
+            f"ctrl+c cancel{add_prompt} · 1-8/f/0/m expand · click panel · ? help",
+            f"ctrl+c cancel{add_prompt} · 1-8/f/0/m expand · ? help",
+            f"ctrl+c cancel{add_prompt} · 1-8/f/0/m expand",
         ]
     return next((choice for choice in choices if len(choice) <= width), choices[-1][:width])
 
@@ -872,11 +891,11 @@ def expanded_hint(width: int, touch_mode: bool) -> str:
         ]
     else:
         choices = [
-            "same key or Esc/q collapses · 1-6/f/0/m switch panels · c cycles filter · "
+            "same key or Esc/q collapses · 1-8/f/0/m switch panels · c cycles filter · "
             "↑/↓/PgUp/PgDn/Home/End or wheel scrolls · ? for help",
-            "Esc/q collapse · 1-6/f/0/m switch · ↑/↓/PgUp/PgDn scroll · c filter · ? help",
-            "Esc/q collapse · 1-6/f/0/m switch · ↑/↓ scroll · ? help",
-            "Esc/q collapse · 1-6/f/0/m switch · ↑/↓ scroll",
+            "Esc/q collapse · 1-8/f/0/m switch · ↑/↓/PgUp/PgDn scroll · c filter · ? help",
+            "Esc/q collapse · 1-8/f/0/m switch · ↑/↓ scroll · ? help",
+            "Esc/q collapse · 1-8/f/0/m switch · ↑/↓ scroll",
         ]
     return next((choice for choice in choices if len(choice) <= width), choices[-1][:width])
 
@@ -899,11 +918,11 @@ def code_change_summary(changes: list) -> str:
 def agent_grid(total_width: int, agent_area_height: int, count: int,
                top: int = 5, gap: int = 2, row_gap: int = 1,
                min_row_height: int = 8) -> tuple[int, list[tuple[int, int, int, int]]]:
-    """Lay out agent panels as 2×3 when height allows, otherwise one row of ``count``.
+    """Lay out agent panels in two balanced rows when height allows, otherwise one row of ``count``.
 
     Returns (cols_per_row, [(y, x, height, width), ...]) in agent order. Empty when the
-    area is too small to place anything. Preferring two rows of three roughly doubles
-    each panel's width versus a single six-column row at the same terminal size — the
+    area is too small to place anything. Preferring two rows roughly doubles
+    each panel's width versus a single full-roster row at the same terminal size — the
     live work feed and response text become readable instead of single-word columns.
 
     Responsive layout: As terminal gets smaller, panels shrink gracefully while maintaining
@@ -913,7 +932,7 @@ def agent_grid(total_width: int, agent_area_height: int, count: int,
         return 0, []
     cols = count
     if count >= 4 and agent_area_height >= (2 * min_row_height + row_gap):
-        cols = min(3, count)
+        cols = (count + 1) // 2
     rows = (count + cols - 1) // cols
     if rows > 1:
         panel_h = max(3, (agent_area_height - row_gap * (rows - 1)) // rows)
@@ -1163,6 +1182,8 @@ AGENT_SPINNERS: dict[str, tuple[tuple[str, ...], int]] = {
     "Aider": (("◢", "◣", "◤", "◥"), 2),
     "Grok": (("╌", "╍", "━", "╍"), 2),
     "Qwen": (("◜", "◝", "◞", "◟"), 2),
+    "Muse": (("▁", "▃", "▅", "▇", "▅", "▃"), 2),
+    "Kimi": (("◐", "◓", "◑", "◒"), 2),
 }
 
 
@@ -1272,6 +1293,24 @@ class Agent:
             if output_file:
                 cmd += ["--output-last-message", str(output_file)]
             return cmd + [prompt]
+        if self.name == "Muse":
+            # Sub-command-first, like Codex: `muse exec` runs one prompt to completion with no UI,
+            # and the options belong to exec rather than the root command.
+            # --disable-approval is REQUIRED for unattended runs -- it skips approval prompts while
+            # keeping Muse's own sandbox. --yolo drops the sandbox too, so it is the elevated path.
+            cmd = [AGENT_EXECUTABLES[self.name], "exec"]
+            cmd += ["--yolo"] if self.elevated else ["--disable-approval", "--trust-workspace"]
+            if self.model:
+                cmd += ["--model", self.model]
+            return cmd + [prompt]
+        if self.name == "Kimi":
+            # -p runs one prompt non-interactively and prints the response. Kimi refuses to combine
+            # --prompt with --yolo/--auto/--plan because -p already runs under its `auto` permission
+            # policy, so there is no separate elevated flag to pass here.
+            cmd = [AGENT_EXECUTABLES[self.name], "--output-format", "text"]
+            if self.model:
+                cmd += ["-m", self.model]
+            return cmd + ["-p", prompt]
         if self.name == "Claude":
             cmd = [AGENT_EXECUTABLES[self.name], "--print", "--no-session-persistence",
                    "--output-format", "text"]
@@ -1410,6 +1449,10 @@ class Agent:
             env = dict(os.environ)
             env["QWEN_CODE_SUPPRESS_YOLO_WARNING"] = "1"
             env["PYTHONIOENCODING"] = "utf-8"
+            if self.name == "Kimi" and env.get("KIMI_MODEL_API_KEY"):
+                # The key alone does not enable Kimi's environment-defined provider.
+                # Preserve configured/login defaults when no direct API key is supplied.
+                env.setdefault("KIMI_MODEL_NAME", self.model or "kimi-for-coding")
             try:
                 proc = subprocess.Popen(
                     cmd, cwd=self.workspace, stdin=subprocess.DEVNULL,
@@ -2509,6 +2552,8 @@ class Display:
             curses.init_pair(7, curses.COLOR_BLUE, -1)
             curses.init_pair(8, curses.COLOR_WHITE, -1)
             curses.init_pair(9, curses.COLOR_GREEN, -1)
+            curses.init_pair(10, curses.COLOR_CYAN, -1)
+            curses.init_pair(11, curses.COLOR_MAGENTA, -1)
 
     def log(self, text: str, kind: str = "info", file_text: str | None = None) -> None:
         elapsed = time.monotonic() - self.started
@@ -2726,6 +2771,7 @@ class Display:
 
     EXPAND_KEYS = {ord("1"): "Codex", ord("2"): "Claude", ord("3"): "Antigravity", ord("4"): "Aider",
                   ord("5"): "Grok", ord("6"): "Qwen",
+                  ord("7"): "Muse", ord("8"): "Kimi",
                   ord("f"): "Final", ord("F"): "Final",
                   ord("m"): "Code", ord("M"): "Code",
                   ord("0"): "Console"}
@@ -2742,7 +2788,7 @@ class Display:
     )
     # Order matches visual layout: agents, then Final, Code Monitor, Console.
     # Code used to be scroll-only (mouse wheel) with no expand path — m/click/Tab now work.
-    PANEL_NAMES = ("Codex", "Claude", "Antigravity", "Aider", "Grok", "Qwen",
+    PANEL_NAMES = ("Codex", "Claude", "Antigravity", "Aider", "Grok", "Qwen", "Muse", "Kimi",
                    "Final", "Code", "Console")
     SCROLL_NAMES = PANEL_NAMES
     AGENTS = (
@@ -2752,6 +2798,8 @@ class Display:
         ("Aider", "✦", "Open-source coding agent", 7),
         ("Grok", "▲", "xAI coding agent", 8),
         ("Qwen", "◈", "Alibaba coding agent", 9),
+        ("Muse", "❖", "Meta coding agent", 10),
+        ("Kimi", "◆", "Moonshot coding agent", 11),
     )
 
     def set_roster(self, names: Iterable[str]) -> None:
@@ -3656,7 +3704,7 @@ class Display:
                 ("Tab/Shift-Tab", "Select the next / previous expandable panel"),
                 ("Enter", "Expand or collapse the selected panel"),
                 ("Click / wheel", "Click a panel to expand it; wheel scrolls it"),
-                ("1 - 6", "Expand / collapse Agent 1..6 panel full-screen"),
+                ("1 - 8", "Expand / collapse Agent 1..8 panel full-screen"),
                 ("f / F", "Expand / collapse Final Answer & Outcome panel"),
                 ("m / M", "Expand / collapse Code Monitor panel"),
                 ("0",     "Expand / collapse Console log panel"),
@@ -5124,6 +5172,10 @@ def preflight_check(name: str, agent: Agent, tick: Callable[[str, str], None],
             "Grok": ("run `grok login --device-code` or "
                      "`roundtable --set-key XAI_API_KEY`"),
             "Qwen": "run `roundtable --set-key OPENAI_API_KEY`",
+            "Muse": ("run `muse login` (device code) or "
+                     "`roundtable --set-key META_API_KEY`"),
+            # Moonshot is env-var only -- no browser step, unlike agy.
+            "Kimi": "run `roundtable --set-key KIMI_MODEL_API_KEY`",
         }.get(name, f"configure `{executable}`")
         if re.search(r"api[ _-]?key|not able to authenticate|401 unauthorized|missing bearer",
                      detail, re.IGNORECASE):
@@ -5712,7 +5764,7 @@ def verify_clis(mock: bool, roster: tuple[str, ...] | None = None,
 
 
 def list_agents() -> str:
-    """Report which of the six known AI CLIs are actually installed on this machine.
+    """Report which of the known AI CLIs are actually installed on this machine.
 
     Uses the same AGENT_EXECUTABLES lookup as verify_clis/log_run_context so this can never
     disagree with what a real (non-mock) run actually requires or records.
@@ -6252,7 +6304,9 @@ def restart_arguments(args: argparse.Namespace, session_path: Path,
                           ("--antigravity-model", args.antigravity_model),
                           ("--aider-model", args.aider_model),
                           ("--grok-model", args.grok_model),
-                          ("--qwen-model", args.qwen_model)):
+                          ("--qwen-model", args.qwen_model),
+                          ("--muse-model", args.muse_model),
+                          ("--kimi-model", args.kimi_model)):
         if value:
             command.extend((option, value))
     if args.reasoning_effort != "auto":
@@ -6312,6 +6366,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "so Aider's underlying model doesn't just duplicate one of the other "
                              "lab-native agents)")
     parser.add_argument("--grok-model")
+    parser.add_argument("--muse-model")
+    parser.add_argument("--kimi-model",
+                        help="Kimi model alias (default: Kimi's configuration or KIMI_MODEL_NAME; "
+                             "a direct KIMI_MODEL_API_KEY defaults to kimi-for-coding)")
     parser.add_argument("--qwen-model", default=AGENT_DEFAULT_MODELS["Qwen"],
                         help="model for Qwen (default: qwen3-coder-plus). Always required in "
                              "practice -- verified against the real CLI, Qwen Code silently fails "
@@ -6329,14 +6387,16 @@ def build_parser() -> argparse.ArgumentParser:
                              "strict relay through every agent, or a mix that alternates relay and "
                              "parallel review rounds")
     parser.add_argument("--synthesizer",
-                        choices=["codex", "claude", "antigravity", "aider", "grok", "qwen", "rotate"],
+                        choices=[name.lower() for name in AGENT_NAMES] + ["rotate"],
                         default="rotate",
                         help="who drafts the final answer first, before the others refine it in "
                              "turn (default: rotate by objective so no one model always drafts)")
-    parser.add_argument("--synthesis-passes", type=int, choices=range(1, 7), default=6,
-                        metavar="1-6",
-                        help="number of sequential final-answer passes: one draft plus up to five "
-                             "refinements (default: 6; use 1 for lowest latency and model usage)")
+    parser.add_argument("--synthesis-passes", type=int,
+                        choices=range(1, len(AGENT_NAMES) + 1), default=6,
+                        metavar=f"1-{len(AGENT_NAMES)}",
+                        help="number of sequential final-answer passes: one draft plus refinements, "
+                             "capped at the roster size (default: 6; use 1 for lowest latency and "
+                             "model usage)")
     parser.add_argument("--balance-load", action="store_true",
                         help="in parallel phases, give an agent running notably slower than the "
                              "others a narrower-scoped prompt instead of the same full task, so "
@@ -6362,7 +6422,7 @@ def build_parser() -> argparse.ArgumentParser:
                              "(no_edit), role hints and the final answer format are reframed for "
                              "prose, and --dead-code-check is forced off")
     parser.add_argument("--elevated",
-                        choices=["codex", "claude", "antigravity", "aider", "grok", "qwen", "all"],
+                        choices=[name.lower() for name in AGENT_NAMES] + ["all"],
                         action="append", default=[], metavar="AGENT",
                         help="run the named agent (repeatable, or 'all') with its CLI's own "
                              "permission-bypass flag instead of the sandboxed default, so tool "
@@ -6401,7 +6461,7 @@ def build_parser() -> argparse.ArgumentParser:
                              "Only the named CLIs are required, preflighted, given panels and "
                              "given turns, so a box where some agents aren't installed -- or a "
                              "provider whose quota is gone -- no longer blocks a run. 'auto' uses "
-                             "whichever of the six are on PATH; 'all' (the default) uses every "
+                             "whichever of the known agents are on PATH; 'all' (the default) uses every "
                              "agent. Order is always canonical, however you type it")
     parser.add_argument("--on-limit", choices=("wait", "drop"), default="drop",
                         help="what to do when an agent hits its provider's usage limit "
@@ -6445,7 +6505,7 @@ def build_parser() -> argparse.ArgumentParser:
                              "rest. Useful for scripted runs where a quietly smaller table "
                              "would be the wrong outcome")
     parser.add_argument("--list-agents", action="store_true",
-                        help="print which of the six known AI CLIs (the other agents in the "
+                        help="print which of the known AI CLIs (the other agents in the "
                              "roundtable) are installed on this machine, then exit without "
                              "starting a session")
     parser.add_argument("--install", action="store_true",
@@ -6730,6 +6790,8 @@ def main() -> int:
         "aider": elevated_all or "aider" in args.elevated,
         "grok": elevated_all or "grok" in args.elevated,
         "qwen": elevated_all or "qwen" in args.elevated,
+        "muse": elevated_all or "muse" in args.elevated,
+        "kimi": elevated_all or "kimi" in args.elevated,
     }
     codex = cls("Codex", workspace, args.codex_model, elevated=elevated["codex"], debug=args.debug)
     claude = cls("Claude", workspace, args.claude_model, elevated=elevated["claude"], debug=args.debug)
@@ -6740,7 +6802,9 @@ def main() -> int:
     qwen = cls("Qwen", workspace, args.qwen_model, elevated=elevated["qwen"], debug=args.debug)
     # Canonical order, matching AGENT_NAMES. roster_agents() zips against that order, so this
     # sequence is the single place the mapping from position to agent is established.
-    agents = (codex, claude, antigravity, aider, grok, qwen)
+    muse = cls("Muse", workspace, args.muse_model, elevated=elevated["muse"], debug=args.debug)
+    kimi = cls("Kimi", workspace, args.kimi_model, elevated=elevated["kimi"], debug=args.debug)
+    agents = (codex, claude, antigravity, aider, grok, qwen, muse, kimi)
     for agent in agents:
         agent.reasoning_effort = args.reasoning_effort
     followup = (args.continue_after_restart == "followup" if continuing else resumed)
