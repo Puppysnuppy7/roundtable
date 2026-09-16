@@ -5842,10 +5842,44 @@ def check_agents(timeout: float = EXTENDED_PREFLIGHT_TIMEOUT_SECONDS,
 STATUS_STALE_AFTER_SECONDS = 45 * 60
 
 
+# Windows keeps an exited process's pid openable for as long as any handle to it survives, so
+# os.kill(pid, 0) -- which is only an OpenProcess call there, not a real signal -- answers True for
+# a process that finished long ago. Asking for the exit code is what separates the two: a genuinely
+# running process reports STILL_ACTIVE. (A process that exits with code 259 reads as running until
+# its handles close. That is the documented cost of this API, and far rarer than the alternative of
+# calling every dead run alive, which is the one thing describe_run_state must never do.)
+_WINDOWS_STILL_ACTIVE = 259
+
+
+def _windows_process_is_running(pid: int) -> bool:
+    """Whether a pid is a live process on Windows. Never raises."""
+    import ctypes
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    ERROR_ACCESS_DENIED = 5
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except (OSError, AttributeError):  # pragma: no cover - not reachable on a real Windows box
+        return True
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        # Access denied means the process exists but belongs to someone else -- the same case the
+        # POSIX branch below treats as alive. Any other error means there is no such process.
+        return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+    try:
+        code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return True
+        return code.value == _WINDOWS_STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _process_is_running(pid: int) -> bool:
     """Whether a pid exists on this machine. Never raises."""
     if pid <= 0:
         return False
+    if os.name == "nt":
+        return _windows_process_is_running(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

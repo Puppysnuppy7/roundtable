@@ -8346,6 +8346,7 @@ class RemoteInvocationTests(unittest.TestCase):
     tailscale-only laptop cannot satisfy, which is what made those commands local-only in practice.
     """
 
+    @unittest.skipUnless(os.name == "posix", "needs a real POSIX shell to stand in for sshd's")
     def test_the_objective_survives_a_real_remote_shell(self):
         """The one place in this program where a quoting bug is worse than a crash: ssh joins its
         command words and hands the result to a shell on the far side."""
