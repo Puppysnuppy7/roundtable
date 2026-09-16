@@ -1,5 +1,4 @@
 .roundtable/
 __pycache__/
-HANDOFF.md
 .aider*
 AGENT_PROMPTS.md
