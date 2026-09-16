@@ -2192,8 +2192,10 @@ def load_session(path: Path) -> Session:
     restart_count = data.get("restart_count", 0)
     if not isinstance(restart_count, int) or isinstance(restart_count, bool) or restart_count < 0:
         raise ValueError("session field 'restart_count' must be a non-negative int")
-    # Sessions written before --agents existed have no roster; they were six-agent runs by
-    # definition, so absent means all six rather than an error.
+    # Sessions written before --agents existed have no roster, so absent means the full current
+    # roster rather than an error. Note this resolves to today's AGENT_NAMES, not the roster the
+    # session originally ran with: resuming a pre---agents session now seats every agent, including
+    # any added since it was saved. That is deliberate -- a resume picks up the current roster.
     roster = data.get("roster", list(AGENT_NAMES))
     requested = data.get("requested_roster", roster)
     for label, value in (("roster", roster), ("requested_roster", requested)):
@@ -3298,7 +3300,7 @@ class Display:
                 mark = "✓"
             else:
                 mark = "○"
-            # Short labels keep six agents visible at the 72-col minimum.
+            # Short labels keep the whole roster visible at the 72-col minimum.
             short = {"Antigravity": "Anti"}.get(name, name)
             if w < 90:
                 short = short[:4]
@@ -5017,8 +5019,8 @@ def pick_synthesizer(choice: str, session: Session,
 
 
 # After --task-status-check marks the objective done (and at most one verification review), a full
-# six-agent synthesis relay is mostly polish. Draft + one refine is enough to shape a merge-style
-# final answer without spending five more full CLI turns.
+# full-roster synthesis relay is mostly polish. Draft + one refine is enough to shape a merge-style
+# final answer without spending a full CLI turn on every remaining agent.
 EARLY_COMPLETE_SYNTHESIS_PASSES = 2
 
 
@@ -6289,7 +6291,7 @@ def restart_arguments(args: argparse.Namespace, session_path: Path,
                     str(args.synthesis_passes), "--skip-preflight"))
     if getattr(args, "rounds", None) is not None:
         command.extend(("--rounds", str(args.rounds)))
-    # Without this the restarted process resolves an all-six roster and re-requires all six CLIs,
+    # Without this the restarted process resolves the full roster and re-requires every CLI,
     # so a --self run on a box that only has some of them would die at verify_clis mid-session.
     if getattr(args, "agents", None):
         command.extend(("--agents", args.agents))
@@ -6395,8 +6397,10 @@ def build_parser() -> argparse.ArgumentParser:
                         choices=range(1, len(AGENT_NAMES) + 1), default=6,
                         metavar=f"1-{len(AGENT_NAMES)}",
                         help="number of sequential final-answer passes: one draft plus refinements, "
-                             "capped at the roster size (default: 6; use 1 for lowest latency and "
-                             "model usage)")
+                             f"capped at the roster size (default: 6 of {len(AGENT_NAMES)}; use 1 for "
+                             "lowest latency and model usage). Agents past this count still "
+                             "contribute their work -- the drafter reads the whole transcript -- "
+                             "they just do not take a relay turn of their own.")
     parser.add_argument("--balance-load", action="store_true",
                         help="in parallel phases, give an agent running notably slower than the "
                              "others a narrower-scoped prompt instead of the same full task, so "

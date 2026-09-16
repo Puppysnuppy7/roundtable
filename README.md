@@ -228,7 +228,9 @@ Useful options:
                        final answer first, before the others refine it in turn (default: rotate by
                        objective)
 --synthesis-passes 1-8 Number of sequential final-answer calls: one draft plus up to seven
-                       refinements (default: 6; use 1 for the lowest latency and model usage)
+                       refinements (default: 6 of 8; use 1 for the lowest latency and model
+                       usage). Agents past this count still contribute their work, since the
+                       drafter reads the whole transcript; they just don't take a relay turn.
 --balance-load         Give an agent running notably slower than the others a narrower-scoped
                        prompt in later parallel phases, instead of the same full task
 --task-status-check    In parallel phases, stop agents still working once one marks the objective
