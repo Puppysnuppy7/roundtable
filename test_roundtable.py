@@ -3310,6 +3310,8 @@ class RoundtableTests(unittest.TestCase):
                  }), \
                  mock.patch("getpass.getpass",
                             side_effect=["mistral-secret", "", "qwen-secret", "meta-secret", "kimi-secret"]), \
+                 mock.patch("shutil.which", side_effect=lambda exe: f"/bin/{exe}"), \
+                 mock.patch.object(roundtable, "_probe_login", return_value=None), \
                  mock.patch("builtins.print",
                             side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
                 result = roundtable._run_key_command_from_cli(["--auth-setup"])
@@ -3328,6 +3330,122 @@ class RoundtableTests(unittest.TestCase):
             self.assertNotIn("kimi-secret", body)
             self.assertIn("codex login", body)
             self.assertIn("grok login --device-code", body)
+            self.assertIn("roundtable --login", body)
+            self.assertIn("kimi login", body)
+
+    def test_agent_auth_table_covers_every_agent(self):
+        self.assertEqual(set(roundtable._AGENT_AUTH), set(roundtable.AGENT_NAMES))
+        for name, (executable, _, _) in roundtable._AGENT_AUTH.items():
+            self.assertEqual(executable, roundtable.AGENT_EXECUTABLES[name])
+
+    def test_auth_recovery_hint_offers_login_and_key_where_both_exist(self):
+        hint = roundtable._auth_recovery_hint("Kimi")
+        self.assertIn("`kimi login`", hint)
+        self.assertIn("--set-key KIMI_MODEL_API_KEY", hint)
+        self.assertEqual(roundtable._auth_recovery_hint("Aider"),
+                         "`roundtable --set-key MISTRAL_API_KEY`")
+        self.assertIn("browser login", roundtable._auth_recovery_hint("Antigravity"))
+
+    def test_codex_login_uses_device_auth_only_when_headless(self):
+        with mock.patch.object(roundtable, "_headless", return_value=True):
+            self.assertEqual(roundtable._login_command("Codex"),
+                             ("codex", "login", "--device-auth"))
+        with mock.patch.object(roundtable, "_headless", return_value=False):
+            self.assertEqual(roundtable._login_command("Codex"), ("codex", "login"))
+
+    def _fake_auth_env(self, installed, probes=None):
+        probes = probes or {}
+        return (
+            mock.patch("shutil.which",
+                       side_effect=lambda exe: f"/bin/{exe}" if exe in installed else None),
+            mock.patch.object(roundtable, "_probe_login",
+                              side_effect=lambda name, path: probes.get(name)),
+        )
+
+    def test_login_without_terminal_only_reports(self):
+        with tempfile.TemporaryDirectory() as td:
+            printed = []
+            which, probe = self._fake_auth_env({"codex", "kimi", "aider"}, {"Codex": True})
+            with which, probe, \
+                 mock.patch.object(roundtable, "_keys_file", return_value=Path(td) / "keys.env"), \
+                 mock.patch.dict(os.environ, {"MISTRAL_API_KEY": "", "KIMI_MODEL_API_KEY": ""}), \
+                 mock.patch.object(roundtable.sys.stdin, "isatty", return_value=False), \
+                 mock.patch("subprocess.call") as call, \
+                 mock.patch("builtins.print",
+                            side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
+                result = roundtable._run_key_command_from_cli(["--login"])
+            self.assertEqual(result, 0)
+            call.assert_not_called()
+            body = "\n".join(printed)
+            self.assertRegex(body, r"Codex\s+logged in")
+            self.assertRegex(body, r"Kimi\s+unknown")
+            self.assertRegex(body, r"Aider\s+NO KEY \(MISTRAL_API_KEY\)")
+            self.assertRegex(body, r"Grok\s+not installed")
+
+    def test_login_named_agent_runs_its_vendor_login(self):
+        with tempfile.TemporaryDirectory() as td:
+            which, probe = self._fake_auth_env({"kimi"})
+            with which, probe, \
+                 mock.patch.object(roundtable, "_keys_file", return_value=Path(td) / "keys.env"), \
+                 mock.patch.object(roundtable.sys.stdin, "isatty", return_value=True), \
+                 mock.patch("subprocess.call", return_value=0) as call, \
+                 mock.patch("builtins.print"):
+                result = roundtable._run_key_command_from_cli(["--login", "kimi"])
+            self.assertEqual(result, 0)
+            call.assert_called_once_with(["/bin/kimi", "login"])
+
+    def test_login_key_only_agent_prompts_for_its_key(self):
+        with tempfile.TemporaryDirectory() as td:
+            keys_path = Path(td) / "keys.env"
+            which, probe = self._fake_auth_env({"aider"})
+            with which, probe, \
+                 mock.patch.object(roundtable, "_keys_file", return_value=keys_path), \
+                 mock.patch.dict(os.environ, {"MISTRAL_API_KEY": ""}), \
+                 mock.patch.object(roundtable.sys.stdin, "isatty", return_value=True), \
+                 mock.patch("getpass.getpass", return_value="mistral-secret"), \
+                 mock.patch("subprocess.call") as call, \
+                 mock.patch("builtins.print"):
+                result = roundtable._run_key_command_from_cli(["--login", "aider"])
+                loaded = roundtable._load_stored_keys()
+            self.assertEqual(result, 0)
+            call.assert_not_called()
+            self.assertEqual(loaded, {"MISTRAL_API_KEY": "mistral-secret"})
+
+    def test_login_rejects_unknown_and_uninstalled_agents(self):
+        with tempfile.TemporaryDirectory() as td:
+            which, probe = self._fake_auth_env(set())
+            with which, probe, \
+                 mock.patch.object(roundtable, "_keys_file", return_value=Path(td) / "keys.env"), \
+                 mock.patch.object(roundtable.sys.stdin, "isatty", return_value=True), \
+                 mock.patch("subprocess.call") as call, \
+                 mock.patch("builtins.print"):
+                self.assertEqual(roundtable._run_key_command_from_cli(["--login", "nope"]), 1)
+                self.assertEqual(roundtable._run_key_command_from_cli(["--login", "muse"]), 1)
+            call.assert_not_called()
+
+    def test_login_walk_only_offers_agents_needing_attention(self):
+        with tempfile.TemporaryDirectory() as td:
+            which, probe = self._fake_auth_env({"codex", "muse"},
+                                               {"Codex": True, "Muse": False})
+            with which, probe, \
+                 mock.patch.object(roundtable, "_keys_file", return_value=Path(td) / "keys.env"), \
+                 mock.patch.dict(os.environ, {"META_API_KEY": ""}), \
+                 mock.patch.object(roundtable.sys.stdin, "isatty", return_value=True), \
+                 mock.patch("builtins.input", return_value="y") as ask, \
+                 mock.patch("subprocess.call", return_value=0) as call, \
+                 mock.patch("builtins.print"):
+                result = roundtable._run_key_command_from_cli(["--login"])
+            self.assertEqual(result, 0)
+            ask.assert_called_once()
+            self.assertIn("Muse", ask.call_args[0][0])
+            call.assert_called_once_with(["/bin/muse", "login"])
+
+    def test_login_flag_invokes_key_command_from_cli(self):
+        with mock.patch("roundtable._run_key_command_from_cli", return_value=0) as mock_key_cmd, \
+             mock.patch("roundtable.apply_stored_keys"), \
+             mock.patch("sys.argv", ["roundtable", "--login", "kimi"]):
+            self.assertEqual(roundtable.main(), 0)
+            mock_key_cmd.assert_called_once_with(["--login", "kimi"])
 
     def test_run_key_command_auth_setup_requires_interactive_terminal(self):
         with tempfile.TemporaryDirectory() as td:

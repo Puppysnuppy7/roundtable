@@ -103,6 +103,194 @@ def apply_stored_keys() -> None:
         os.environ.setdefault(name, value)
 
 
+# How each agent authenticates: its executable, the vendor login command (None for key-only
+# agents), and the API-key env var it accepts (None for login-only agents). The single source for
+# --login, --auth-setup's closing summary, and preflight's recovery hints, so they cannot drift.
+# Commands were read off each CLI's own --help, not docs: Kimi Code and Muse both ship a
+# device-code `login` subcommand, and agy has no login subcommand -- its browser login runs on
+# first interactive launch.
+_AGENT_AUTH: dict[str, tuple[str, tuple[str, ...] | None, str | None]] = {
+    "Codex": ("codex", ("codex", "login"), None),
+    "Claude": ("claude", ("claude", "auth", "login"), None),
+    "Antigravity": ("agy", ("agy",), None),
+    "Aider": ("aider", None, "MISTRAL_API_KEY"),
+    "Grok": ("grok", ("grok", "login", "--device-code"), "XAI_API_KEY"),
+    "Qwen": ("qwen", None, "OPENAI_API_KEY"),
+    "Muse": ("muse", ("muse", "login"), "META_API_KEY"),
+    "Kimi": ("kimi", ("kimi", "login"), "KIMI_MODEL_API_KEY"),
+}
+
+
+def _headless() -> bool:
+    """True when no local browser can open: a POSIX box without a graphical session (e.g. over
+    ssh). macOS and Windows always have one."""
+    import os
+    return (os.name == "posix" and sys.platform != "darwin"
+            and not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"))
+
+
+def _login_command(name: str) -> tuple[str, ...] | None:
+    command = _AGENT_AUTH[name][1]
+    # Codex's default login waits on a localhost browser redirect, which a headless box can never
+    # complete; its device-code flow works from any terminal.
+    if name == "Codex" and command is not None and _headless():
+        return (*command, "--device-auth")
+    return command
+
+
+def _auth_recovery_hint(name: str) -> str:
+    """One-line 'how to fix it' for an agent that failed authentication."""
+    _, _, key_var = _AGENT_AUTH.get(name, (name.lower(), None, None))
+    command = _login_command(name) if name in _AGENT_AUTH else None
+    parts = []
+    if command is not None:
+        shown = " ".join(command)
+        parts.append(f"run `{shown}` and complete its browser login" if name == "Antigravity"
+                     else f"run `{shown}`")
+    if key_var:
+        parts.append(f"`roundtable --set-key {key_var}`")
+    return " or ".join(parts) if parts else f"configure `{name.lower()}`"
+
+
+def _probe_login(name: str, executable: str) -> bool | None:
+    """Cheap, local-only check of whether an agent's own login is present. True/False when the
+    CLI or its credential file can answer; None when there is no reliable local signal -- never
+    guess, preflight is the real test."""
+    import json
+    import os
+    import subprocess
+    from pathlib import Path
+
+    def run(*args: str) -> subprocess.CompletedProcess | None:
+        try:
+            return subprocess.run([executable, *args], capture_output=True, text=True,
+                                  timeout=15, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    if name == "Codex":
+        result = run("login", "status")
+        return None if result is None else result.returncode == 0
+    if name == "Claude":
+        result = run("auth", "status")
+        if result is None:
+            return None
+        try:
+            return bool(json.loads(result.stdout).get("loggedIn"))
+        except (ValueError, AttributeError):
+            return None
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    credential = {"Grok": Path.home() / ".grok" / "auth.json",
+                  "Muse": config_home / "muse" / "auth.json"}.get(name)
+    if credential is not None:
+        return credential.is_file() and credential.stat().st_size > 0
+    return None
+
+
+def _auth_status_rows() -> list[tuple[str, str, str, bool]]:
+    """(agent, state, how to authenticate, needs attention) for every known agent."""
+    import os
+    import shutil
+
+    stored = _load_stored_keys()
+    rows = []
+    for name, (executable, _, key_var) in _AGENT_AUTH.items():
+        path = shutil.which(executable)
+        hint = _auth_recovery_hint(name)
+        if path is None:
+            rows.append((name, "not installed", "see `roundtable --install`", False))
+            continue
+        if key_var and os.environ.get(key_var):
+            rows.append((name, f"ready ({key_var} in environment)", hint, False))
+            continue
+        if key_var and stored.get(key_var):
+            rows.append((name, f"ready ({key_var} stored)", hint, False))
+            continue
+        logged_in = _probe_login(name, path)
+        if logged_in is True:
+            rows.append((name, "logged in", hint, False))
+        elif logged_in is False:
+            rows.append((name, "NOT logged in", hint, True))
+        elif _AGENT_AUTH[name][1] is None:
+            rows.append((name, f"NO KEY ({key_var})", hint, True))
+        else:
+            rows.append((name, "unknown (preflight will check)", hint, True))
+    return rows
+
+
+def _print_auth_status(rows: list[tuple[str, str, str, bool]]) -> None:
+    width = max(len(row[1]) for row in rows)
+    for name, state, hint, _ in rows:
+        print(f"  {name:<12} {state:<{width}}  {hint}")
+
+
+def _run_login(name: str) -> int:
+    """Run one agent's vendor login in this terminal, or prompt for its key if it has none."""
+    import shutil
+    import subprocess
+
+    executable, _, key_var = _AGENT_AUTH[name]
+    if shutil.which(executable) is None:
+        print(f"error: {name} ({executable}) is not installed -- see `roundtable --install`",
+              file=sys.stderr)
+        return 1
+    command = _login_command(name)
+    if command is None:
+        print(f"{name} authenticates with an API key; storing {key_var}.")
+        return _run_key_command_from_cli(["--set-key", key_var])
+    if name == "Antigravity":
+        print("agy has no login subcommand: its browser login starts on first launch. "
+              "Complete it, then exit agy (Ctrl+C) to return here.")
+    print(f"$ {' '.join(command)}", flush=True)
+    try:
+        resolved = [shutil.which(command[0]) or command[0], *command[1:]]
+        return subprocess.call(resolved)
+    except KeyboardInterrupt:
+        print()
+        return 130
+    except OSError as exc:
+        print(f"error: could not run {command[0]}: {exc}", file=sys.stderr)
+        return 1
+
+
+def _run_login_command(target: str) -> int:
+    """--login [AGENT]: show every agent's auth state; log in to one, or walk the ones that
+    need it. Without a terminal it only reports, so it is safe in scripts and over ssh."""
+    rows = _auth_status_rows()
+    print("Agent authentication (local checks only; preflight is the real test):")
+    _print_auth_status(rows)
+    if target != "all":
+        match = next((name for name in _AGENT_AUTH
+                      if target.lower() in (name.lower(), _AGENT_AUTH[name][0])), None)
+        if match is None:
+            print(f"\nerror: unknown agent {target!r}; expected one of: "
+                  + ", ".join(name.lower() for name in _AGENT_AUTH), file=sys.stderr)
+            return 1
+        if not sys.stdin.isatty():
+            print("\nerror: --login needs an interactive terminal", file=sys.stderr)
+            return 1
+        print()
+        return _run_login(match)
+    pending = [name for name, state, _, attention in rows if attention]
+    if not pending:
+        print("\nNothing needs attention.")
+        return 0
+    if not sys.stdin.isatty():
+        print("\nRun `roundtable --login AGENT` in a terminal to log in.")
+        return 0
+    failures = 0
+    for name in pending:
+        try:
+            answer = input(f"\nLog in to {name} now? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nstopped")
+            break
+        if answer in ("y", "yes"):
+            failures += _run_login(name) != 0
+    print("\nLaunch Roundtable normally; preflight will verify every agent.")
+    return 1 if failures else 0
+
+
 def _run_key_command_from_cli(argv: list[str] | None = None) -> int:
     """Handle --set-key/--list-keys/--clear-key without importing the rest of this module (same
     reasoning as _run_install_from_cli: must work on stock Windows Python, and none of this needs
@@ -118,8 +306,12 @@ def _run_key_command_from_cli(argv: list[str] | None = None) -> int:
     parser.add_argument("--list-keys", action="store_true")
     parser.add_argument("--clear-key", metavar="NAME")
     parser.add_argument("--auth-setup", action="store_true")
+    parser.add_argument("--login", nargs="?", const="all", metavar="AGENT")
     known, _ = parser.parse_known_args(args)
     keys_path = _keys_file()
+
+    if known.login:
+        return _run_login_command(known.login)
 
     if known.auth_setup:
         if not sys.stdin.isatty():
@@ -155,12 +347,10 @@ def _run_key_command_from_cli(argv: list[str] | None = None) -> int:
             print("\nsaved: " + ", ".join(saved))
         else:
             print("\nno new API keys saved")
-        print("\nLogin-based agents use their vendor CLIs instead:")
-        print("  Codex:       codex login")
-        print("  Claude:      claude")
-        print("  Antigravity: agy")
-        print("  Grok:        grok login --device-code  (alternative to XAI_API_KEY)")
-        print("After setup, launch Roundtable normally; preflight will verify every agent.")
+        print("\nEvery agent's current state (login-based agents use their vendor CLIs):")
+        _print_auth_status(_auth_status_rows())
+        print("\nRun `roundtable --login` to log in to the ones that need it, or launch "
+              "Roundtable normally; preflight will verify every agent.")
         return 0
 
     if known.list_keys:
@@ -204,12 +394,12 @@ def _run_key_command_from_cli(argv: list[str] | None = None) -> int:
         print(f"saved {known.set_key} to {keys_path}")
         return 0
 
-    print("error: expected one of --set-key NAME, --list-keys, --clear-key NAME",
+    print("error: expected one of --set-key NAME, --list-keys, --clear-key NAME, --login",
           file=sys.stderr)
     return 1
 
 
-_KEY_COMMAND_FLAGS = ("--set-key", "--list-keys", "--clear-key", "--auth-setup")
+_KEY_COMMAND_FLAGS = ("--set-key", "--list-keys", "--clear-key", "--auth-setup", "--login")
 
 # Must run before `import curses` so stock Windows Python can still install/update/bugsend/manage
 # keys.
@@ -5165,26 +5355,17 @@ def preflight_check(name: str, agent: Agent, tick: Callable[[str, str], None],
     to land.
     """
     def authentication_failure(detail: str) -> tuple[bool, str]:
-        executable = AGENT_EXECUTABLES.get(name, name.lower())
-        recovery = {
-            "Codex": "run `codex login`",
-            "Claude": "run `claude` and complete its login",
-            "Antigravity": "run `agy` and complete its browser login",
-            "Aider": "run `roundtable --set-key MISTRAL_API_KEY`",
-            "Grok": ("run `grok login --device-code` or "
-                     "`roundtable --set-key XAI_API_KEY`"),
-            "Qwen": "run `roundtable --set-key OPENAI_API_KEY`",
-            "Muse": ("run `muse login` (device code) or "
-                     "`roundtable --set-key META_API_KEY`"),
-            # Moonshot is env-var only -- no browser step, unlike agy.
-            "Kimi": "run `roundtable --set-key KIMI_MODEL_API_KEY`",
-        }.get(name, f"configure `{executable}`")
+        recovery = _auth_recovery_hint(name)
+        if not recovery.startswith("run "):
+            recovery = "run " + recovery
         if re.search(r"api[ _-]?key|not able to authenticate|401 unauthorized|missing bearer",
                      detail, re.IGNORECASE):
             return False, (f"needs valid API credentials -- {recovery}, or run "
-                           f"`roundtable --auth-setup`; then re-run roundtable ({detail})")
+                           f"`roundtable --login {name.lower()}` / `roundtable --auth-setup`; "
+                           f"then re-run roundtable ({detail})")
         return False, (f"needs interactive login -- {recovery}, or run "
-                       f"`roundtable --auth-setup`; then re-run roundtable ({detail})")
+                       f"`roundtable --login {name.lower()}` / `roundtable --auth-setup`; "
+                       f"then re-run roundtable ({detail})")
 
     agent.cancel_event = cancel_event
     timer = threading.Timer(timeout, cancel_event.set)
@@ -6579,9 +6760,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--clear-key", metavar="NAME",
                         help="remove a locally-stored key by env var name, then exit")
     parser.add_argument("--auth-setup", action="store_true",
-                        help="run a guided, hidden-input setup for Aider/Mistral, Grok, and Qwen "
-                             "API keys and show the login commands for browser-authenticated "
-                             "agents, then exit")
+                        help="run a guided, hidden-input setup for every API-key agent (Aider, "
+                             "Grok, Qwen, Muse, Kimi), then show each agent's authentication "
+                             "state, then exit")
+    parser.add_argument("--login", nargs="?", const="all", metavar="AGENT",
+                        help="show every agent's authentication state, then run the vendor "
+                             "login for AGENT (e.g. `--login kimi`), or with no AGENT offer to "
+                             "log in to each one that needs it; uses device-code flows where "
+                             "the vendor has one, and prompts for the key of key-only agents. "
+                             "Without a terminal it only reports, then exits")
     return parser
 
 
@@ -6610,7 +6797,7 @@ def main() -> int:
     install.refresh_windows_path()
     parser = build_parser()
     args, remaining = parser.parse_known_args()
-    if args.set_key or args.list_keys or args.clear_key or args.auth_setup:
+    if args.set_key or args.list_keys or args.clear_key or args.auth_setup or args.login:
         # Consumed by this parser above, so re-add for _run_key_command_from_cli's own parser,
         # same reasoning as --update/--message/--log below.
         extra = []
@@ -6622,6 +6809,8 @@ def main() -> int:
             extra += ["--clear-key", args.clear_key]
         if args.auth_setup:
             extra.append("--auth-setup")
+        if args.login:
+            extra += ["--login", args.login]
         return _run_key_command_from_cli(extra)
     if args.install or args.update or args.bugsend:
         # --update/--message/--log were already parsed (and consumed) by this parser above, so

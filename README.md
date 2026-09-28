@@ -92,14 +92,29 @@ any provider you do not have a key for. Values are stored in `~/.roundtable/keys
 the current user where the platform supports it, and are never printed. Existing environment
 variables take priority over stored values.
 
-Login-based agents still use their vendor commands: `codex login`, `claude`, and `agy`; Grok can
-use `grok login --device-code` instead of an API key. For direct or scripted administration, use
+It finishes by showing every agent's authentication state. To log in to the agents that need it:
+
+```bash
+roundtable --login          # show every agent's state, then offer to log in to each one that needs it
+roundtable --login kimi     # run one agent's vendor login in this terminal
+```
+
+`--login` runs each vendor's own login command in your terminal: `codex login` (with
+`--device-auth` on a machine with no graphical session), `claude auth login`, `grok login
+--device-code`, `muse login` and `kimi login` (both device-code flows), and `agy`, which has no
+login subcommand and signs in via the browser on first launch. For the key-only agents (Aider,
+Qwen) it prompts for the key instead. The state column comes from local checks only (stored and
+environment keys, `codex login status`, `claude auth status`, Grok's and Muse's credential files)
+and says "unknown" rather than guessing where a CLI offers no local signal; preflight remains the
+real test. Without a terminal, `--login` only prints the table, so it is safe in scripts.
+
+For direct or scripted administration, use
 `roundtable --set-key NAME` (hidden prompt), `roundtable --list-keys` (names only), and
 `roundtable --clear-key NAME`. Key commands intentionally require an interactive terminal so a
 secret cannot accidentally land in shell history, command arguments, or piped logs.
 
-For Muse, use `muse login` or save `META_API_KEY`. For Kimi, use its configured login/model
-or save `KIMI_MODEL_API_KEY`; with a direct key, Roundtable supplies `KIMI_MODEL_NAME`
+For Muse, use `muse login` or save `META_API_KEY`. For Kimi, use `kimi login` or save
+`KIMI_MODEL_API_KEY`; with a direct key, Roundtable supplies `KIMI_MODEL_NAME`
 (default `kimi-for-coding`) if absent. An existing `KIMI_MODEL_NAME` is preserved.
 `--kimi-model` selects a model alias explicitly; custom endpoints can be set with
 `KIMI_MODEL_BASE_URL`. See [Kimi environment configuration](https://www.kimi.com/code/docs/en/kimi-code-cli/configuration/env-vars.html).
