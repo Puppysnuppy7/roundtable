@@ -626,3 +626,24 @@ July/Linux notes below remain useful history, but this section is the current op
    a real installation on a new machine.
 4. Do not print or copy values from `~/.roundtable/keys.env`; only key names/status belong in logs
    and handoffs.
+
+## Addendum 14 — octopi main-agent session, 2026-09-28/30
+
+On branch `worktree-login-flow` (`fefeedb`), **not merged to master**: `roundtable --login [AGENT]`.
+- `_AGENT_AUTH` is now the single table of each agent's executable, vendor login command and API-key env
+  var. `--login`, the end of `--auth-setup`, and preflight's recovery hints all read from it, and a test
+  pins it to `AGENT_NAMES`.
+- `--login` prints each agent's auth state from local checks only and says "unknown" rather than
+  guessing. It then offers each agent's vendor login; key-only agents (Aider, Qwen) get a hidden key
+  prompt. Codex gets `--device-auth` on a box with no desktop session. Without a terminal it only reports.
+- Fixes the stale preflight hint that called Kimi "env-var only" (Kimi Code has `kimi login`).
+- 708/708 tests pass.
+
+On the pi as of 2026-09-30, all 8 CLIs are installed: muse 1.4.0 and Kimi Code 2.1.1 are new, and grok
+went to 1.0.44. Live `--login` report: Codex, Claude and Grok are logged in; **Muse is not logged in;
+Aider and Qwen have no keys; Kimi and agy are unknown.** A full 8-agent run will fail preflight on those
+until they're set up. npm 12 skips install scripts, so after a global update run the vendor
+postinstall by hand (see homelab handoff §5q).
+
+A two-agent (Codex + Claude) CAD run on the pi worked end to end using `cq-python` / `cq-check` and
+produced a verified bracket in `~/cad-test/`. Tell the agents in the objective about those two commands.
