@@ -8583,6 +8583,58 @@ class ReviewFindingsTests(unittest.TestCase):
         self.assertEqual(seen["Aider"], roundtable.AGENT_DEFAULT_MODELS["Aider"])
         self.assertEqual(seen["Qwen"], roundtable.AGENT_DEFAULT_MODELS["Qwen"])
 
+    def test_check_agents_honours_the_runs_models_and_elevation(self):
+        """--check-agents ignored --elevated and --<agent>-model, so it reported Grok (needs
+        elevation on the Pi) and Qwen (needs a non-default model) as broken while real runs with
+        the same flags worked."""
+        seen = {}
+
+        def record_agent(name, workspace, model=None, **kwargs):
+            seen[name] = (model, kwargs.get("elevated", False))
+            return roundtable.MockAgent(name, workspace)
+
+        with mock.patch.object(roundtable.shutil, "which",
+                               side_effect=lambda exe: "/usr/bin/" + exe), \
+             mock.patch.object(roundtable, "Agent", side_effect=record_agent):
+            roundtable.check_agents(timeout=5, models={"Qwen": "qwen3.6-plus"},
+                                    elevated=["grok"])
+        self.assertEqual(seen["Qwen"], ("qwen3.6-plus", False))
+        self.assertEqual(seen["Grok"][1], True)
+        self.assertEqual(seen["Aider"], (roundtable.AGENT_DEFAULT_MODELS["Aider"], False))
+
+        seen.clear()
+        with mock.patch.object(roundtable.shutil, "which",
+                               side_effect=lambda exe: "/usr/bin/" + exe), \
+             mock.patch.object(roundtable, "Agent", side_effect=record_agent):
+            roundtable.check_agents(timeout=5, elevated=["all"])
+        self.assertTrue(all(elev for _, elev in seen.values()))
+
+    def test_a_relay_drops_a_crashed_agent_instead_of_ending_the_run(self):
+        """A non-quota failure inside a sequential/mixed relay (Qwen hitting its per-turn tool-call
+        cap) raised out of the phase and killed the run before its final synthesis, although the
+        parallel phase drops the same failure and carries on."""
+        class Crashing(roundtable.Agent):
+            def run(self, prompt, on_tick, cancel_event=None, no_edit=False):
+                raise RuntimeError("Qwen exited with status 1\nLoop detection halted the run")
+
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            session = roundtable.Session("objective", str(ws), 1, "2026-10-28T00:00:00", [])
+            ticks = []
+            agents = [("Qwen", Crashing("Qwen", ws)), ("Codex", roundtable.MockAgent("Codex", ws))]
+            roundtable._run_sequential_phase(session, agents, "review",
+                                             lambda n, line: ticks.append((n, line)),
+                                             lambda names, msg: None, "relay")
+            self.assertEqual([t.speaker for t in session.turns], ["Codex"])
+            self.assertTrue(any(n == "Qwen" and "dropped from this phase after a failure" in line
+                                for n, line in ticks))
+
+            # A one-agent relay has nobody to hand on to, so it still fails loudly.
+            with self.assertRaises(RuntimeError):
+                roundtable._run_sequential_phase(roundtable.Session("objective", str(ws), 1, "2026-10-28T00:00:00", []),
+                                                 [("Qwen", Crashing("Qwen", ws))], "review",
+                                                 lambda *_: None, lambda *_: None, "relay")
+
     def test_the_parser_defaults_match_the_shared_model_table(self):
         """The drift this table exists to prevent."""
         parsed = roundtable.build_parser().parse_args(["objective"])

@@ -4845,13 +4845,23 @@ def _run_sequential_phase(session: Session, agents: list[tuple[str, Agent]], pha
                 agent, prompt, lambda line, speaker=name: tick(speaker, line),
                 no_edit=chat, on_limit=on_limit)
         except RuntimeError as exc:
-            if str(exc) == f"{name} cancelled" or not usage_limit_detail(str(exc)):
+            if str(exc) == f"{name} cancelled":
                 raise
-            # The parallel runner already drops a failed agent and carries on; this relay
-            # did not, so on_limit=drop -- the default for any two-agent roster -- turned a
-            # rate limit into a dead run under --collab sequential and mixed.
-            tick(name, f"out of quota — leaving the relay "
-                       f"({usage_limit_detail(str(exc))})")
+            detail = usage_limit_detail(str(exc))
+            if detail:
+                # The parallel runner already drops a failed agent and carries on; this relay
+                # did not, so on_limit=drop -- the default for any two-agent roster -- turned a
+                # rate limit into a dead run under --collab sequential and mixed.
+                tick(name, f"out of quota — leaving the relay ({detail})")
+                continue
+            if len(agents) < 2:
+                raise
+            # Any other hard failure (a CLI crash, Qwen's per-turn tool-call cap, a timeout) used
+            # to abort the whole run from inside a relay, discarding every later phase and the
+            # final synthesis, while the parallel runner drops the same failure and carries on.
+            # Match the parallel phase: the agent leaves this phase and the relay continues.
+            first_line = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
+            tick(name, f"dropped from this phase after a failure: {first_line}")
             continue
         # Independently verify this agent's turn against real, deterministic evidence rather than
         # whatever it claimed -- a no-op outside a --self session.
@@ -5780,7 +5790,9 @@ def list_agents() -> str:
 
 
 def check_agents(timeout: float = EXTENDED_PREFLIGHT_TIMEOUT_SECONDS,
-                 mock: bool = False) -> tuple[str, list[str]]:
+                 mock: bool = False,
+                 models: dict[str, str | None] | None = None,
+                 elevated: Iterable[str] = ()) -> tuple[str, list[str]]:
     """Probe every installed agent and report who could actually take a turn right now.
 
     --list-agents answers "is it installed", which is not the question that sends someone to a
@@ -5794,8 +5806,16 @@ def check_agents(timeout: float = EXTENDED_PREFLIGHT_TIMEOUT_SECONDS,
 
     Returns the report and the agents that are ready now, so callers can act on it as well as
     print it.
+
+    ``models`` (display name -> model) and ``elevated`` (lower-case agent names, or "all") carry the
+    same --<agent>-model and --elevated choices a real run would get. Without them the probe ran every
+    agent un-elevated on its default model, so an agent that only works elevated (Grok on the Pi) or
+    on a non-default model (Qwen) was reported broken while the very same flags made runs succeed.
     """
     cls = MockAgent if mock else Agent
+    models = models or {}
+    elevated = {name.lower() for name in elevated}
+    elevate_all = "all" in elevated
     installed = [name for name in AGENT_NAMES
                  if mock or shutil.which(AGENT_EXECUTABLES[name])]
     rows: dict[str, str] = {name: "not installed" for name in AGENT_NAMES}
@@ -5806,7 +5826,9 @@ def check_agents(timeout: float = EXTENDED_PREFLIGHT_TIMEOUT_SECONDS,
                 # Same model a real run would use. Without this Aider falls back to its
                 # own default and Qwen fails auth with a misleading "Invalid API-key",
                 # so a healthy agent is reported as a broken one.
-                agent = cls(name, Path(probe_dir), AGENT_DEFAULT_MODELS.get(name))
+                agent = cls(name, Path(probe_dir),
+                            models.get(name) or AGENT_DEFAULT_MODELS.get(name),
+                            elevated=elevate_all or name.lower() in elevated)
                 cancel_event = threading.Event()
                 # on_limit="wait" keeps a usage-limited agent a *pass* inside preflight_check so it
                 # reports the quota detail, which this function then classifies separately.
@@ -6385,7 +6407,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="roundtable",
         description="A shared terminal roundtable for Codex, Claude, Antigravity, Aider, Grok, "
-                    "and Qwen")
+                    "Qwen, Muse, and Kimi")
     parser.add_argument("objective", nargs="?", help="the problem the agents should solve")
     parser.add_argument("-r", "--rounds", type=int, choices=range(0, 6), metavar="0-5")
     parser.add_argument("-C", "--workspace", help="shared working directory")
@@ -6685,7 +6707,12 @@ def main() -> int:
     if args.check_agents:
         report, ready = check_agents(
             timeout=args.preflight_timeout or EXTENDED_PREFLIGHT_TIMEOUT_SECONDS,
-            mock=args.mock)
+            mock=args.mock,
+            models={"Codex": args.codex_model, "Claude": args.claude_model,
+                    "Antigravity": args.antigravity_model, "Aider": args.aider_model,
+                    "Grok": args.grok_model, "Qwen": args.qwen_model,
+                    "Muse": args.muse_model, "Kimi": args.kimi_model},
+            elevated=args.elevated)
         print(report)
         return 0 if ready else 1
     args.touch_mode = has_touchscreen() if args.touch is None else args.touch
