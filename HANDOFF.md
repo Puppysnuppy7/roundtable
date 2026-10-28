@@ -17,7 +17,8 @@ still active.
 ## What this project is
 
 `/home/user/roundtable/roundtable.py` (~3660 lines) — a dependency-free, single-file, curses-based
-terminal UI where **six** coding-agent CLIs collaborate on a task: `codex` (OpenAI), `claude`
+terminal UI where **eight** coding-agent CLIs (six at the time this section was first written; Muse and
+Kimi were added 2026-09-13) collaborate on a task: `codex` (OpenAI), `claude`
 (Anthropic), `agy`/Antigravity (Google), `aider` (model-agnostic, pinned to Mistral's Codestral by
 default so it doesn't duplicate a lab-native agent), `grok` (xAI), and `qwen` (Alibaba) — five labs
 plus one swappable, so no two agents run the same underlying model by default. Parallel/sequential/
@@ -626,3 +627,24 @@ July/Linux notes below remain useful history, but this section is the current op
    a real installation on a new machine.
 4. Do not print or copy values from `~/.roundtable/keys.env`; only key names/status belong in logs
    and handoffs.
+
+
+## Maintenance -- 2026-10-28 (Pi Agent, owner-approved low-priority "downtime" session)
+
+- **Agent CLIs updated and each re-tested with a real one-line prompt:** Codex 0.162.0 -> 0.165.0,
+  Grok 1.0.44 -> 1.0.70 (npm now blocks its postinstall; needs `npm install -g
+  --allow-scripts=@xai-official/grok @xai-official/grok@latest`, otherwise the version silently stays
+  old), Qwen 0.25.1 -> 0.26.2 (still the Pi 5 16 KB-page `jemalloc` noise; harmless, documented in the
+  README). Claude Code not updated mid-session (2.1.286 installed, 2.1.312 available).
+- **Fixed `--check-agents` ignoring `--elevated` and `--<agent>-model`.** It probed every agent
+  un-elevated on its default model, so it reported Grok (needs `--elevated grok` on the Pi) and Qwen
+  (needs `--qwen-model`) as broken while real runs with the same flags worked. Now passes the run's
+  models and elevation through; regression test added.
+- **Fixed one agent's crash killing a whole run inside a relay.** In the 2026-10-27 HP research run,
+  Qwen hit its per-turn tool-call cap in round 3's sequential review; `_run_sequential_phase`
+  re-raised any non-quota failure, so the run died before its final synthesis (the parallel runner
+  already dropped such failures). The relay now drops the failed agent ("dropped from this phase
+  after a failure") and continues; a one-agent relay still raises. Regression test added.
+- Tests: `python3 -m unittest test_roundtable test_install` -> 701 OK (was 699 + 2 new).
+- Still needs the owner: Kimi (`No model configured` -> run `kimi`, then `/login`) and Muse (API key
+  rejected -> `muse login`).

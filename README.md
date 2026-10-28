@@ -65,7 +65,10 @@ partway through. Concretely: Codex and Claude Code both publish `linux-arm64`/`d
 binaries, so they install cleanly on 64-bit Arm (e.g. a 64-bit Raspberry Pi OS); neither publishes a
 32-bit Arm build, so this warns up front on arm32 (installs may still be attempted and then fail).
 Qwen Code depends on a native module with no `linux-arm64` prebuild, so an aarch64 Linux install is
-flagged as unverified and may need to compile from source. Aider is pure Python and installs the
+flagged as unverified and may need to compile from source. On a Raspberry Pi 5 (whose stock kernel
+uses 16 KB memory pages) Qwen Code 0.25-0.26 also prints `<jemalloc>: Unsupported system page size`
+when its bundled ripgrep starts and falls back to its built-in grep; turns still complete, so this is
+harmless noise rather than a failed agent. Aider is pure Python and installs the
 same way everywhere. On Windows, the script still installs the `roundtable.cmd` launcher and reports
 CLI status, but warns that actually running roundtable's GUI needs the third-party `windows-curses`
 package, which this installer does not manage. The installer deliberately does not `import
